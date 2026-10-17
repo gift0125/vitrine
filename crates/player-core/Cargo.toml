@@ -1,0 +1,11 @@
+[package]
+name = "player-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+
+# Stage 2 引入：
+# rodio = "0.21"
+# lofty = "0.22"
