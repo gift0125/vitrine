@@ -78,30 +78,30 @@ directories = "6"         # 配置目录定位
 
 ## 3. 阶段划分（Stage 0 → 5）
 
-### 🟡 Stage 0 — 环境验证（0.5 天）
+### 🟢 Stage 0 — 环境验证（0.5 天）✅ 2026-10-17
 
 **目标**：空窗口跑起来，验证工具链。
 
-- [ ] 安装 Rust stable（1.85+），确认 MSVC 工具链（Windows）
-- [ ] `cargo new simple-media-player`，添加 `gpui-kit` 依赖
-- [ ] 跑通官方 hello_world 模式：`gpui_kit::application().run(...)` 打开一个窗口显示 "Hello"
+- [x] 安装 Rust stable（1.85+），确认 MSVC 工具链（Windows）——实测 rustc 1.99.1 x86_64-pc-windows-msvc
+- [x] `cargo new simple-media-player`，添加 `gpui-kit` 依赖（workspace：crates/app + crates/player-core）
+- [x] 跑通官方 hello_world 模式：`gpui_kit::application().run(...)` 打开一个窗口显示 "Hello"
 - [ ] （可选）`npx skills add longbridge/gpui-kit` 给编码 Agent 装官方技能
 
-**验收**：`cargo run` 弹出窗口，120Hz 渲染无报错；`git commit` 基线。
+**验收**：`cargo run` 弹出窗口，120Hz 渲染无报错；`git commit` 基线。✅（基线 41c13ef，首次全量构建 18m14s 通过）
 
 ---
 
-### 🟡 Stage 1 — 主窗口骨架与布局（1 天）
+### 🟢 Stage 1 — 主窗口骨架与布局（1 天）✅ 2026-10-17
 
 **目标**：播放器三栏布局落地，纯静态 UI。
 
-- [ ] 主窗口 + 标题栏定制（参考 gpui-kit `example-dock`）
-- [ ] 布局：左侧 Playlist 面板 / 右上封面区 / 底部控制栏（播放按钮、SeekBar、音量）
-- [ ] 用 gpui-component 组件：`Button` / `Slider` / `List` / `Icon`（Lucide 图标）
-- [ ] 明暗主题切换（`Theme` / `ActiveTheme`）
-- [ ] 中文文案 + 字体渲染验证
+- [x] 主窗口 + 标题栏定制（`gpui_kit::open_window` + TitlebarOptions，1040x680，min 720x480）
+- [x] 布局：左侧 Playlist 面板 / 右上封面区 / 底部控制栏（播放按钮、SeekBar、音量）
+- [x] 用 gpui-component 组件：`Button` / `Slider` / `List`（虚拟滚动 delegate）/ `Icon`（Lucide 图标；`icon_assets!` 注册 SkipBack/SkipForward/Volume 系列/Music/ListMusic 额外图标）
+- [x] 明暗主题切换（`Theme::change`；`--dark` 启动参数 + 底栏月亮/太阳按钮）
+- [x] 中文文案 + 字体渲染验证（截图确认无豆腐块）
 
-**验收**：窗口可缩放，布局不错乱；主题切换即时生效；截图存档。
+**验收**：窗口可缩放，布局不错乱；主题切换即时生效（--dark 启动路径实测通过，按钮 handler 调同一 API）；截图存档 `docs/screenshots/stage1-light.png` / `stage1-dark.png`。✅
 
 ---
 

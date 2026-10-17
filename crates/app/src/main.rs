@@ -1,41 +1,47 @@
-//! Simple Media Player — Stage 0: 环境验证窗口
+//! Simple Media Player — Stage 1: 主窗口骨架与三栏布局
 //!
-//! 目标：验证 gpui-kit 工具链可用，弹出一个 GPU 渲染的原生窗口。
-//! Stage 1 将替换为播放器三栏布局。
+//! 布局：左侧播放列表 / 右上封面区 / 底部控制栏，支持明暗主题切换。
+//! Stage 2 将接入 player-core 的 AudioEngine 实现真实播放。
 
-use gpui_kit::component::{button::*, *};
+mod assets;
+mod player_view;
+mod playlist;
+
+use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-struct HelloWorld;
-
-impl Render for HelloWorld {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .v_flex()
-            .size_full()
-            .gap_2()
-            .items_center()
-            .justify_center()
-            .child(div().text_xl().child("Simple Media Player"))
-            .child(div().text_sm().child("Stage 0: 工具链验证 ✅"))
-            .child(
-                Button::new("ok")
-                    .primary()
-                    .label("Let's Go!")
-                    .on_click(cx.listener(|_this, _event, _window, cx| {
-                        cx.quit();
-                    })),
-            )
-    }
-}
+use crate::assets::AppAssets;
+use crate::player_view::PlayerView;
 
 fn main() {
-    gpui_kit::application().run(|cx| {
-        gpui_kit::init(cx);
+    let start_dark = std::env::args().any(|arg| arg == "--dark");
 
-        cx.open_window(WindowOptions::default(), |_window, cx| {
-            cx.new(|_cx| HelloWorld)
-        })
-        .expect("failed to open window");
-    });
+    gpui_kit::application()
+        .with_assets(AppAssets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+
+            if start_dark {
+                gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+            }
+
+            let bounds = Bounds {
+                origin: Default::default(),
+                size: size(px(1040.), px(680.)),
+            };
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(720.), px(480.))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Simple Media Player".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| PlayerView::new(window, cx))
+            })
+            .expect("failed to open window");
+        });
 }
