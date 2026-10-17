@@ -1,8 +1,16 @@
 //! player-core: 播放内核（无 UI 依赖）
 //!
-//! Stage 2 将在此实现 AudioEngine（rodio 封装）与 TrackMeta（lofty 元数据解析）。
+//! - [`AudioEngine`]：rodio 封装的音频播放引擎
+//! - [`TrackMeta`]：曲目元数据（lofty 解析）
+//! - 目录扫描 / 扩展名过滤等纯数据工具
 
-/// 曲目元数据（Stage 2 填充完整字段）
+mod audio;
+mod metadata;
+
+pub use audio::{AudioEngine, EngineError};
+pub use metadata::{is_supported_audio, load_track_meta, scan_dir_for_tracks};
+
+/// 曲目元数据
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrackMeta {
     pub title: String,
@@ -17,4 +25,10 @@ pub enum PlaybackState {
     Stopped,
     Playing,
     Paused,
+}
+
+impl PlaybackState {
+    pub fn is_playing(self) -> bool {
+        self == Self::Playing
+    }
 }

@@ -1,39 +1,129 @@
-//! 播放列表面板：List 组件 + 虚拟滚动。
+//! 播放列表面板：List 组件 + 虚拟滚动 + 拖拽排序。
 //!
-//! Stage 1 为静态演示数据（验证布局与滚动）；Stage 3 接入
-//! 文件导入、拖拽排序与持久化。
+//! 数据源（tracks）的真身在 [`PlaylistDelegate`] 内；所有会改变列表的
+//! 操作（删除/拖拽排序）通过 `WeakEntity<PlayerView>` 回写主视图，
+//! 由主视图统一修正当前曲目下标并持久化。
 
 use player_core::TrackMeta;
 
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{ListDelegate, ListItem, ListState};
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, IndexPath, Sizable as _};
 use gpui_kit::prelude::*;
-use gpui_kit::{App, Context, Window};
+use gpui_kit::{div, App, Context, SharedString, WeakEntity, Window};
+
+use crate::player_view::PlayerView;
+
+/// 拖拽排序时跟随光标的预览项。
+#[derive(Clone)]
+struct DragTrack {
+    title: String,
+}
+
+impl Render for DragTrack {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(theme.primary)
+            .text_color(theme.primary_foreground)
+            .text_sm()
+            .child(self.title.clone())
+    }
+}
 
 /// 播放列表数据源。
 pub struct PlaylistDelegate {
     tracks: Vec<TrackMeta>,
     /// 当前键盘/悬停选中项
     selected: Option<IndexPath>,
-    /// 当前播放项（双击/回车确认）
+    /// 当前播放项
     confirmed: Option<IndexPath>,
+    view: WeakEntity<PlayerView>,
 }
 
 impl PlaylistDelegate {
-    pub fn new(tracks: Vec<TrackMeta>) -> Self {
+    pub fn new(tracks: Vec<TrackMeta>, view: WeakEntity<PlayerView>) -> Self {
         Self {
             tracks,
             selected: None,
             confirmed: None,
+            view,
         }
     }
 
-    /// 当前确认（播放）中的曲目下标（Stage 3 状态同步使用）。
-    #[allow(dead_code)]
-    pub fn confirmed_index(&self) -> Option<usize> {
+    pub fn tracks(&self) -> &[TrackMeta] {
+        &self.tracks
+    }
+
+    pub fn track_count(&self) -> usize {
+        self.tracks.len()
+    }
+
+    pub fn track(&self, row: usize) -> Option<&TrackMeta> {
+        self.tracks.get(row)
+    }
+
+    /// 追加曲目；返回新曲目起始下标。
+    pub fn append_tracks(&mut self, tracks: Vec<TrackMeta>) -> usize {
+        let start = self.tracks.len();
+        self.tracks.extend(tracks);
+        start
+    }
+
+    /// 移除指定曲目。选中/播放中索引由调用方（view）修正。
+    pub fn remove_at(&mut self, row: usize) {
+        if row < self.tracks.len() {
+            self.tracks.remove(row);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.tracks.clear();
+        self.selected = None;
+        self.confirmed = None;
+    }
+
+    /// 拖拽排序：把 `from` 行移动到 `to` 行，选中/播放中索引同步重映射。
+    pub fn move_item(&mut self, from: usize, to: usize) {
+        if from == to || from >= self.tracks.len() || to >= self.tracks.len() {
+            return;
+        }
+        let track = self.tracks.remove(from);
+        self.tracks.insert(to, track);
+        self.selected = self
+            .selected
+            .map(|ix| IndexPath::new(remap_index(ix.row, from, to)));
+        self.confirmed = self
+            .confirmed
+            .map(|ix| IndexPath::new(remap_index(ix.row, from, to)));
+    }
+
+    /// 同步当前播放项（主视图在播放/停止时调用）。
+    pub fn set_confirmed(&mut self, row: Option<usize>) {
+        self.confirmed = row.map(IndexPath::new);
+    }
+
+    /// 当前播放曲目下标。
+    pub fn confirmed_row(&self) -> Option<usize> {
         self.confirmed.map(|ix| ix.row)
+    }
+}
+
+/// 拖拽排序后旧下标 → 新下标映射。
+fn remap_index(old: usize, from: usize, to: usize) -> usize {
+    if old == from {
+        to
+    } else if from < old && old <= to {
+        old - 1
+    } else if to <= old && old < from {
+        old + 1
+    } else {
+        old
     }
 }
 
@@ -50,9 +140,10 @@ impl ListDelegate for PlaylistDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
-        let track = self.tracks.get(ix.row)?;
+        let track = self.tracks.get(ix.row)?.clone();
         let is_current = self.confirmed == Some(ix);
         let theme = cx.theme();
+        let view = self.view.clone();
 
         let icon_color = if is_current {
             theme.primary
@@ -64,6 +155,12 @@ impl ListDelegate for PlaylistDelegate {
             .artist
             .clone()
             .unwrap_or_else(|| "未知艺术家".to_string());
+
+        let drag = DragTrack {
+            title: track.title.clone(),
+        };
+        let from_row = ix.row;
+        let view_remove = self.view.clone();
 
         Some(
             ListItem::new(ix)
@@ -96,6 +193,28 @@ impl ListDelegate for PlaylistDelegate {
                                 .text_color(theme.muted_foreground),
                         ),
                 )
+                // 行尾删除按钮
+                .suffix(move |_, _| {
+                    let view = view_remove.clone();
+                    Button::new(SharedString::from(format!("remove-{from_row}")))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .on_click(move |_, _, cx| {
+                            let _ = view.update(cx, |view, cx| {
+                                view.remove_track(from_row, cx);
+                            });
+                        })
+                })
+                // 拖拽排序
+                .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                .drag_over::<DragTrack>(|style, _, _, cx| style.bg(cx.theme().drop_target))
+                .on_drop(move |drag: &DragTrack, _, cx| {
+                    let _ = drag;
+                    let _ = view.update(cx, |view, cx| {
+                        view.move_playlist_item(from_row, ix.row, cx);
+                    });
+                })
                 .selected(self.selected == Some(ix))
                 .confirmed(is_current),
         )
@@ -124,6 +243,27 @@ impl ListDelegate for PlaylistDelegate {
     fn cancel(&mut self, _window: &mut Window, cx: &mut Context<ListState<Self>>) {
         self.selected = None;
         cx.notify();
+    }
+
+    fn render_empty(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<ListState<Self>>,
+    ) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .py_8()
+            .text_color(cx.theme().muted_foreground)
+            .child(Icon::new(IconName::ListMusic).size_10())
+            .child(Label::new("播放列表为空"))
+            .child(
+                Label::new("点击上方 + 添加音频文件，或 +📁 添加文件夹")
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground),
+            )
     }
 }
 

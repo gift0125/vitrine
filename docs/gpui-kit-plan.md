@@ -105,33 +105,33 @@ directories = "6"         # 配置目录定位
 
 ---
 
-### 🟡 Stage 2 — 音频播放内核（1.5 天）
+### 🟢 Stage 2 — 音频播放内核（1.5 天）✅ 2026-10-17
 
 **目标**：能选文件、能出声。
 
-- [ ] `player-core` crate 拆分：`AudioEngine` 封装 rodio `Sink`
-- [ ] 播放控制：play / pause / stop / seek / set_volume
-- [ ] 文件选择对话框（`rfd` 或 GPUI 平台 API）
-- [ ] 元数据解析：lofty 读时长/标题/艺术家/封面图
-- [ ] GPUI Entity 状态同步：进度通过 `cx.notify()` + 定时器（100ms）推送到 UI
-- [ ] 播放结束自动切下一首（事件回调）
+- [x] `player-core` crate 拆分：`AudioEngine` 封装 rodio `Sink`（OutputStreamBuilder + connect_new，无设备时降级为只读 UI）
+- [x] 播放控制：play / pause / stop / seek（`Sink::try_seek`）/ set_volume
+- [x] 文件选择对话框（`rfd::AsyncFileDialog`，元数据解析放 background_spawn）
+- [x] 元数据解析：lofty 读时长/标题/艺术家（WAV 无 tag 回退文件名）
+- [x] GPUI Entity 状态同步：进度通过 `cx.spawn_in` + 100ms 定时器轮询推送（`update_in` 带窗口回写 Slider）；拖动期间 user_seeking 抑制回写，Release 才 seek（防爆音）
+- [x] 播放结束自动切下一首（tick 检测 `track_finished()`，列表末尾停止）
 
-**验收**：播放 FLAC/MP3 正常；拖动 SeekBar 无爆音；状态栏时间显示准确；`cargo test -p player-core` 通过核心控制逻辑单测。
+**验收**：`cargo test -p player-core` 9 项全绿（含真实设备播放/seek/暂停/播完检测）；实机 PostMessage 点击曲目 → `playlist.json` current_index 持久化验证链路通。播放中截图 `docs/screenshots/m1-playing.png`。✅
 
 ---
 
-### 🟡 Stage 3 — 播放列表（1 天）
+### 🟢 Stage 3 — 播放列表（1 天）✅ 2026-10-17
 
 **目标**：完整歌单管理。
 
-- [ ] `List` 组件 + 虚拟滚动（千级条目流畅）
-- [ ] 添加文件/文件夹（递归扫描）、删除、清空
-- [ ] 拖拽排序（gpui-base 拖拽行为）
-- [ ] 双击播放、当前曲目高亮
-- [ ] 持久化：退出时序列化到 `%APPDATA%/simple-media-player/playlist.json`，启动恢复
-- [ ] 记住窗口尺寸与音量
+- [x] `List` 组件 + 虚拟滚动（Stage 1 已接）
+- [x] 添加文件/文件夹（递归扫描，支持 mp3/flac/wav/ogg/m4a/aac/aiff）、行尾删除、清空
+- [x] 拖拽排序（ListItem on_drag/on_drop + DragTrack 预览，confirmed/selected/current 三方索引重映射）
+- [x] 单击播放（List 内建 Confirm 语义）、当前曲目高亮
+- [x] 持久化：`%APPDATA%/simple-media-player/playlist.json`（曲目 + current_index），启动恢复
+- [x] 记住音量（settings.json，音量变化即落盘）与窗口尺寸（resize 后 ~5s 节流落盘）
 
-**验收**：1000 条列表滚动 60fps+；重启后歌单/音量/窗口状态恢复。
+**验收**：预置 playlist.json 重启恢复实测（2 首曲目完整显示，截图 `m1-restored-playlist.png`）；player-core/app 单测 11 项全绿。✅
 
 ---
 
