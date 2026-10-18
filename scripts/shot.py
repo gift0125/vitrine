@@ -8,6 +8,7 @@
 """
 
 import ctypes
+import os
 import subprocess
 import sys
 import time
@@ -27,7 +28,10 @@ HWND_TOPMOST = -1
 SWP_SHOWWINDOW = 0x0040
 
 root = Path(__file__).resolve().parent.parent
-exe = root / "target" / "debug" / "simple-media-player.exe"
+# 默认拍 debug 构建；验发布包时用 SMP_EXE=target/release/simple-media-player.exe
+exe = Path(os.environ.get("SMP_EXE") or root / "target" / "debug" / "simple-media-player.exe")
+if not exe.is_absolute():
+    exe = root / exe
 
 args = sys.argv[1:]
 out = Path(args[0]) if args and not args[0].startswith("--") else root / "docs/screenshots/chroma-light.png"
