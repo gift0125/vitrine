@@ -92,6 +92,10 @@ UI 测试把持久化目录重定向到临时目录（见 `persistence::set_conf
 | 视频打不开、日志只有一句 toast | 设 `SMP_MPV_LOG=%TEMP%\mpv.log` 后重试，mpv 的真实报错在里面 |
 | 想确认命令/事件是否正常 | 设 `SMP_MPV_TRACE=%TEMP%\ipc.log`，逐行记录 IPC 收发 |
 | 应用是否被外部结束 | 看 `%APPDATA%\simple-media-player\session.log`：有 `event loop returned` 是正常退出，只有 `start` 说明被强杀 |
+| 播放失败但界面上只闪了一下提示 | 同一条错误也写进了 `session.log`（`error: 无法播放「…」…`），可以直接翻日志 |
+
+> 发布版是 GUI 子系统程序，**双击 exe 不会带出一个黑底 cmd 窗口**；代价是它没有控制台，
+> 所以诊断信息除了弹 toast，还会同时落到 `session.log`。调试构建保留控制台，`eprintln!` 直接可见。
 
 > 踩过的坑：`playlist.json` 里写成 `C://Users//...`（双斜杠）会导致 mpv 报 `loading failed`，
 > 应用会提示「mpv 无法加载该文件」。路径用标准 `C:\Users\...` 即可。
@@ -104,7 +108,7 @@ UI 测试把持久化目录重定向到临时目录（见 `persistence::set_conf
 |---|---|
 | `playlist.json` | 曲目列表 + 上次播放位置 |
 | `settings.json` | 音量、窗口尺寸 |
-| `session.log` | 启动 / 退出 / panic 留痕（用于区分「主动退出」与「被外部终止」） |
+| `session.log` | 启动 / 退出 / panic / 播放失败原因留痕（用于区分「主动退出」与「被外部终止」） |
 
 ## 架构
 
@@ -159,6 +163,7 @@ GPUI 的 Windows 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`）
 
 尺寸取设计稿的实测值：播放列表 **320px**（padding 20、条目 48、圆角 8）、
 控制栏 padding 16 + gap 12、播放按钮 **44 正圆**、正文字号 13 / 辅助 11 / 标题 15。
+控制行分三段：左端音量、**中间走带控制（上一首 / 播放 / 下一首）恒在窗口正中**、右端全屏与换肤。
 
 刻意与设计稿不同的三处，都是为了适配 mpv 叠加窗口这一架构约束：
 

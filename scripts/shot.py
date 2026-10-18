@@ -50,8 +50,19 @@ user32.SetWindowPos.argtypes = [
     ctypes.c_int, ctypes.c_int, ctypes.c_uint,
 ]
 user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
 user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = ctypes.c_long
+try:
+    user32.AdjustWindowRectExForDpi.argtypes = [
+        ctypes.POINTER(wintypes.RECT), ctypes.c_uint32, wintypes.BOOL,
+        ctypes.c_uint32, ctypes.c_uint32,
+    ]
+    HAS_ADJUST_DPI = True
+except AttributeError:  # Win10 1607 之前没有这个 API
+    HAS_ADJUST_DPI = False
 
 cmd = [str(exe)] + (["--dark"] if dark else [])
 log = root / "target" / "shot-stderr.log"
@@ -66,9 +77,40 @@ if not hwnd:
 
 scale = user32.GetDpiForWindow(hwnd) / 96.0
 phys_w, phys_h = round(width * scale), round(height * scale)
-user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, phys_w, phys_h, SWP_SHOWWINDOW)
+
+# SetWindowPos 设的是**窗口**尺寸，客户区会少掉边框和标题栏（实测 1560 的外框
+# 只给出 1538 的客户区），截完再拉伸就会让 1px 的边距对不上。这里先按目标客户区
+# 反推外框尺寸，保证截图是严格的 1:1 逻辑像素。
+outer_w, outer_h = phys_w, phys_h
+if HAS_ADJUST_DPI:
+    style = user32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
+    exstyle = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
+    frame = wintypes.RECT(0, 0, phys_w, phys_h)
+    if user32.AdjustWindowRectExForDpi(
+        ctypes.byref(frame), style, False, exstyle, round(scale * 96)
+    ):
+        outer_w = frame.right - frame.left
+        outer_h = frame.bottom - frame.top
+
+user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, outer_w, outer_h, SWP_SHOWWINDOW)
 user32.SetForegroundWindow(hwnd)
-time.sleep(0.6)
+
+
+def window_rect():
+    r = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(r))
+    return (r.left, r.top, r.right, r.bottom)
+
+
+# 窗口移动/改尺寸后 DWM 还会补一段动画，抢在这之前截图会截到窗口还没挪到位
+# 的桌面（表现为图左边多一条黑边）。等到外框位置连续两次采样一致再动手。
+last = window_rect()
+for _ in range(40):
+    time.sleep(0.1)
+    now = window_rect()
+    if now == last and now[0] >= 0 and now[1] >= 0:
+        break
+    last = now
 
 # 需要交互（点播放列表某一行）时，直接给窗口投递鼠标消息，
 # 不移动真实光标——避免截图里混进悬停态。

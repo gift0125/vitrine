@@ -247,7 +247,10 @@ impl PlayerView {
     /// 并排队等下一次 tick 统一弹 toast（tick 里有 window 可用）。
     fn report_error(&mut self, message: impl Into<SharedString>) {
         let message = message.into();
+        // release 版是 GUI 子系统（双击不再有控制台），所以诊断信息不能只靠
+        // eprintln!，必须同时落进 session.log，否则用户报障时手上什么都没有。
         eprintln!("{message}");
+        crate::persistence::log_session(&format!("error: {message}"));
         self.last_error = Some(message.clone());
         self.pending_errors.push(message);
     }
@@ -1168,7 +1171,11 @@ impl PlayerView {
             )
     }
 
-    /// 控制行：左（上一首 / 播放 / 下一首 / 音量）· 右（全屏 / 换肤）。
+    /// 控制行：左（音量）· 中（上一首 / 播放 / 下一首）· 右（全屏 / 换肤）。
+    ///
+    /// 左、右两栏都是 `flex_1`（`flex: 1 1 0%`，即等宽），所以中间那栏必然落在
+    /// 窗口正中。早先用 `justify_between` 把走带按钮和音量塞在同一组里，左侧内容
+    /// 比右侧多，走带就被挤到偏左的位置——这正是"播放控制没有居中"的原因。
     fn render_controls_row(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let is_dark = theme.mode.is_dark();
@@ -1190,10 +1197,33 @@ impl PlayerView {
         h_flex()
             .w_full()
             .items_center()
-            .justify_between()
-            // ---- 左：走带控制 + 音量 ----
+            .gap(px(12.))
+            // ---- 左：音量（flex_1，内容靠左） ----
             .child(
                 h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        Icon::new(volume_icon)
+                            .size(px(16.))
+                            .text_color(theme.secondary_foreground),
+                    )
+                    .child(
+                        div()
+                            .id("volume-bar")
+                            .aria_label("音量")
+                            .w(px(88.))
+                            .flex()
+                            .test_support()
+                            .child(Slider::new(&self.volume).bg(theme.primary)),
+                    ),
+            )
+            // ---- 中：走带控制（不参与伸缩，恒在窗口正中） ----
+            .child(
+                h_flex()
+                    .flex_shrink_0()
                     .items_center()
                     .gap(px(14.))
                     .child(
@@ -1230,32 +1260,15 @@ impl PlayerView {
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.skip(1, cx);
                             })),
-                    )
-                    .child(
-                        h_flex()
-                            .ml(px(8.))
-                            .items_center()
-                            .gap(px(8.))
-                            .child(
-                                Icon::new(volume_icon)
-                                    .size(px(16.))
-                                    .text_color(theme.secondary_foreground),
-                            )
-                            .child(
-                                div()
-                                    .id("volume-bar")
-                                    .aria_label("音量")
-                                    .w(px(88.))
-                                    .flex()
-                                    .test_support()
-                                    .child(Slider::new(&self.volume).bg(theme.primary)),
-                            ),
                     ),
             )
-            // ---- 右：全屏（仅视频） + 明暗切换 ----
+            // ---- 右：全屏（仅视频） + 明暗切换（flex_1，内容靠右） ----
             .child(
                 h_flex()
+                    .flex_1()
+                    .min_w_0()
                     .items_center()
+                    .justify_end()
                     .gap(px(4.))
                     .when(is_video, |el| {
                         el.child(

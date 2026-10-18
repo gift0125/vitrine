@@ -344,3 +344,39 @@ fn layout_keeps_playlist_and_controls_inside_window(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+/// 走带控制（上一首 / 播放 / 下一首）必须落在窗口水平正中。
+///
+/// 这里守的是一个很容易回归的布局写法：左右两栏宽度不等时（例如
+/// `justify_between` 把音量也塞进左侧组），中间那组会被挤到偏左的位置。
+#[gpui_kit::test]
+fn transport_controls_are_horizontally_centered(cx: &mut TestAppContext) {
+    fresh_dir("centered");
+    let (window, _view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+
+        let play = window.find("play-pause").bounds();
+        let prev = window.find("prev").bounds();
+        let next = window.find("next").bounds();
+        let window_bounds = window.bounds();
+
+        let offset = play.center().x - window_bounds.center().x;
+        assert!(
+            offset.as_f32().abs() <= 1.0,
+            "播放按钮应居中：圆心偏移 {offset:?}（窗口 {window_bounds:?}，按钮 {play:?}）"
+        );
+
+        // 走带三键次序正确、间距对称
+        assert!(prev.right() <= play.left(), "上一首应在播放左侧");
+        assert!(next.left() >= play.right(), "下一首应在播放右侧");
+        let left_gap = play.left() - prev.right();
+        let right_gap = next.left() - play.right();
+        assert!(
+            (left_gap - right_gap).as_f32().abs() <= 1.0,
+            "两侧间距应对称：{left_gap:?} vs {right_gap:?}"
+        );
+    })
+    .unwrap();
+}

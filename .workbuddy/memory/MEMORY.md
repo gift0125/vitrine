@@ -23,7 +23,9 @@
 - 含中文的 `.ps1` **必须存成 UTF-8 with BOM**，否则 PowerShell 5.1 按 GBK 解 → 乱码 + 语法报错。
 - 诊断开关（保留）：`SMP_MPV_LOG` 存 mpv stderr、`SMP_MPV_TRACE` 存 JSON IPC 双向报文。mpv 对路径重复分隔符不宽容（`C://` → `end-file reason=error file_error="loading failed"`），且该失败在 `--msg-level=all=error` 下 stderr 是空的，只有 IPC 报文能看出真相。
 - 换肤：`ThemeConfig`（`#[serde(default)]` + Default）配 `Theme::update` + `apply_config`。**`ThemeConfigColors` 的 `blue/red/green/cyan/magenta/yellow`(±`_light`) 是私有字段**，crate 外不能用结构体字面量 + `..Default::default()`，只能 `default()` 后逐字段赋值。别在同一个 closure 里既换 mode 又换 config（`installed_by_edit` 会跳过 `apply_config`）。
-- 截图工具（`scripts/shot.py`）**必须先 `SetProcessDpiAwareness(2)`**：否则 Python 按 96dpi 虚拟化，`GetClientRect` 尺寸缩水、`ImageGrab` 只截到窗口左上角（表现为"界面只剩封面，歌单和控制栏消失"）。
+- 截图工具（`scripts/shot.py`）**必须先 `SetProcessDpiAwareness(2)`**：否则 Python 按 96dpi 虚拟化，`GetClientRect` 尺寸缩水、`ImageGrab` 只截到窗口左上角（表现为"界面只剩封面，歌单和控制栏消失"）。另两点：`SetWindowPos` 设的是**外框**尺寸（1560×1020 外框只给 1538×964 客户区），要按目标客户区用 `AdjustWindowRectExForDpi` 反推外框；DWM 动画期间抢截会在图左边留一条黑边，需轮询等外框位置稳定。
+- 发布版必须保持 **GUI 子系统**（`#![cfg_attr(all(not(debug_assertions), target_os="windows"), windows_subsystem="windows")]`），否则双击先弹 cmd。验证读 PE 头 `OptionalHeader.Subsystem`（2=GUI / 3=console），不要靠肉眼。GUI 子系统无 stderr，但 `eprintln!` 在空句柄下不会 panic（std 当空设备），所以 `report_error` 只额外补一条 `session.log` 即可。
+- 布局铁律：要让某一组控件在窗口正中，左右两栏必须**等宽**（都 `flex_1`，`flex: 1 1 0%`）。用 `justify_between` 把内容分左右两组时，两组宽度不等就会把"中间"顶偏——走带控制偏左就是这么来的（2026-10-18 修）。
 
 ## 设计稿要点（详见 2026-10-17 日志）
 - 色板严格取 Catppuccin Latte 官方值；Mauve #8839EF 唯一强调色。

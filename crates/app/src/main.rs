@@ -1,3 +1,10 @@
+// release 版按 GUI 程序链接（PE subsystem = Windows），双击 exe 不会再弹一个 cmd 窗口。
+// debug 版保留控制台子系统，方便直接看到 eprintln! 诊断输出。
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 //! Simple Media Player — 主入口
 //!
 //! M1（Stage 2+3）：音频播放内核 + 播放列表管理。
