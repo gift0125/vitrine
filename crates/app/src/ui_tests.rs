@@ -487,3 +487,54 @@ fn dropping_files_adds_them_and_starts_playback(cx: &mut TestAppContext) {
         );
     });
 }
+
+// ----------------------------------------------------------------------
+// 提示：视频模式不能用 in-app toast（被 mpv 叠加窗盖住）
+// ----------------------------------------------------------------------
+
+/// 视频模式下整块内容区被 mpv 的叠加窗口盖着，gpui-component 的 toast 落在里面
+/// 等于不可见——用户拖进一个片子，界面上什么反馈都没有。所以视频模式改画标题带
+/// 上的小胶囊（那条带子在叠加窗之上）。
+#[gpui_kit::test]
+fn video_mode_uses_title_band_pill_instead_of_toast(cx: &mut TestAppContext) {
+    fresh_dir("pill");
+    let (window, view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+
+        // 音频模式：提示走右上角 toast，标题带里不该有胶囊
+        view.update(cx, |view, cx| {
+            view.test_notify("已导入 1 个文件", window, cx);
+        });
+        window.render_frame(cx);
+        assert!(
+            window.try_find("status-pill").is_none(),
+            "音频模式应走 toast，不要在标题带里叠胶囊"
+        );
+
+        // 视频模式：同一条提示改画胶囊，而且必须落在标题带内
+        view.update(cx, |view, cx| {
+            view.test_set_video_mode(true);
+            view.test_notify("已导入 1 个文件", window, cx);
+        });
+        window.render_frame(cx);
+
+        let bounds = window
+            .try_find("status-pill")
+            .expect("视频模式必须在标题带里画出状态胶囊")
+            .bounds();
+        assert!(
+            bounds.bottom() <= px(crate::player_view::TITLE_BAND),
+            "胶囊要压在标题带内（否则会被叠加窗盖住），实际: {bounds:?}"
+        );
+        assert!(
+            view.read(cx)
+                .snapshot()
+                .pill
+                .is_some_and(|text| text.contains("已导入 1 个文件")),
+            "胶囊文案应是刚发生的提示"
+        );
+    })
+    .unwrap();
+}

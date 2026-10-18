@@ -43,7 +43,9 @@ const SEEK_FALLBACK_MAX: f32 = 600.0;
 /// 轮询间隔（计划约定 100ms）。
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 /// 顶部标题带高度（系统标题栏已关闭，这一段是自绘拖拽区 + 窗口按钮）。
-const TITLE_BAND: f32 = 34.0;
+///
+/// `theme::install` 也读它来给 toast 让位，所以是 `pub(crate)`。
+pub(crate) const TITLE_BAND: f32 = 34.0;
 /// 底部悬浮胶囊的内缩。
 const CAPSULE_INSET: f32 = 24.0;
 /// 底部为悬浮胶囊预留的高度。
@@ -57,6 +59,11 @@ const BOTTOM_BAND: f32 = 116.0;
 const DROP_HINT_IDLE: Duration = Duration::from_millis(250);
 /// 窗口按钮宽度：Windows 10/11 的标题栏按钮就是 46 宽、与标题栏等高。
 const CAPTION_BUTTON_WIDTH: f32 = 46.0;
+/// 视频模式下状态胶囊的存活时间。
+///
+/// 它替代了 toast，没有「手动关闭」的入口，只能靠时间退场；4s 够读完一行
+/// 「已导入 3 个文件 · 正在播放「xxx」」，又不至于在画面顶上挂太久。
+const STATUS_PILL_DURATION: Duration = Duration::from_secs(4);
 /// 悬浮播放列表面板宽度（设计稿 320）。
 const PLAYLIST_WIDTH: f32 = 320.0;
 /// 时间码字体（设计稿用等宽）。
@@ -147,6 +154,13 @@ pub struct PlayerView {
     drop_activity: Rc<Cell<Option<Instant>>>,
     /// 上一帧是否画了拖放提示（tick 用它判断要不要重绘）
     drop_hint_shown: bool,
+    /// 视频模式下的临时状态胶囊（文案, 出现时刻, 是否错误）。
+    ///
+    /// 视频模式下 mpv 叠加窗盖住了整个内容区，gpui-component 的 toast 落在里面
+    /// 等于不可见，所以改成画在标题带上的小胶囊（那条带子在叠加窗之上）。
+    status_pill: Option<(SharedString, Instant, bool)>,
+    /// 上一帧是否画了状态胶囊（tick 用它判断要不要重绘）
+    status_pill_shown: bool,
     /// 最近一条错误（便于测试断言，也给未来的状态栏复用）
     last_error: Option<SharedString>,
 }
@@ -290,6 +304,8 @@ impl PlayerView {
             pending_autoplay: autoplay,
             drop_activity: Rc::new(Cell::new(None)),
             drop_hint_shown: false,
+            status_pill: None,
+            status_pill_shown: false,
         };
 
         // 100ms 轮询：进度同步 + 自动连播 + 叠加窗口跟随 + 窗口尺寸节流落盘
@@ -325,14 +341,37 @@ impl PlayerView {
         self.pending_infos.push(message.into());
     }
 
-    /// 把排队的提示推成右上角 toast（错误用 `Notification::error`，其余 info）。
+    /// 把排队的提示弹出来。
+    ///
+    /// 两种呈现方式，取决于**底色**：音频模式用右上角 toast（gpui-component 的
+    /// 通知层，位置固定、会自己排队）；视频模式整块内容区被 mpv 叠加窗盖着，
+    /// in-app toast 等于不可见，所以改成标题带里的小胶囊（见 `status_pill`）。
     fn flush_errors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let to_pill = self.video_active;
         for message in std::mem::take(&mut self.pending_errors) {
-            window.push_notification(Notification::error(message), cx);
+            if to_pill {
+                self.status_pill = Some((message, Instant::now(), true));
+            } else {
+                window.push_notification(Notification::error(message), cx);
+            }
         }
         for message in std::mem::take(&mut self.pending_infos) {
-            window.push_notification(Notification::info(message), cx);
+            if to_pill {
+                self.status_pill = Some((message, Instant::now(), false));
+            } else {
+                window.push_notification(Notification::info(message), cx);
+            }
         }
+    }
+
+    /// 视频模式下的状态胶囊是否还在有效期内。
+    fn status_pill_live(&self) -> Option<&(SharedString, Instant, bool)> {
+        if !self.video_active {
+            return None;
+        }
+        self.status_pill
+            .as_ref()
+            .filter(|(_, shown_at, _)| shown_at.elapsed() < STATUS_PILL_DURATION)
     }
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -357,6 +396,14 @@ impl PlayerView {
             .is_some_and(|stamp| stamp.elapsed() < DROP_HINT_IDLE);
         if dragging != self.drop_hint_shown {
             self.drop_hint_shown = dragging;
+            cx.notify();
+        }
+
+        // 状态胶囊：出现和到点消失都只能由 tick 发现（没有别的事件会碰它），
+        // 所以这里统一比对「这帧该不该画」，变了就重绘一次。
+        let pill_live = self.status_pill_live().is_some();
+        if pill_live != self.status_pill_shown {
+            self.status_pill_shown = pill_live;
             cx.notify();
         }
 
@@ -1003,8 +1050,9 @@ impl PlayerView {
                 .collect::<Vec<_>>()
                 .join(" | ")
         ));
-        // 让用户立刻看到"东西进来了"，而不是猜有没有成功
-        self.playlist_open = true;
+        // 不自动展开右侧歌单：视频模式下展开会让画面整体让位，
+        // 用户只是打开/拖进一个文件，却被顶开一块面板反而碍事。
+        // 结果用一条 toast 说清楚（见 append_dropped_and_play），面板开合仍是用户自己决定。
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -1055,7 +1103,8 @@ impl PlayerView {
             seen.push(key);
             fresh.push(track);
         }
-        if !fresh.is_empty() {
+        let added = fresh.len();
+        if added > 0 {
             self.append_tracks(fresh, cx);
         }
 
@@ -1070,7 +1119,18 @@ impl PlayerView {
             })
         });
         match target {
-            Some(index) => self.play_track(index, cx),
+            Some(index) => {
+                self.play_track(index, cx);
+                let title = self
+                    .current_track(cx)
+                    .map(|track| track.title)
+                    .unwrap_or_default();
+                self.report_info(if added > 0 {
+                    format!("已导入 {added} 个文件 · 正在播放「{title}」")
+                } else {
+                    format!("正在播放「{title}」")
+                });
+            }
             None => cx.notify(),
         }
     }
@@ -1182,6 +1242,45 @@ impl PlayerView {
         }
     }
 
+    /// 标题带右侧的状态胶囊（视频模式下代替 toast）。
+    ///
+    /// 底色一定按浮层口径画：它只在 `video_active` 时出现，那一块 chrome 是深色画布。
+    fn render_status_pill(
+        &self,
+        message: &SharedString,
+        is_error: bool,
+    ) -> impl gpui_kit::IntoElement {
+        let (icon, tint) = if is_error {
+            (IconName::CircleX, overlay::danger())
+        } else {
+            (IconName::CircleCheck, overlay::accent())
+        };
+
+        h_flex()
+            .id("status-pill")
+            .test_support()
+            .flex_shrink(1.)
+            .min_w_0()
+            .items_center()
+            .gap(px(6.))
+            .px(px(10.))
+            .py(px(4.))
+            .mr(px(8.))
+            .rounded(px(999.))
+            .bg(overlay::glass())
+            .border_1()
+            .border_color(overlay::border())
+            .child(Icon::new(icon).size(px(12.)).text_color(tint))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.))
+                    .text_color(overlay::fg())
+                    .child(message.clone()),
+            )
+    }
+
     /// 顶部标题带：当前曲名 + 自绘窗口按钮（系统标题栏已在 main 里关掉）。
     fn render_title_band(&self, window: &Window, cx: &Context<Self>) -> Div {
         // 最大化时 Windows 会把"最大化"换成"还原"图标
@@ -1219,9 +1318,13 @@ impl PlayerView {
                             .child(title),
                     ),
             )
+            .when_some(self.status_pill_live(), |el, (message, _, is_error)| {
+                el.child(self.render_status_pill(message, *is_error))
+            })
             .child(
                 h_flex()
                     .flex_shrink_0()
+                    .h_full()
                     .items_center()
                     .when(self.cinema, |el| {
                         // 影院模式下仍然留一个退出按钮，否则用户没法回到普通窗口
@@ -1891,6 +1994,8 @@ pub(crate) struct ViewSnapshot {
     pub playing: bool,
     /// 是否成功打开了音频输出设备（无设备时播放路径会降级）
     pub using_audio_device: bool,
+    /// 当前画在标题带里的状态胶囊文案（视频模式专属）
+    pub pill: Option<String>,
 }
 
 #[cfg(test)]
@@ -1902,7 +2007,29 @@ impl PlayerView {
             last_error: self.last_error.as_ref().map(|s| s.to_string()),
             playing: self.playback_state().is_playing(),
             using_audio_device: self.engine.is_some(),
+            pill: self
+                .status_pill_live()
+                .map(|(message, _, _)| message.to_string()),
         }
+    }
+
+    /// 测试用：直接切「视频模式」开关。
+    ///
+    /// 真切换要起 mpv（`play_track` → `start_video`），测试环境里没有；
+    /// 而「视频用胶囊、音频用 toast」只取决于 `video_active` 这一个布尔。
+    pub(crate) fn test_set_video_mode(&mut self, on: bool) {
+        self.video_active = on;
+    }
+
+    /// 测试用：模拟一次用户可见提示，并立刻走 tick 里的分发逻辑。
+    pub(crate) fn test_notify(
+        &mut self,
+        message: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.report_info(message.to_string());
+        self.flush_errors(window, cx);
     }
 }
 
@@ -2012,7 +2139,10 @@ fn caption_button(
     div()
         .id(id)
         .w(px(CAPTION_BUTTON_WIDTH))
-        .h_full()
+        // 高度写死成标题带高度，**不能用 `h_full()`**：外面那圈 `h_flex()` 没有显式高度
+        // （高度由内容撑开），`height: 100%` 在不定高父级上会退化成 auto，
+        // 按钮就只剩图标那 10px 高——悬停底色成了一条横线（用户就是这么发现的）。
+        .h(px(TITLE_BAND))
         .flex_shrink_0()
         .flex()
         .items_center()

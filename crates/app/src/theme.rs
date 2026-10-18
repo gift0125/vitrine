@@ -263,6 +263,14 @@ pub mod overlay {
         gpui_kit::rgb(0xCBA6F7).into()
     }
 
+    /// 浮层上的警示色：Mocha 的 Red。
+    ///
+    /// 暗玻璃上用浅色主题的 `danger`（#D20F39）只有 3:1 出头，读起来发闷；
+    /// Mocha 的 #F38BA8 在 #0B0C10 上有 9:1，和 `accent` 同一档亮度。
+    pub fn danger() -> Hsla {
+        gpui_kit::rgb(0xF38BA8).into()
+    }
+
     /// 播放键：仍是品牌 Mauve（设计稿明确浮层里只有它用这个色）
     pub fn play() -> Hsla {
         gpui_kit::rgb(0x8839EF).into()
@@ -278,6 +286,16 @@ pub fn install(cx: &mut App, dark: bool) {
         theme.light_theme = light.clone();
         theme.dark_theme = dark_cfg;
         theme.apply_config(&light);
+
+        // toast 的位置和宽度一并按本项目口径改掉。
+        //
+        // 标题栏是我们自绘的（`TitlebarOptions.appears_transparent`），gpui-component
+        // 不知道它有多高，默认只让开 TITLE_BAR_HEIGHT + 16 = 50——正好贴着最小化/
+        // 关闭按钮的下沿，看着像压在按钮上。这里让开「标题带 + 12」。
+        // 宽度同理：默认 382 在 1040 宽的窗口里占 37%，像一块公告板。
+        theme.notification.margins.top = gpui_kit::px(crate::player_view::TITLE_BAND + 12.);
+        theme.notification.margins.right = gpui_kit::px(16.);
+        theme.notification.width = gpui_kit::px(320.);
     });
 
     if dark {

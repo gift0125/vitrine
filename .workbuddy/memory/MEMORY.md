@@ -35,6 +35,9 @@
 - `drag_over::<T>` 的样式回调只给 `&StyleRefinement`：**拿不到 `Context`**，改不了字段也 `notify` 不了。要视觉反馈就把时间戳写进 `Cell<Option<Instant>>`，由 100ms tick 判断并 `notify`（`on_file_drop_exit` 只给 `&mut App`、只对 `Exited` 且仍 hover 时触发，不够稳）。
 - 标题栏窗口按钮：`IconName::WindowMinimize/Maximize/Close` 是 24 网格 + 2px 描边，缩到 10px 会糊；要手写 10×10、1px 描边的 SVG 用 `Icon::default().data(SVG_BYTES)`。按钮本体按 Windows 规范 **46 宽 × 标题栏高**，关闭键悬停 `#C42B1C`。
 - **chrome 前景色跟底色走，不跟主题走**：视频模式整块 chrome 是深色画布，此时用浅色主题的 `muted_foreground`/`secondary_foreground` 只有 ≈3:1 对比度（`chrome_fg`/`chrome_dim` 就是干这个的）。
+- **提示按底色分流**（`flush_errors`）：`video_active` → 标题带胶囊 `status_pill`（4s 自动退场，出现/消失由 tick 比对 `status_pill_shown` 触发重绘）；否则 `window.push_notification`。原因：视频模式内容区整块被 mpv 叠加窗盖着，in-app toast 等于没画。通知层位置/宽度在 `theme::install` 里改（`notification.margins.top = TITLE_BAND + 12`、`width = 320`），`apply_config`/`change` 不会重置它。
+- **`height: 100%` 在不定高父级上退化成 auto**：`h_flex()` 高度由内容撑开时，子元素 `.h_full()` 解析不出来（实测按钮只剩图标 10px 高，悬停底色成一条横线）。要写死 `.h(px(...))`，父级再补 `.h_full()`。
+- 测试侧：`window.find(id)` 缺元素会 **panic**，判"不存在"用 `try_find`（Option）；`bounds()` 直接返回 `Bounds`（不是 Option）。无头测试要覆盖视频模式用 `#[cfg(test)]` 的 `test_set_video_mode`/`test_notify`，不必真起 mpv。
 
 ## 设计稿要点（详见 2026-10-17 / 2026-10-18 日志）
 - 色板严格取 Catppuccin Latte 官方值；Mauve #8839EF 唯一强调色。**v2 起是两套色板**：应用表面 Latte/Mocha，叠加层（胶囊）深色玻璃，见 `theme::overlay`。

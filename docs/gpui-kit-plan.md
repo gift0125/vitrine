@@ -326,6 +326,52 @@ GPUI 的拖放链路：系统投放 → `FileDropEvent::Entered { position, path
 
 ---
 
+### 💬 提示的两种呈现 / 按钮悬停条（2026-10-18 第三轮修）
+
+用户反馈两条：**打开视频文件时弹一条 toast 就够，不要展开右侧面板**；**窗口按钮悬停时
+底色只有一条横条，没铺满**。
+
+**1. 打开/拖入不再自动展开歌单**
+
+`import_dropped` 里原来有 `self.playlist_open = true`（"让用户立刻看到东西进来了"）。
+但在视频模式下展开面板会挤占画面（画面右侧让位 344px），用户只是打开一个文件却被顶开
+一块面板，反而碍事。改为：不动面板，用一条提示回执（`已导入 N 个文件 · 正在播放「X」`）。
+
+**2. toast 在视频模式下根本不可见 → 换成标题带胶囊**
+
+发现的问题：视频模式整块内容区被 mpv 叠加窗盖着，gpui-component 的 toast 画在里面 = 没人看得见；
+而音频模式下默认位置（`TITLE_BAR_HEIGHT + 16 = 50`）正好贴着窗口按钮下沿，宽度 382
+在 1040 窗口里占 37%，像块公告板。
+
+处理：
+- `flush_errors` 按**底色**分流：`video_active` 时写 `status_pill`
+  （`Option<(SharedString, Instant, bool)>`），否则 `window.push_notification`。
+- 胶囊画在标题带右侧、窗口按钮左边（`id("status-pill")` + `.test_support()`），
+  玻璃底 + 状态图标，`STATUS_PILL_DURATION = 4s` 自动退场。
+- 有效期判断统一交给 tick（`status_pill_shown` 与当前状态比对后 `cx.notify()`）——
+  出现和消失都没有别的事件源，靠 tick 是唯一稳的办法（同拖放提示的处理）。
+- `theme::install` 里把通知层的 `margins.top` 改成 `TITLE_BAND + 12`、`width` 收到 320，
+  所以 `TITLE_BAND` 提升为 `pub(crate)`。
+
+**3. 按钮悬停条 = CSS `height: 100%` 在不定高父级上退化成 auto**
+
+`caption_button` 里写了 `.h_full()`，外层那圈 `h_flex()` 没有显式高度（高度由按钮撑开），
+于是 `height: 100%` 解析不出来 → 按钮只剩图标那 10px 高 → 悬停底色成了一条横线。
+修法：给按钮写死 `.h(px(TITLE_BAND))`，父级补 `.h_full()`。
+实测悬停块 = 46×34 逻辑像素（scale 1.5 下 69×46 物理像素），右上角关闭键整块 `#C42B1C`。
+
+**验证**：
+- 新用例 `video_mode_uses_title_band_pill_instead_of_toast`：音频模式断言
+  `try_find("status-pill")` 为空（走 toast）；切 `video_active` 后断言胶囊存在、
+  `bounds().bottom() <= TITLE_BAND`（必须压在叠加窗之上）、文案正确。
+  开关用 `#[cfg(test)]` 的 `test_set_video_mode` / `test_notify`，不必真起 mpv。
+- 真机：往叠加窗口投 `WM_DROPFILES` 后截图，标题带出现「已导入 1 个文件 · 正在播放」，
+  4s 后自动消失；音频模式用损坏的 wav 触发错误，toast 落在按钮下方。
+
+**测试** 15 + 17 全绿。
+
+---
+
 ## 4. 里程碑与时间线
 
 | 里程碑 | 内容 | 累计工期 |
