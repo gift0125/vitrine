@@ -39,6 +39,10 @@
 
 ![歌单悬浮在画面上，不挤占画面宽度](docs/screenshots/chroma-video-playlist.png)
 
+点胶囊左侧的 `ⓘ` 展开视频信息卡（再点收起）：
+
+![视频信息卡：分辨率/编码/码率/帧率/色彩/音频，浮在画面左下](docs/screenshots/chroma-video-info.png)
+
 ## 环境要求
 
 - **Windows 10 / 11**（当前只验证了 Windows；GPUI Kit 本身跨平台，代码里 macOS/Linux 分支未测试）
