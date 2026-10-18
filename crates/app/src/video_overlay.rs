@@ -85,6 +85,9 @@ const CS_DBLCLKS: u32 = 0x0008;
 
 const BLACK_BRUSH: i32 = 4;
 
+/// `GetWindow` 的「z 序里下一个（更靠下的）窗口」。
+const GW_HWNDNEXT: u32 = 2;
+
 const SWP_NOSIZE: u32 = 0x0001;
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOZORDER: u32 = 0x0004;
@@ -200,12 +203,15 @@ mod win {
         fn FillRect(hdc: Hwnd, rect: *const Rect, brush: Hwnd) -> i32;
         fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
         fn SetWindowLongPtrW(hwnd: Hwnd, index: i32, value: isize) -> isize;
+        fn GetWindow(hwnd: Hwnd, cmd: u32) -> Hwnd;
         fn ReleaseCapture() -> i32;
         fn SetCapture(hwnd: Hwnd) -> Hwnd;
         fn GetCursorPos(point: *mut Point) -> i32;
         fn SetForegroundWindow(hwnd: Hwnd) -> i32;
         fn IsZoomed(hwnd: Hwnd) -> i32;
         fn SetWindowRgn(hwnd: Hwnd, region: Hwnd, redraw: i32) -> i32;
+        fn GetDoubleClickTime() -> u32;
+        fn GetSystemMetrics(index: i32) -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -238,6 +244,9 @@ mod win {
     }
 
     const GWLP_USERDATA: i32 = -21;
+    /// 双击判据里的位移阈值（`GetSystemMetrics` 的索引）。
+    const SM_CXDOUBLECLK: i32 = 36;
+    const SM_CYDOUBLECLK: i32 = 37;
     /// 区域合并方式：加上一块 / 减掉一块。
     const RGN_OR: i32 = 2;
     const RGN_DIFF: i32 = 4;
@@ -279,6 +288,38 @@ mod win {
         }
     }
 
+    /// 上一次左键按下（时刻, 屏幕坐标）：自己判「双击的第二下」用。
+    static LAST_PRESS: std::sync::Mutex<Option<(std::time::Instant, i32, i32)>> =
+        std::sync::Mutex::new(None);
+
+    /// 这一下是不是双击的第二下。
+    ///
+    /// 不指望 `WM_LBUTTONDBLCLK`：这块窗口是 `WS_EX_NOACTIVATE`，系统对"没被激活的
+    /// 窗口"并不保证派发双击——实测（合成输入下稳定复现）只来两条
+    /// `WM_LBUTTONDOWN`，于是"双击画面最大化"变成了"点了两下没反应"。
+    /// 这里按系统同一套判据补一遍：时间取 `GetDoubleClickTime`，位移取
+    /// `SM_CXDOUBLECLK`/`SM_CYDOUBLECLK`，和真双击的语义一致。
+    fn take_double_press(x: i32, y: i32) -> bool {
+        let now = std::time::Instant::now();
+        let Ok(mut slot) = LAST_PRESS.lock() else {
+            return false;
+        };
+        let double = slot.is_some_and(|(at, px, py)| {
+            let window =
+                std::time::Duration::from_millis(u64::from(unsafe { GetDoubleClickTime() }));
+            let (slop_x, slop_y) = unsafe {
+                (
+                    GetSystemMetrics(SM_CXDOUBLECLK),
+                    GetSystemMetrics(SM_CYDOUBLECLK),
+                )
+            };
+            now.duration_since(at) <= window && (x - px).abs() <= slop_x && (y - py).abs() <= slop_y
+        });
+        // 成立就清空：连点三下算"一次双击 + 一次单击"，不能算两轮双击
+        *slot = if double { None } else { Some((now, x, y)) };
+        double
+    }
+
     fn collect_dropped(hdrop: Hwnd) {
         const ALL: u32 = 0xFFFF_FFFF;
         let count = unsafe { DragQueryFileW(hdrop, ALL, std::ptr::null_mut(), 0) };
@@ -318,32 +359,51 @@ mod win {
         if msg == WM_LBUTTONDOWN {
             // 画面这块不在主窗口的区域里，按下来的是我们：自己开一轮拖动。
             let main = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
-            if main != 0 && unsafe { IsIconic(main) } == 0 && unsafe { IsZoomed(main) } == 0 {
+            let mut cursor = Point::default();
+            unsafe {
+                GetCursorPos(&mut cursor);
+            }
+            trace(&format!(
+                "lbuttondown main={main} iconic={} zoomed={} at=({},{})",
+                unsafe { IsIconic(main) },
+                unsafe { IsZoomed(main) },
+                cursor.x,
+                cursor.y
+            ));
+            if main != 0 && unsafe { IsIconic(main) } == 0 {
                 // 先激活主窗口。这块窗口是 `WS_EX_NOACTIVATE`（点了不抢焦点才不闪），
                 // 所以系统不会替我们把主窗提到前台——不显式做一次，用户点画面
                 // 既不会激活窗口、第一次双击还会被系统当成「激活」吃掉。
                 activate(main);
-                let mut cursor = Point::default();
-                let mut rect = Rect::default();
-                unsafe {
-                    GetCursorPos(&mut cursor);
-                    GetWindowRect(main, &mut rect);
+                // 双击自己判（`WM_LBUTTONDBLCLK` 在合成输入下不会来），见 take_double_press
+                if take_double_press(cursor.x, cursor.y) {
+                    // 第一下可能已经开了拖动（正常会有 UP 收尾，这里兜一层）
+                    end_drag(hwnd);
+                    let zoomed = unsafe { IsZoomed(main) } != 0;
+                    trace(&format!("double press -> set_zoomed(zoomed={})", !zoomed));
+                    crate::window_actions::set_zoomed(main, !zoomed);
+                    return 0;
                 }
-                if let Ok(mut slot) = DRAG.lock() {
-                    *slot = Some(Drag {
-                        overlay: hwnd,
-                        main,
-                        cursor: (cursor.x, cursor.y),
-                        origin: (rect.left, rect.top),
-                    });
-                }
-                unsafe {
-                    SetCapture(hwnd);
+                if unsafe { IsZoomed(main) } == 0 {
+                    let mut rect = Rect::default();
+                    unsafe {
+                        GetWindowRect(main, &mut rect);
+                    }
+                    if let Ok(mut slot) = DRAG.lock() {
+                        *slot = Some(Drag {
+                            overlay: hwnd,
+                            main,
+                            cursor: (cursor.x, cursor.y),
+                            origin: (rect.left, rect.top),
+                        });
+                    }
+                    unsafe {
+                        SetCapture(hwnd);
+                    }
                 }
                 return 0;
             }
-            // 最大化/最小化状态下不拖：拖一个最大化窗口得先去掉 WS_MAXIMIZE，
-            // 那是拖到一半变形的另一套状态机，双击还原就够了。
+            // 最小化状态下不拖也不双击：那是"还原窗口"的活儿，交给系统/任务栏。
         }
         if msg == WM_MOUSEMOVE {
             if let Some(drag) = drag_of(hwnd) {
@@ -352,6 +412,7 @@ mod win {
                     GetCursorPos(&mut cursor);
                     let x = drag.origin.0 + (cursor.x - drag.cursor.0);
                     let y = drag.origin.1 + (cursor.y - drag.cursor.1);
+                    trace(&format!("drag -> main@({x},{y})"));
                     SetWindowPos(
                         drag.main,
                         0,
@@ -385,7 +446,14 @@ mod win {
             let main = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
             if main != 0 {
                 activate(main);
+                end_drag(hwnd);
+                // 系统已经认了这一轮双击，把自判的按下记录清掉，
+                // 否则紧跟着的单击会被自判逻辑当成"第二下"。
+                if let Ok(mut slot) = LAST_PRESS.lock() {
+                    *slot = None;
+                }
                 let zoomed = unsafe { IsZoomed(main) } != 0;
+                trace(&format!("dblclk -> set_zoomed(zoomed={})", !zoomed));
                 crate::window_actions::set_zoomed(main, !zoomed);
             }
             return 0;
@@ -416,6 +484,16 @@ mod win {
             unsafe {
                 SetForegroundWindow(main);
             }
+        }
+    }
+
+    /// 输入桥的诊断留痕（`SMP_OVERLAY_TRACE` 打开）。
+    ///
+    /// 合成鼠标事件与窗口消息是两套时序，出了问题只有把"收到什么消息、据此做了什么"
+    /// 落盘才说得清（双击被吞、按住画面变最大化这类）。
+    fn trace(message: &str) {
+        if std::env::var_os("SMP_OVERLAY_TRACE").is_some() {
+            crate::persistence::log_session(&format!("overlay: {message}"));
         }
     }
 
@@ -556,6 +634,21 @@ mod win {
         }
     }
 
+    /// 视频窗现在是不是就压在 `main` 正下方（`GW_HWNDNEXT` 就是它）。
+    ///
+    /// 只查不改：z 序会被别的进程（`BringWindowToTop`、新窗口插进来）打乱，
+    /// 查一次比每 100ms 都打一次 `SetWindowPos` 便宜得多。
+    pub fn is_below(hwnd: Hwnd, main: Hwnd) -> bool {
+        hwnd != 0 && main != 0 && unsafe { GetWindow(main, GW_HWNDNEXT) } == hwnd
+    }
+
+    /// z 序不对才纠正（每帧调这个，正确时只是一次 `GetWindow`）。
+    pub fn ensure_below(hwnd: Hwnd, main: Hwnd) {
+        if !is_below(hwnd, main) {
+            keep_below(hwnd, main);
+        }
+    }
+
     pub fn is_minimized(hwnd: Hwnd) -> bool {
         hwnd != 0 && unsafe { IsIconic(hwnd) } != 0
     }
@@ -663,6 +756,10 @@ mod win {
     pub fn hide(_hwnd: Hwnd) {}
     pub fn set_rect(_hwnd: Hwnd, _x: i32, _y: i32, _w: i32, _h: i32, _visible: bool) {}
     pub fn keep_below(_hwnd: Hwnd, _main: Hwnd) {}
+    pub fn is_below(_hwnd: Hwnd, _main: Hwnd) -> bool {
+        true
+    }
+    pub fn ensure_below(_hwnd: Hwnd, _main: Hwnd) {}
     pub fn is_minimized(_hwnd: Hwnd) -> bool {
         false
     }
@@ -702,16 +799,17 @@ impl VideoOverlay {
         self.visible
     }
 
-    /// 设置位置尺寸（物理屏幕像素）。位置未变化时不重复调用 SetWindowPos。
+    /// 设置位置尺寸（物理屏幕像素）。位置未变化时不再移动窗口。
+    ///
+    /// 但 z 序**每次都要查**：位置没变不代表压在被主窗口下面——别的进程把主窗口
+    /// 提到最前、或我们自己 `ShowWindow` 过，都可能把它翻上来盖住 chrome。
     pub fn set_rect(&mut self, x: i32, y: i32, width: i32, height: i32) {
         let rect = (x, y, width.max(1), height.max(1));
-        if rect == self.rect {
-            return;
+        if rect != self.rect {
+            self.rect = rect;
+            win::set_rect(self.hwnd, rect.0, rect.1, rect.2, rect.3, self.visible);
         }
-        self.rect = rect;
-        win::set_rect(self.hwnd, rect.0, rect.1, rect.2, rect.3, self.visible);
-        // z 序不会因为改尺寸自动维持，改完补一次
-        win::keep_below(self.hwnd, self.main);
+        win::ensure_below(self.hwnd, self.main);
     }
 
     pub fn show(&mut self) {

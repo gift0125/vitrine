@@ -70,6 +70,12 @@ pub struct VideoStatus {
     pub duration: f64,
     /// mpv 当前是否暂停
     pub paused: bool,
+    /// 视频显示尺寸（像素）：mpv 的 `dwidth`/`dheight`，已按像素宽高比与旋转校正。
+    ///
+    /// 音频文件、尚未解码出画、idle 时为 0。UI 拿它把窗口调成画面的比例
+    /// （窗口尺寸 = 内容尺寸，画面刚好铺满、不留黑边）。
+    pub width: u32,
+    pub height: u32,
     /// 未加载任何文件
     pub idle: bool,
     /// 已自然播放结束（end-file reason=eof）
@@ -246,6 +252,10 @@ impl VideoEngine {
             (2, "duration"),
             (3, "pause"),
             (4, "idle-active"),
+            // 画面尺寸：`d*` 是「实际显示尺寸」（含像素宽高比校正与旋转），
+            // `width`/`height` 只是编码尺寸，变形画面的比例会算错。
+            (5, "dwidth"),
+            (6, "dheight"),
         ] {
             engine.send(serde_json::json!({ "command": ["observe_property", id, name] }));
         }
@@ -465,6 +475,17 @@ fn trace(line: &str) {
     }
 }
 
+/// 把 mpv 报的尺寸属性取成正数（像素）。
+///
+/// 未加载文件时 mpv 回 `null`，解码出画之前可能是 `0` 甚至负数（`--video-rotate`
+/// 相关的边界情况），这些都当「还不知道」处理。
+fn dimension(data: &serde_json::Value) -> u32 {
+    data.as_i64()
+        .filter(|v| *v > 0)
+        .map(|v| v.min(u32::MAX as i64) as u32)
+        .unwrap_or(0)
+}
+
 /// 解析单行 mpv 事件并更新状态。
 fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
     trace(&format!("<- {line}"));
@@ -504,6 +525,12 @@ fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
                     // mpv 在 idle 时 pause 可能为 null
                     st.paused = data.as_bool().unwrap_or(false);
                 }
+                "dwidth" => {
+                    st.width = dimension(&data);
+                }
+                "dheight" => {
+                    st.height = dimension(&data);
+                }
                 "idle-active" => {
                     if let Some(idle) = data.as_bool() {
                         st.idle = idle;
@@ -516,6 +543,10 @@ fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
             st.finished = false;
             st.error = None;
             st.position = 0.0;
+            // 上一部片子的尺寸不能留给下一部：UI 会据此把窗口调成画面比例，
+            // 留着旧值就会先跳成上一部片的形状，再跳回来。
+            st.width = 0;
+            st.height = 0;
         }
         "file-loaded" => {
             st.idle = false;
@@ -654,6 +685,37 @@ mod tests {
         assert!(st.error.is_none());
         assert!(!st.finished);
         assert_eq!(st.position, 0.0);
+    }
+
+    /// 画面尺寸必须能读到——UI 靠它把窗口调成画面比例（窗口 = 内容）。
+    ///
+    /// 用 `dwidth`/`dheight` 而不是 `width`/`height`：后者是编码尺寸，
+    /// 非方形像素的片子（老 DVD rip）按它算比例会拉变形。
+    #[test]
+    fn display_size_is_tracked() {
+        let status = Arc::new(Mutex::new(VideoStatus::default()));
+        handle_line(
+            r#"{"event":"property-change","name":"dwidth","data":1920}"#,
+            &status,
+        );
+        handle_line(
+            r#"{"event":"property-change","name":"dheight","data":1080}"#,
+            &status,
+        );
+        let st = status.lock().unwrap().clone();
+        assert_eq!((st.width, st.height), (1920, 1080));
+
+        // 换片时清空：否则会先按上一部片的形状跳一下窗口
+        handle_line(r#"{"event":"start-file"}"#, &status);
+        let st = status.lock().unwrap();
+        assert_eq!((st.width, st.height), (0, 0));
+        drop(st);
+        // idle / 未解码时 mpv 回 null，不能被当成 0 之外的怪值
+        handle_line(
+            r#"{"event":"property-change","name":"dwidth","data":null}"#,
+            &status,
+        );
+        assert_eq!(status.lock().unwrap().width, 0);
     }
 
     #[test]

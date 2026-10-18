@@ -135,6 +135,16 @@ pub struct PlayerView {
     video_active: bool,
     /// 视频内核不可用时的提示文案
     video_error: Option<String>,
+    /// 已经按哪一部片子的尺寸调过窗口（画面宽高）。
+    ///
+    /// 每部片子只调一次：用户手动拉伸过窗口之后，不能在下一个 tick 又弹回去。
+    fit_done: Option<(u32, u32)>,
+    /// 待确认的画面尺寸（宽、高、**已连续见到几次**）。
+    ///
+    /// mpv 的 `dwidth/dheight` 不止报一次：实测 1280×720 的片子起播时先报
+    /// 960×540，隔一帧才报真值。按第一份数据调窗口会先跳到一个错的尺寸再跳回来，
+    /// 所以同一个值连着出现两次才动手。
+    fit_seen: Option<(u32, u32, u8)>,
     /// render 阶段由 canvas 捕获的视频区（窗口逻辑坐标 x, y, w, h）
     video_rect: VideoRectCell,
     /// render 阶段由 canvas 捕获的控制胶囊矩形。
@@ -325,6 +335,8 @@ impl PlayerView {
             video: VideoRuntime::default(),
             video_active: false,
             video_error: None,
+            fit_done: None,
+            fit_seen: None,
             video_rect,
             capsule_rect,
             chrome_region: None,
@@ -501,10 +513,11 @@ impl PlayerView {
 
         // 窗口尺寸节流落盘（变化后 ~5s 保存一次）
         // 影院模式下 bounds 是全屏尺寸、最大化时是最大化尺寸，都不能当窗口尺寸存
-        // （否则下次启动会开成全屏大小 / 贴着屏幕边）。
+        // （否则下次启动会开成全屏大小 / 贴着屏幕边）。视频模式也不存：那份尺寸是
+        // 按画面算出来的，存下来会让"音频模式"的默认窗口跟着某部片子的比例走。
         let bounds = window.bounds();
         let size = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
-        if self.cinema || self.maximized || size == self.last_saved_size {
+        if self.cinema || self.maximized || self.video_active || size == self.last_saved_size {
             self.window_dirty_ticks = 0;
         } else {
             self.window_dirty_ticks += 1;
@@ -561,6 +574,9 @@ impl PlayerView {
             self.rebuild_seek(status.duration as f32, cx);
         }
 
+        // 窗体大小 = 内容大小：画面尺寸一报到就把窗口调成同样的尺寸/比例
+        self.fit_to_video_source(status.width, status.height, window, cx);
+
         if status.finished {
             let count = self.playlist.read(cx).delegate().track_count();
             match self.current {
@@ -590,6 +606,55 @@ impl PlayerView {
                 state.set_value(status.position as f32, window, cx);
             });
         }
+    }
+
+    /// 把窗口调成画面的尺寸与比例（窗体大小 = 内容大小）。
+    ///
+    /// 每部片子只调一次：mpv 要解码出第一帧才知道 `dwidth/dheight`，而那个值
+    /// 还会先报一份中间值——所以等它连着两帧不变才动手（见 `fit_seen`）；调完
+    /// 之后用户自己拉伸窗口，不能再弹回去。
+    ///
+    /// 最大化 / 影院模式下不调——那两种状态的尺寸归系统管，按画面去改等于把用户
+    /// 刚放大的窗口打回原形。等退出这两种状态，`fit_done` 还是 `None`，下一帧
+    /// 自然补上。
+    fn fit_to_video_source(
+        &mut self,
+        width: u32,
+        height: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if width < 2 || height < 2 || self.main_hwnd == 0 {
+            return;
+        }
+        if self.fit_done == Some((width, height)) {
+            return;
+        }
+        // 先确认这个尺寸是**稳定**的：同一个值连着报两次才当真。mpv 起播时会先给
+        // 一份中间值（1280×720 的片子报 960×540），按它调窗口会白跳一下。
+        let repeats = match self.fit_seen {
+            Some((w, h, seen)) if (w, h) == (width, height) => seen.saturating_add(1),
+            _ => 0,
+        };
+        self.fit_seen = Some((width, height, repeats));
+        if repeats == 0 {
+            return;
+        }
+        if self.maximized || self.cinema || window.is_fullscreen() {
+            return;
+        }
+        self.fit_done = Some((width, height));
+
+        let main = self.main_hwnd;
+        // 这条命令必须放到下一轮消息循环里执行：`SetWindowPos` 会**同步**回调
+        // GPUI 的 `WM_SIZE` → 重新布局，而此刻 App 正被本轮更新借用，回调拿不到
+        // 借用权，布局就停在旧尺寸上（`window_actions` 模块头记着同一个坑）。
+        // 前台任务由平台投递到消息队列后运行，和 GPUI 自己的 `Window::resize`
+        // 是同一套路。
+        cx.spawn_in(window, async move |_this, _cx| {
+            window_actions::fit_to_video(main, (width, height));
+        })
+        .detach();
     }
 
     /// 让叠加窗口对齐 canvas 捕获的视频区，并压在主窗口正下方。
@@ -800,6 +865,9 @@ impl PlayerView {
     fn start_video(&mut self, track: &TrackMeta, cx: &mut Context<Self>) {
         self.video_error = None;
         self.video_active = true;
+        // 换片了：等新片子的尺寸出来再调窗口（旧尺寸不能沿用）
+        self.fit_done = None;
+        self.fit_seen = None;
 
         if self.main_hwnd == 0 {
             self.video_active = false;

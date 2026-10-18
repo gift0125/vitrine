@@ -3,6 +3,8 @@
 用法：python scripts/verify_floating_chrome.py
 
 第七轮（视频窗挪到主窗下面）之后的判据：
+0. **窗体大小 = 内容大小** —— 起播后窗口按画面像素 1:1 调整（`dwidth/dheight`
+   → `window_actions::fit_to_video`），客户区比例等于画面比例，右缘不是黑边。
 1. **画面区露出来了** —— 主窗口把自己的画面区从窗口区域里减掉了。没减的话，
    被整块盖住的视频窗会停止出帧，屏幕中心就不是彩条而是主窗口的底色；
    同时用 `GetWindowRgn` 直接确认「区域已设且不是整窗」。
@@ -117,32 +119,6 @@ if owner.value != proc.pid:
     raise SystemExit(f"找到的窗口不属于本次启动的进程（{owner.value} ≠ {proc.pid}），先清掉残留实例")
 
 scale = user32.GetDpiForWindow(hwnd) / 96.0
-# 窗口尺寸：按**目标客户区**反推外框。`AdjustWindowRectExForDpi` 在这类自绘标题栏
-# （`WM_NCCALCSIZE` 返回 0）的窗口上会多算一个标题栏高度，所以先拿它当起点，
-# 再按实测客户区差值补两次——比任何公式都准。
-style = user32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
-target = (round(width * scale), round(height * scale))
-box = wintypes.RECT(0, 0, target[0], target[1])
-user32.AdjustWindowRectExForDpi(
-    ctypes.byref(box), style, False, 0, user32.GetDpiForWindow(hwnd)
-)
-user32.SetWindowPos(
-    hwnd, HWND_TOPMOST, 0, 0, box.right - box.left, box.bottom - box.top, SWP_SHOWWINDOW
-)
-time.sleep(0.6)
-for _ in range(3):
-    r = wintypes.RECT()
-    user32.GetClientRect(hwnd, ctypes.byref(r))
-    dw, dh = target[0] - r.right, target[1] - r.bottom
-    if abs(dw) <= 1 and abs(dh) <= 1:
-        break
-    o = wintypes.RECT()
-    user32.GetWindowRect(hwnd, ctypes.byref(o))
-    user32.SetWindowPos(
-        hwnd, HWND_TOPMOST, 0, 0,
-        (o.right - o.left) + dw, (o.bottom - o.top) + dh, SWP_SHOWWINDOW,
-    )
-    time.sleep(0.5)
 
 overlay = user32.FindWindowW("SimpleMediaPlayerVideoOverlay", None)
 print(f"overlay hwnd = {overlay}")
@@ -188,13 +164,6 @@ def region_box():
     ctypes.windll.gdi32.DeleteObject(rgn)
     return kind, (r.left, r.top, r.right - r.left, r.bottom - r.top)
 
-
-# 逻辑尺寸取**实测客户区**：SetWindowPos 设的是外框，客户区实测 1898×1189 物理
-# ÷1.5 = 1265×793，跟设的 1280×800 差几像素。按目标尺寸换算的话所有坐标整体
-# 偏掉一点，点胶囊右侧那排 28px 的图标就会点到间隙里（踩过）。
-cw0, ch0 = client_rect()
-lw, lh = cw0 / scale, ch0 / scale
-print(f"client = {cw0}x{ch0} 逻辑 = {lw:.1f}x{lh:.1f}  scale = {scale}")
 
 # 抢前台：脚本所在进程不在前台时，`SetForegroundWindow` 会被系统拒绝（只有前台
 # 进程才有权抢），而**第一次落在窗口上的点击会被吃掉用于激活**——表现为"点了没
@@ -269,11 +238,15 @@ def click(lx, ly):
 
 
 def double_click(lx, ly):
-    """在画面区双击（叠加窗 → HTCAPTION 双击转交）。"""
+    """在画面区双击（叠加窗自己处理 WM_LBUTTONDBLCLK → 最大化/还原）。"""
     ox, oy = client_origin()
     sx, sy = ox + round(lx * scale), oy + round(ly * scale)
+    # 和 `click` 一样：先离开一点再进来，否则光标已经在那儿时窗口收不到 WM_MOUSEMOVE，
+    # 第一下点击会被系统当成"在窗外按下"而丢掉。
+    user32.SetCursorPos(sx - 40, sy)
+    time.sleep(0.12)
     user32.SetCursorPos(sx, sy)
-    time.sleep(0.15)
+    time.sleep(0.2)
     for _ in range(2):
         user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         time.sleep(0.03)
@@ -315,6 +288,92 @@ def check_aligned(tag):
     print(f"  [{tag}] 主窗外框 = {main}  视频窗外框 = {ovl}  差 = {delta}")
     return delta == (0, 0, 0, 0)
 
+
+def wait_aligned(timeout=2.0):
+    """等视频窗追上主窗口的新几何。
+
+    窗口刚被改过尺寸时，叠加窗要等下一帧（canvas 重新上报视频区）+ 100ms tick
+    才跟上来；这期间截图会拍到"画面还停在旧位置、右边露出桌面/别的窗口"，
+    看起来像"没铺满"，其实是取样太早。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if frame_rect(overlay) == frame_rect():
+            return True
+        time.sleep(0.1)
+    return frame_rect(overlay) == frame_rect()
+
+
+# ---- 0. 窗体大小 = 内容大小 ---------------------------------------------
+# 起播后窗口会按画面调一次尺寸：mpv 报 `dwidth/dheight` → `window_actions::fit_to_video`。
+# 判据用**像素级**的：客户区应等于画面像素（1:1，不做缩放），比例应等于画面比例。
+# 样片都是 16:9，这里按文件名给出期望像素；换样片时改这张表。
+EXPECTED_PIXELS = {"verify-long.mp4": (1280, 720), "gen-1080p.mp4": (1920, 1080)}
+fit_client = wait_client_settled()
+fit_w, fit_h = fit_client[0] / scale, fit_client[1] / scale
+print(
+    f"起播后客户区 = {fit_client[0]}x{fit_client[1]} 物理"
+    f" → 逻辑 {fit_w:.1f}x{fit_h:.1f}"
+)
+expect = EXPECTED_PIXELS.get(media.name)
+# 截图前先等叠加窗追上新的窗口几何（否则取到的是"画面还停在旧位置"的中间态）
+fit_aligned = wait_aligned()
+if expect:
+    fit_ok = abs(fit_client[0] - expect[0]) <= 2 and abs(fit_client[1] - expect[1]) <= 2
+    print(f"  期望画面像素 {expect[0]}x{expect[1]}（窗口 = 内容，1:1）→ {'符合' if fit_ok else '不符'}")
+else:
+    ratio = fit_client[0] / fit_client[1]
+    fit_ok = abs(ratio - 16 / 9) < 0.02
+    print(f"  客户区比例 = {ratio:.3f}（期望 16:9）→ {'符合' if fit_ok else '不符'}")
+# 画面右缘：窗口比例正好等于画面比例时那里是画面本体；黑边（letterbox）或比例
+# 不对时会是黑的。取样点避开左侧竖条里的胶囊（y 取客户区正中）。
+#
+# 要等几帧：改完尺寸后 mpv 得重新配置 VO，叠加窗的几何已经到了、画面却可能还是
+# 上一帧的一部分（表现为"上面一条是画面、下面露出桌面"）。这是**瞬态**，
+# 等不到就必须如实报失败，所以只在超时前重试（给 3 秒，慢机器上 VO 重配更久）。
+fit_edge = (0, 0, 0)
+deadline = time.time() + 3.0
+while time.time() < deadline:
+    fit_aligned = fit_aligned or wait_aligned(0.3)
+    img_fit = grab()
+    fit_edge = sample(img_fit, fit_w - 4, fit_h / 2)
+    if colorful(fit_edge):
+        break
+    time.sleep(0.15)
+img_fit.save(out_dir / "floating-00-fit.png")
+print(f"  画面右缘像素 = {fit_edge}   ← 应为彩条（有黑边就不是）")
+print(f"  视频窗是否已跟上新几何 = {fit_aligned}")
+
+# 后面几步（点击 / 拖动 / 双击）需要稳定的几何，先按脚本自己的尺寸把窗口摆好：
+# 按**目标客户区**反推外框。`AdjustWindowRectExForDpi` 在这类自绘标题栏
+# （`WM_NCCALCSIZE` 返回 0）的窗口上会多算一个标题栏高度，所以先拿它当起点，
+# 再按实测客户区差值补两次——比任何公式都准。
+style = user32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
+target = (round(width * scale), round(height * scale))
+box = wintypes.RECT(0, 0, target[0], target[1])
+user32.AdjustWindowRectExForDpi(
+    ctypes.byref(box), style, False, 0, user32.GetDpiForWindow(hwnd)
+)
+user32.SetWindowPos(
+    hwnd, HWND_TOPMOST, 0, 0, box.right - box.left, box.bottom - box.top, SWP_SHOWWINDOW
+)
+time.sleep(0.6)
+for _ in range(3):
+    r = wintypes.RECT()
+    user32.GetClientRect(hwnd, ctypes.byref(r))
+    dw, dh = target[0] - r.right, target[1] - r.bottom
+    if abs(dw) <= 1 and abs(dh) <= 1:
+        break
+    o = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(o))
+    user32.SetWindowPos(
+        hwnd, HWND_TOPMOST, 0, 0,
+        (o.right - o.left) + dw, (o.bottom - o.top) + dh, SWP_SHOWWINDOW,
+    )
+    time.sleep(0.5)
+set_w, set_h = wait_client_settled()
+lw, lh = set_w / scale, set_h / scale
+print(f"脚本摆到 {width}x{height} 后：物理 {set_w}x{set_h} 逻辑 {lw:.1f}x{lh:.1f}")
 
 # ---- 1. 画面区是否真的让出来了 -----------------------------------------
 img = grab(out_dir / "floating-01-video.png")
@@ -450,10 +509,17 @@ def wait_maximized(bigger, base, timeout=4.0):
 
 
 # 这两步放在最后：会改窗口尺寸/位置，前面的取样都按旧几何算好的。
-# 走的是叠加窗 `WM_LBUTTONDBLCLK` → `window_actions::set_zoomed`。
+# 走的是叠加窗自己的 `WM_LBUTTONDBLCLK` → `window_actions::set_zoomed`。
+# 和歌单一样按**结果**重试：合成鼠标事件偶发被系统吞掉，那不是应用的问题，
+# 但重试仍不对就必须报失败。
 base_client = client_rect()
-double_click(lw * 0.5, lh * 0.45)
-zoomed, zoom_style = wait_maximized(True, base_client)
+zoomed, zoom_style = False, False
+for attempt in range(1, 3):
+    double_click(lw * 0.5, lh * 0.45)
+    zoomed, zoom_style = wait_maximized(True, base_client)
+    if zoomed:
+        break
+    print(f"  第 {attempt} 次双击没让窗口变大，重试")
 cw1, ch1 = refresh_geometry()
 img_max = grab(out_dir / "floating-04-maximized.png")
 max_mid = sample(img_max, lw / 2, lh / 2)
@@ -463,8 +529,13 @@ print(
     f"client = {cw1}x{ch1}（原始 {base_client[0]}x{base_client[1]}）；画面中心 = {max_mid}"
 )
 
-double_click(lw * 0.5, lh * 0.45)
-restored, restore_style = wait_maximized(False, base_client)
+restored, restore_style = False, False
+for attempt in range(1, 3):
+    double_click(lw * 0.5, lh * 0.45)
+    restored, restore_style = wait_maximized(False, base_client)
+    if restored:
+        break
+    print(f"  第 {attempt} 次双击没还原，重试")
 cw2, ch2 = refresh_geometry()
 print(
     f"再双击画面 → 回原尺寸 {restored}（IsZoomed={restore_style}）；"
@@ -483,6 +554,17 @@ err.close()
 
 print("--- 判定 ---")
 ok = True
+if not fit_ok:
+    print(f"FAIL: 起播后窗口尺寸没跟画面对齐（客户区 {fit_client}，期望 {expect or '16:9'}）")
+    ok = False
+elif not fit_aligned:
+    print("FAIL: 调整尺寸后视频窗没跟上主窗口几何（画面会停在旧位置）")
+    ok = False
+elif not colorful(fit_edge):
+    print(f"FAIL: 画面右缘是 {fit_edge}，比例对不上/有黑边（画面没铺满客户区）")
+    ok = False
+else:
+    print(f"OK: 起播即把窗口调成画面尺寸 {fit_client}（1:1），画面铺满不留黑边")
 if not colorful(mid):
     print(f"FAIL: 画面中心不是彩条（{mid}），画面区没从窗口区域里减掉")
     ok = False
