@@ -582,6 +582,120 @@ Windows 后端的 `Blurred` 走 `SetWindowCompositionAttribute(accent_state = 4)
 
 ---
 
+### 🧊 第七轮（已落地）：把视频窗挪到主窗下面，chrome 变真半透明
+
+用户一句话点题：「视频窗放在主窗下听起来更像正解」。方向是对的，但**实施路径和
+最初的方案几乎全被实测推翻了三次**。这一节记的是最终做法 + 那些坑，别再走一遍。
+
+#### 结论先说
+
+视频窗垫在主窗口**下面**，主窗口逐像素透明；画面区从主窗口的**窗口区域**里减掉，
+标题带/胶囊/歌单再加回去。于是 `overlay::glass()`（`#0B0C10` @72%）真的透出画面，
+按住画面拖动 / 双击最大化由**我们自己实现**的桥接处理（不是转交系统）。
+
+#### 一、逐像素透明是支持的（原判断是错的）
+
+之前的结论「GPUI Windows 后端（DComp + `WS_EX_NOREDIRECTIONBITMAP`）不支持窗口级
+透明」**是错的**。20 行实验：`window_background = Transparent` + 根节点只画一块红方块
+→ 截图整窗透出**后面那个浏览器窗口**，只剩红方块和 DWM 圆角。三个源码事实支撑：
+
+1. 合成 swapchain 的 alpha 模式是 `DXGI_ALPHA_MODE_PREMULTIPLIED`，不是 `IGNORE`；
+2. `background_appearance != Opaque` 时 `pre_draw` 把后备缓冲清成 `[0,0,0,0]`；
+3. 混合状态是 `SrcBlend = SRC_ALPHA / DestBlend = INV_SRC_ALPHA / SrcBlendAlpha = ONE`
+   ——半透明图形写进清成 0 的缓冲后，正好是 DWM 要的预乘形式。
+
+#### 二、挡住第一版的是窗口表面那层底色
+
+只把根节点改成透明，截图仍是 `#EFF1F5` 一模一样。原因是 gpui-component 的
+`RootPlugin::style` 给**每个窗口的表面** refine 了一层 `.bg(tokens.background)`，
+它在 `Root` 里、不在我们的 view 下面。解法（不改主题 token，toast/list 还在用它）：
+
+```rust
+// `Root` 实现了 Styled，实例样式 refine 在插件之后，所以能逐窗覆盖
+root.style().refine(&StyleRefinement::default().bg(transparent_black()));
+```
+
+必须在 `render` 里做一次（`PlayerView::new` 那会儿 `Root` 还没挂上窗口，取不到；
+无头测试窗口也没有 `Root`，要 `window.root::<Root>().flatten()` 守卫）。
+
+#### 三、真正的拦路虎：被完全盖住的窗口会**停止出帧**
+
+透明做完，画面仍然是黑的。三次实测（同一个 mpv、同一份文件）：
+
+- 视频窗垫在主窗下面、主窗整块盖着它 → 空白，`PrintWindow` 取内容也是黑的；
+- 把视频窗挪到没被盖住的地方 → 画面立刻正常；
+- 在主窗口的窗口区域上挖个 300×300 的洞 → 画面正好出现在那个洞里。
+
+**系统只认窗口矩形/区域，不认逐像素透明度**：它判定视频窗 100% 被遮挡，mpv 那边
+的呈现就停在那儿不出帧（`--d3d11-flip=no` 也没用）。所以主窗口必须把画面区从
+窗口区域里减掉：
+
+```text
+region = 整窗矩形 − 画面区（stage） + chrome 矩形（标题带/胶囊/歌单，RGN_OR 回去）
+```
+
+- 非客户区的边框留在区域里 → 四边拖动缩放、系统边框照常；
+- chrome 必须加回去，否则自己也被剪掉（看不到，而且点不到——区域同时裁剪输入）；
+- `CreateRoundRectRgn` 收的是椭圆**直径**不是半径；区域坐标是**物理像素、相对窗口矩形**，
+  所以要用 `ClientToScreen − GetWindowRect` 的偏移换算，逻辑坐标乘 scale；
+- **去重键不含窗口位置**（区域坐标是相对窗口矩形的，纯移动不用重设，
+  带上位置会让拖动/贴边时每帧 `SetWindowRgn` → 整窗重绘 + 画面抖），尺寸变化由
+  chrome 自身坐标体现，scale 单独记一笔（跨屏换 DPI）。
+
+#### 四、视频窗铺**外框**，不铺客户区
+
+第一版按客户区定位，结果左边和底部透出桌面/别的窗口文字——因为边框那一圈仍留在
+主窗口的区域里，而我们不在那儿画任何东西。改成铺满 `GetWindowRect`（外框），
+边框那一圈下面就有视频窗的黑底兜着。
+
+#### 五、输入桥被推翻重做（三个坑）
+
+画面区不在主窗口区域里了，点在上面命中的是视频窗，所以三件事得自己接：
+
+| 坑 | 现象 | 正解 |
+|---|---|---|
+| 给叠加窗加 `WS_EX_TRANSPARENT`（想"命中穿透"） | **整块窗口不再被合成**，帧还在、看不见 | 不要加，注释里写着别加 |
+| 把舞台挂 `WindowControlArea::Drag`（想白拿原生拖动） | 舞台压根不在主窗口区域里，GPUI 收不到 | 拖动在叠加窗 wndproc 里自己实现 |
+| `ReleaseCapture()` + `SendMessageW(main, WM_NCLBUTTONDOWN, HTCAPTION)`（想白拿贴边吸附） | 拖动只跟上头一两步就停（GPUI 的 wndproc 吃掉 `WM_MOUSEMOVE`，系统模态循环拿不到位移）；紧接着的双击被当成"继续拖动"，窗口挪一段而不是最大化 | 自己记起点、自己 `SetWindowPos`，叠加窗同步粘住 |
+| 双击转交 `WM_NCLBUTTONDBLCLK` | 窗口撑到工作区，但 `WS_MAXIMIZE` 位丢了 → `IsZoomed` 为假，标题带图标和"再点还原"全乱 | 直接调 `window_actions::set_zoomed(main, !is_zoomed)` |
+| 双击消息根本不出现 | 窗口类没设 `CS_DBLCLKS`，系统只连发两条 `WM_LBUTTONDOWN` | 类样式加 `CS_DBLCLKS` |
+
+文件拖放仍走 `DragAcceptFiles` + `WM_DROPFILES` → 队列 → tick（OLE 沿**父链**找投放
+目标，叠加窗会截断；`WS_EX_TRANSPARENT` 不改变 `WindowFromPoint`，别试）。
+`WM_ERASEBKGND` 里铺黑：第一帧到达前不铺黑会闪一下桌面。
+
+#### 六、标题带也要玻璃
+
+画面铺满整窗之后，标题带直接压在画面上。16:9 片源顶部常有黑边，看着"还好"，
+换成顶到边的画面曲名就读不出来了 → 视频模式下给标题带铺 `overlay::glass()`，
+和胶囊同一套口径。
+
+#### 七、验收
+
+`scripts/verify_floating_chrome.py`（真机）+ `ui_tests::chrome_region_covers_capsule_and_panel`
+（几何）双层守着：
+
+- 画面中心必须是彩条（区域减法生效才会出帧）；
+- `GetWindowRgn` 类型 = COMPLEXREGION 且外接框仍是整窗；
+- 视频窗与主窗 `GetWindowRect` **逐像素相同**；
+- 胶囊里压在两个色条上的两点色差 > 25（>`72%` 玻璃留住色相，实心黑板会抹平）；
+- 展开歌单后 `PtInRegion(面板中心)` 为真、面板取样是浅底；
+- 按住画面拖动：位移非零 + 拖动途中画面中心仍是彩条 + 松手后外框仍对齐；
+- 双击画面：`IsZoomed` 变真，再双击变假，两次都对齐。
+
+#### 已知代价 / 不做的事
+
+- **仍然没有区域级 backdrop blur**。系统的 acrylic 只能整窗，要「只糊 chrome 底下
+  那块」得自己拿视频纹理做区域级 backdrop filter——视频纹理在 mpv 进程/D3D 里，
+  不在 GPUI 手里，属「GPUI 自己合成视频」的量级。
+- **没有 Aero Snap / 拖最大化窗口还原**：自己实现的拖动省掉了系统的贴边吸附，
+  最大化状态下按住画面不拖（双击还原就够了）。
+- 窗口**缩放/最大化动画期间**会逐帧重设区域，极端情况下闪一帧。
+- 区域与 chrome 是两份几何（一份画、一份算），只能靠上面那条单测盯着它们对齐。
+
+
+---
+
 ## 4. 里程碑与时间线
 
 | 里程碑 | 内容 | 累计工期 |

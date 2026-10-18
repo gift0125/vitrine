@@ -639,3 +639,83 @@ fn video_mode_uses_title_band_pill_instead_of_toast(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+/// 视频模式下主窗口的窗口区域必须**正好**盖住实际画出来的 chrome。
+///
+/// 这是第七轮最容易被静默破坏的契约：画面区从主窗口区域里减掉之后，
+/// 没被 `chrome_rects` 列进来的控件会被系统整块剪掉，而"被剪掉"和"没画"
+/// 在截图里长得一样，只能靠几何对齐来守。
+///
+/// 反过来也不能多列：多出来的矩形等于让主窗口在不透明表面之外的地方
+/// 也参与绘制，会把画面盖住。
+#[gpui_kit::test]
+fn chrome_region_covers_capsule_and_panel(cx: &mut TestAppContext) {
+    fresh_dir("region-rects");
+    let (window, view) = open_view(cx, Vec::new());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| view.test_set_video_mode(true));
+        // 胶囊高度是内容撑开的，必须先把一帧画出来，`capsule_rect` 才有值
+        window.render_frame(cx);
+
+        let rects = view.update(cx, |view, _| view.test_chrome_rects(window));
+        assert!(
+            rects.len() >= 2,
+            "视频模式的区域至少要含标题带和胶囊，实际 {rects:?}"
+        );
+
+        // 注意：`covered` 必须显式收 rects。写成闭包捕获的话，后面 `let rects = ...`
+        // 重新绑定只会遮蔽外层变量，闭包仍然指着**第一版**（还没含面板），
+        // 断言就会假失败——这条踩过一次。
+        fn covered(rects: &[crate::video_overlay::ChromeRect], x: f32, y: f32) -> bool {
+            rects
+                .iter()
+                .any(|r| x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height)
+        }
+
+        // 标题带左端（拖动区）和窗口按钮都在里面
+        assert!(covered(&rects, 8., 17.), "标题带必须在区域里：{rects:?}");
+        let max_button = window.find("win-max").bounds();
+        assert!(
+            covered(
+                &rects,
+                max_button.center().x.as_f32(),
+                max_button.center().y.as_f32()
+            ),
+            "最大化按钮必须在区域里，否则点不到：{rects:?} vs {max_button:?}"
+        );
+
+        // 胶囊里的控件同理
+        let seek = window.find("seek-bar").bounds();
+        assert!(
+            covered(&rects, seek.center().x.as_f32(), seek.center().y.as_f32()),
+            "进度条必须在区域里，否则整条走带都被剪掉：{rects:?} vs {seek:?}"
+        );
+        let seek_bottom = seek.bottom().as_f32();
+        assert!(
+            covered(&rects, seek.center().x.as_f32(), seek_bottom + 20.),
+            "胶囊的控制行（进度条下方）也要在区域里：{rects:?} vs 进度条底 {seek_bottom:.1}"
+        );
+
+        // 画面中心必须**不**在区域里——那正好是减法要空出来的地方
+        let bounds = window.bounds();
+        assert!(
+            !covered(
+                &rects,
+                bounds.center().x.as_f32(),
+                bounds.center().y.as_f32()
+            ),
+            "画面中心不该留在主窗口区域里，否则 mpv 会被判成完全遮挡而停止出帧：{rects:?}"
+        );
+
+        // 展开歌单：面板整块浮在画面上，区域必须把它加回去
+        window.click("toggle-playlist", cx);
+        window.render_frame(cx);
+        let rects = view.update(cx, |view, _| view.test_chrome_rects(window));
+        let panel = window.find("playlist-panel").bounds();
+        assert!(
+            covered(&rects, panel.center().x.as_f32(), panel.center().y.as_f32()),
+            "歌单面板必须在区域里，否则展开后是一片画面：{rects:?} vs {panel:?}"
+        );
+    })
+    .unwrap();
+}

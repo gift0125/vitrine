@@ -11,7 +11,7 @@
 - 工具链：用户自行安装 Rust + VS Build Tools（2026-10-17 确认），agent 不动系统环境。
 
 ## GPUI 平台事实（踩过的坑，勿重复验证）
-- GPUI Windows 后端 = DirectComposition + WS_EX_NOREDIRECTIONBITMAP → **不能承载原生子窗口**；视频走 mpv.exe + `--wid` 自建 WS_POPUP 顶层窗口（owner=主窗口）。
+- GPUI Windows 后端 = DirectComposition + WS_EX_NOREDIRECTIONBITMAP → **不能承载原生子窗口**；视频走 mpv.exe + `--wid` 自建 WS_POPUP 顶层窗口，**无 owner、垫在主窗口正下方**（第七轮改的，详见下面的"第七轮"条目）。
 - `ListItem::confirmed()` 不产生任何视觉（只有 check_icon 才画对勾）；默认主题 `primary` 与正文色重合（light neutral-900 vs neutral-950），不能用 primary 表达"当前项"。列表高亮用 `list_active` / `list_active_border` token。
 - `cx.on_app_quit` **只在显式 App::quit() 时触发，窗口关闭不走它**；资源清理必须依赖 Drop。退出留痕见 `persistence::log_session` → `%APPDATA%/simple-media-player/session.log`。
 - 观测到"进程自行退出"时先分三档：日志有 `player_view dropped`+`event loop returned`=优雅退出；只有 `start`=被硬杀（宿主清理进程树）；在宿主任务内启动的长驻进程可稳定存活 16min+，应用本身无自杀路径。
@@ -46,11 +46,22 @@
 - **按住画面拖窗体**：叠加窗 wndproc 收 `WM_LBUTTONDOWN` → `GetWindow(hwnd, GW_OWNER)` → `ReleaseCapture()` + `SendMessageW(owner, WM_NCLBUTTONDOWN, HTCAPTION, 0)`，把这一下转交给系统当标题栏拖动（贴边吸附/最大化还原/跨屏白拿）；叠加窗自己由 tick 追上。
 - **拖放不弹提示**：拖进来这个动作本身就是意图，画面换了就是回执。只保留「没有可播放的媒体文件」这类真失败提示。
 - **验收取样要用实测客户区换算**：`SetWindowPos` 设的是外框，实测 1898×1189 物理 ÷1.5 = 1265×793 而非设的 1280×800；按目标尺寸换算整体偏几像素，点 28px 图标正好点进间隙（`scripts/verify_floating_chrome.py` 里记了这条）。
-- **洞露出来的是不透明画布，不是画面**：GPUI Windows 后端（DComp + `WS_EX_NOREDIRECTIONBITMAP`）不支持窗口级透明，所以设计稿的"60% 黑 + 模糊"退成实心深色；歌单面板保持 Latte 浅底（改深底会让 `List` 的行文字不可读，颜色取主题 token）。
+- ~~**洞露出来的是不透明画布，不是画面**：GPUI Windows 后端不支持窗口级透明~~ **这条已被第七轮推翻**：逐像素透明是支持的（见"第七轮"）。歌单面板仍保持 Latte 浅底（改深底会让 `List` 的行文字不可读，颜色取主题 token）。
 - **`Window::zoom_window()` 在 Windows 上只最大化、不还原**（`gpui-pre-windows 0.3.9` 的 `zoom()` 只有 `ShowWindowAsync(SW_MAXIMIZE)`）→ 自己写 `window_actions::{is_zoomed, set_zoomed}`。**必须用 `ShowWindowAsync`**：同步 `ShowWindow` 会在 GPUI 的事件派发里重入 `WM_SIZE`，窗口变大了但界面还画在旧尺寸、hitbox 全错位（表现为"再点一次最大化/还原永远点不到按钮"）。异步的代价是调用后 `IsZoomed` 仍是旧值 → 状态先乐观更新 + `zoom_pending` 300ms 内不让 tick 反向纠正。
 - **双击标题栏不用自己实现**：标题栏拖拽区映射成 `HTCAPTION`，Windows 原生就做最大化/还原，`on_double_click` 根本不会被调用（日志可证）。
 - **GPUI 有窗口透明/模糊能力，但对我们的视频场景无用**：`WindowBackgroundAppearance::{Transparent, Blurred, MicaBackdrop}` 在 gpui-pre 0.3.6 就有（`WindowOptions.window_background`，非 Opaque 时清 alpha 0，Windows 的 `Blurred` → `SetWindowCompositionAttribute` acrylic），但模糊的是窗口**背后**的内容，而 mpv 画在**上面**的叠加窗里。要真模糊视频得反转 z 序（放弃 ownership 自己管 z 序），属重构。
 
+
+## 第七轮（2026-10-18）：视频窗垫在主窗下面，chrome 变真半透明
+- **逐像素透明是支持的**：合成 swapchain 是 `PREMULTIPLIED`，`background_appearance != Opaque` 时 `pre_draw` 清 `[0,0,0,0]`，混合是预乘。真正挡路的是 gpui-component 的 `RootPlugin::style` 给每个**窗口表面** refine 了 `.bg(tokens.background)` → 在 `Render::render` 里 `window.root::<gpui_kit::base::Root>()` 后 `root.style().refine(&StyleRefinement::default().bg(transparent_black()))`（`new` 里做无效：Root 还没挂；无头测试没有 Root，要守卫）。
+- **被完全遮挡的窗口会停止出帧**：系统只认窗口矩形/区域，不看逐像素 alpha。所以主窗口必须把画面区从窗口区域里减掉：`region = 整窗 − stage + chrome(RGN_OR)`；不减就黑屏（`PrintWindow` 也黑、`--d3d11-flip=no` 无效）。
+- 区域：物理像素、坐标**相对窗口矩形**（`ClientToScreen − GetWindowRect` 偏移）；`CreateRoundRectRgn` 收**直径**；去重键不含窗口位置（纯移动不用重设，否则拖动时每帧重绘、画面发抖）。视频窗铺**外框**不铺客户区（否则边框那圈透出桌面）。
+- 别给叠加窗加 `WS_EX_TRANSPARENT`：整窗不再被合成（帧在、看不见）。
+- 拖动/双击**自己实现**，别转交系统：`WM_NCLBUTTONDOWN/HTCAPTION` 只跟上头一两步（GPUI 的 wndproc 吃掉 `WM_MOUSEMOVE`，系统模态循环拿不到位移），`WM_NCLBUTTONDBLCLK` 会丢 `WS_MAXIMIZE`（窗口撑满工作区但 `IsZoomed` 假）；双击需要窗口类 `CS_DBLCLKS`，走 `window_actions::set_zoomed(main, !is_zoomed)`。
+- 标题带在视频模式也要铺 `overlay::glass()`（画面顶到边时曲名读不出来）。
+- 验收两层：`scripts/verify_floating_chrome.py`（真机：出帧/区域/对齐/玻璃透色/歌单 PtInRegion/拖动/双击）+ `ui_tests::chrome_region_covers_capsule_and_panel`（区域矩形 vs 实际布局）。
+- 代价：没有区域级 backdrop blur（acrylic 只能整窗）、没有 Aero Snap、缩放动画期间可能闪一帧。
+- `scripts/shot.py` 已改成走 `SMP_DATA_DIR` 隔离：`--play` 会写 playlist.json，之前直接跑会污染用户真实列表（踩过两次）。
 
 ## 设计稿要点（详见 2026-10-17 / 2026-10-18 日志）
 - 色板严格取 Catppuccin Latte 官方值；Mauve #8839EF 唯一强调色。**v2 起是两套色板**：应用表面 Latte/Mocha，叠加层（胶囊）深色玻璃，见 `theme::overlay`。

@@ -131,6 +131,16 @@ fn main() {
                     appears_transparent: true,
                     ..Default::default()
                 }),
+                // 窗口需要**逐像素透明**：视频模式要把画面区留成 alpha 0，
+                // 让下面那个 mpv 叠加窗透上来（见 video_overlay 模块头）。
+                //
+                // 这一项只是前提之一：非 Opaque 时渲染器会把后备缓冲清成 alpha 0，
+                // 而合成用的 swapchain 本来就是 `DXGI_ALPHA_MODE_PREMULTIPLIED`，
+                // DWM 会按 alpha 合成。另一处前提是窗口表面那层底色——它由
+                // gpui-component 的 RootPlugin 铺，在 `PlayerView::new` 里覆盖成透明。
+                //
+                // 音频模式下我们的根节点会自己铺不透明底色，所以外观和以前一致。
+                window_background: WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             };
 

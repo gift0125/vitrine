@@ -74,7 +74,13 @@ except AttributeError:  # Win10 1607 之前没有这个 API
 cmd = [str(exe)] + (["--dark"] if dark else []) + passthrough
 log = root / "target" / "shot-stderr.log"
 err = open(log, "wb")
-proc = subprocess.Popen(cmd, stdout=err, stderr=subprocess.STDOUT)
+# 配置目录隔离：`--play <文件>` 会把它**写进播放列表并保存**，直接跑就会改掉用户
+# 真实的 `%APPDATA%\simple-media-player\playlist.json`（踩过：截图里混进了上一次
+# 验收留下的十来个样片）。`SMP_DATA_DIR` 可以整体顶掉这个目录。
+shot_data = root / "target" / "shot-data"
+shot_data.mkdir(parents=True, exist_ok=True)
+env = dict(os.environ, SMP_DATA_DIR=str(shot_data))
+proc = subprocess.Popen(cmd, stdout=err, stderr=subprocess.STDOUT, env=env)
 time.sleep(3.2)
 
 hwnd = user32.FindWindowW(None, "Chroma")

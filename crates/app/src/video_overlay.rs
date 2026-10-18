@@ -1,25 +1,44 @@
-//! Win32 顶层叠加窗口：mpv 以 `--wid` 挂载于此，覆盖在 GPUI 视频区之上。
+//! Win32 顶层窗口：mpv 以 `--wid` 挂载于此，**垫在 GPUI 主窗口下面**。
 //!
 //! ## 为什么需要它
 //!
 //! GPUI 的 Windows 后端使用 DirectComposition（窗口带 `WS_EX_NOREDIRECTIONBITMAP`），
-//! 这种窗口没有重定向表面，**无法承载原生子窗口**。因此视频不能直接画在 GPUI 窗口内部，
-//! 只能由一个「无边框、不抢焦点、由主窗口拥有（owned）」的顶层弹窗盖在视频区位置上方。
+//! 这种窗口没有重定向表面，**无法承载原生子窗口**。所以视频不能画在 GPUI 窗口内部，
+//! 只能由一个「无边框、不抢焦点」的顶层弹窗承载，位置尺寸由主窗口跟着对齐。
+//!
+//! ## 为什么在主窗口下面（2026-10-18 第七轮）
+//!
+//! 之前它盖在主窗口**上面**，靠给自己的窗口区域开洞把标题带/胶囊/歌单露出来。
+//! 那条路能让 chrome「浮」在画面上，但 chrome 背后只有主窗口的不透明表面，
+//! 玻璃永远是实心黑板。现在反过来：**主窗口逐像素透明，画面垫在它下面**，
+//! 于是同一句 `overlay::glass()`（`#0B0C10` @72%）就真的透出画面了。
+//!
+//! ## 但这里有个必须知道的坑：被完全盖住的窗口会停止出帧
+//!
+//! 实测（同一个 mpv、同一份文件）：
+//!
+//! - 视频窗垫在主窗口下面、主窗**整块**盖着它 → 画面一片空白，PrintWindow 取内容也是黑的；
+//! - 把视频窗挪到没被盖住的地方 → 画面立刻正常；
+//! - 在主窗口的窗口区域上挖个 300×300 的洞 → 画面正好出现在那个洞里。
+//!
+//! 结论：系统只认**窗口矩形/区域**，不认逐像素透明度。它认为视频窗 100% 被遮挡，
+//! mpv 那边的呈现就停在那儿不出帧了（关掉 d3d11 flip 也没用）。所以主窗口必须把
+//! 自己的**画面区从窗口区域里减掉**（见 [`set_region`]），只留下 chrome 那几块：
+//! 画面露出来才会出帧，而 chrome 那几块是半透明的，于是「玻璃底下透出画面」成立。
+//!
+//! ## 输入因此要转一手
+//!
+//! 画面区不在主窗口的区域里了，点在上面命中的是视频窗。它只是个画布（不抢焦点、
+//! 也没有 GPUI），所以替主窗口挡两件事：
+//!
+//! - 按住画面 → 自己实现窗口拖动（位移一比一，叠加窗同步粘上去）；
+//! - 双击画面 → `set_zoomed` 最大化/还原（等价于双击标题栏）；
+//! - 文件拖进来 → `WM_DROPFILES` 收进队列，主线程 tick 取走。
 //!
 //! ## 坐标约定
 //!
-//! GPUI 的布局坐标是逻辑像素（相对窗口客户区）。这里统一用
-//! `set_rect(x, y, w, h)` 接收**物理屏幕像素**，由调用方完成
-//! `客户区原点（ClientToScreen） + 逻辑坐标 × scale_factor` 的换算。
-//!
-//! ## 已知约束
-//!
-//! 视频区域内的 GPUI 内容会被这层原生窗口遮住——这是该方案固有的代价，
-//! 换来的是 mpv 原生渲染性能（硬件解码 + GPU 输出，零像素搬运）。
-//!
-//! 但「遮住」不等于只能让位：给叠加窗口设**窗口区域**（`SetWindowRgn`）就能把
-//! chrome 的几块从画面里挖掉，露出下面的 GPUI 主窗口——标题带、控制胶囊、歌单面板
-//! 因此可以压在画面上，而不是把画面挤小。见 [`Hole`]。
+//! 布局是逻辑像素（相对客户区）。交给 Win32 的矩形要么是**物理屏幕像素**
+//! （`set_rect`），要么是**物理像素、相对窗口矩形**（`set_region`），换算由调用方做。
 
 use std::ffi::c_void;
 use std::sync::Once;
@@ -33,30 +52,51 @@ const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
 const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
 const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
 
+// 注意：**不要**给这块窗口加 `WS_EX_TRANSPARENT`。听着像「命中测试穿透」，
+// 实测会让整块窗口不再被合成——画面直接消失（帧还在，就是看不见）。
+// 点击本来就得它来接（见模块头「输入因此要转一手」）。
+
 const SW_HIDE: i32 = 0;
 const SW_SHOWNA: i32 = 8;
 
-/// 文件拖放：这块窗口盖住了整个视频区，也就是窗口 80% 的面积。
-/// GPUI 的 `IDropTarget` 注册在**主窗口**上，而 OLE 的拖放目标查找是按
-/// `WindowFromPoint` 从光标下的窗口开始的（只沿父链向上找），走到叠加窗口就断了，
-/// 拖进去只会看到「禁止」光标。所以叠加窗口自己接一份。
+const WM_ERASEBKGND: u32 = 0x0014;
+/// 文件拖放：画面区占窗口 80% 的面积，而 GPUI 的 `IDropTarget` 注册在**主窗口**上。
+/// 画面区不在主窗口的区域里，OLE 找到的投放目标就是这块窗口，所以它自己接一份。
 const WM_DROPFILES: u32 = 0x0233;
-/// 按下画面：转成「按住标题栏」，交给系统做窗口拖动。
-const WM_LBUTTONDOWN: u32 = 0x0201;
-const WM_NCLBUTTONDOWN: u32 = 0x00A1;
-const HTCAPTION: usize = 2;
-const GW_OWNER: u32 = 4;
-
-/// 区域合并方式：从整窗里减掉一块。
-const RGN_DIFF: i32 = 4;
-
-/// 从叠加窗口里扣掉的一块矩形（**逻辑像素**，相对窗口左上角）。
+/// 按住画面拖动窗体：自己实现，不转交 `HTCAPTION` 的模态拖拽。
 ///
-/// 视频模式下画面铺满整窗，而标题带/胶囊/歌单是画在 GPUI 主窗口里的——
-/// mpv 的叠加窗口浮在主窗口之上，不把这几块从它的可见区域里挖掉，
-/// chrome 就永远被画面盖着（这正是「顶栏没有浮在视频上方」的成因）。
+/// 曾经是 `ReleaseCapture()` + `SendMessageW(main, WM_NCLBUTTONDOWN, HTCAPTION, 0)`
+/// 让系统接管（贴边吸附白拿），实测在这个窗口上不可靠：拖动只跟上头一两步就停住
+/// （GPUI 的 wndproc 自己吃掉 `WM_MOUSEMOVE`，系统那套模态循环拿不到位移），
+/// 紧接着的双击还会被当成"继续拖动"，窗口挪一段而不是最大化。
+/// 所以这里自己记起点、自己 `SetWindowPos`：位移一比一、叠加窗同步粘住。
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+/// 双击画面：等价于双击标题栏（最大化/还原）。
+///
+/// 前提是窗口类带 `CS_DBLCLKS`——没有它系统只会连发两条 `WM_LBUTTONDOWN`，
+/// `WM_LBUTTONDBLCLK` 永远不来（踩过）。
+const WM_LBUTTONDBLCLK: u32 = 0x0203;
+const WM_CAPTURECHANGED: u32 = 0x0215;
+
+/// 窗口类样式：不设这一位就收不到双击消息。
+const CS_DBLCLKS: u32 = 0x0008;
+
+const BLACK_BRUSH: i32 = 4;
+
+const SWP_NOSIZE: u32 = 0x0001;
+const SWP_NOMOVE: u32 = 0x0002;
+const SWP_NOZORDER: u32 = 0x0004;
+const SWP_NOACTIVATE: u32 = 0x0010;
+const SWP_SHOWWINDOW: u32 = 0x0040;
+
+/// 主窗口区域里**要留下**的一块 chrome（**逻辑像素**，相对客户区左上角）。
+///
+/// 画面区要从主窗口的区域里减掉，而 chrome 是浮在画面上的——它们必须再加回区域，
+/// 否则自己也被剪掉，看不见。
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Hole {
+pub struct ChromeRect {
     pub x: f32,
     pub y: f32,
     pub width: f32,
@@ -65,7 +105,7 @@ pub struct Hole {
     pub radius: f32,
 }
 
-impl Hole {
+impl ChromeRect {
     pub fn rect(x: f32, y: f32, width: f32, height: f32) -> Self {
         Self {
             x,
@@ -86,10 +126,6 @@ impl Hole {
         }
     }
 }
-
-const SWP_NOZORDER: u32 = 0x0004;
-const SWP_NOACTIVATE: u32 = 0x0010;
-const SWP_SHOWWINDOW: u32 = 0x0040;
 
 const CLASS_NAME: &str = "SimpleMediaPlayerVideoOverlay";
 
@@ -116,6 +152,15 @@ mod win {
     pub struct Point {
         pub x: i32,
         pub y: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
     }
 
     #[link(name = "user32")]
@@ -147,17 +192,24 @@ mod win {
             flags: u32,
         ) -> i32;
         fn IsWindow(hwnd: Hwnd) -> i32;
+        fn IsIconic(hwnd: Hwnd) -> i32;
         fn DefWindowProcW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
         fn ClientToScreen(hwnd: Hwnd, point: *mut Point) -> i32;
-        fn GetWindow(hwnd: Hwnd, cmd: u32) -> Hwnd;
-        fn SendMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
+        fn GetClientRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
+        fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
+        fn FillRect(hdc: Hwnd, rect: *const Rect, brush: Hwnd) -> i32;
+        fn GetWindowLongPtrW(hwnd: Hwnd, index: i32) -> isize;
+        fn SetWindowLongPtrW(hwnd: Hwnd, index: i32, value: isize) -> isize;
         fn ReleaseCapture() -> i32;
+        fn SetCapture(hwnd: Hwnd) -> Hwnd;
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn IsZoomed(hwnd: Hwnd) -> i32;
         fn SetWindowRgn(hwnd: Hwnd, region: Hwnd, redraw: i32) -> i32;
     }
 
-    // 区域（RGN）相关都在 gdi32 里，`SetWindowRgn` 在 user32。
     #[link(name = "gdi32")]
     extern "system" {
+        fn GetStockObject(index: i32) -> Hwnd;
         fn CreateRectRgn(left: i32, top: i32, right: i32, bottom: i32) -> Hwnd;
         fn CreateRoundRectRgn(
             left: i32,
@@ -184,12 +236,47 @@ mod win {
         fn DragFinish(hdrop: Hwnd);
     }
 
-    /// 叠加窗口收到的拖放路径，等主线程的 100ms tick 来取走。
+    const GWLP_USERDATA: i32 = -21;
+    /// 区域合并方式：加上一块 / 减掉一块。
+    const RGN_OR: i32 = 2;
+    const RGN_DIFF: i32 = 4;
+
+    /// 视频窗收到的拖放路径，等主线程的 100ms tick 来取走。
     ///
-    /// `WM_DROPFILES` 只在 wndproc 里能拿到，拿完必须立刻 `DragFinish`；
-    /// 而拿到的这一刻我们不在 GPUI 的 `App` 上下文里，不能直接改视图状态，
-    /// 所以先落在队列里，由 tick 统一消费（和通知的「入队 + flush」同一套路）。
+    /// `WM_DROPFILES` 只在 wndproc 里能拿到，而这一刻我们不在 GPUI 的 `App`
+    /// 上下文里，改不了视图状态，所以先落队列再统一消费。
     static DROPPED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// 一次「按住画面拖动」的起点。
+    ///
+    /// wndproc 是自由函数，没有 self；叠加窗又只有一个，用静态量足够。
+    /// 存的是**按下那一刻**的光标与主窗外框位置，移动时算总位移——
+    /// 用累计位移而不是逐步增量，丢一两个 `WM_MOUSEMOVE` 也不会漂。
+    #[derive(Clone, Copy)]
+    struct Drag {
+        /// 捕获鼠标的窗口（= 叠加窗自己，用来区分是不是这一轮的拖动）
+        overlay: Hwnd,
+        main: Hwnd,
+        cursor: (i32, i32),
+        origin: (i32, i32),
+    }
+
+    static DRAG: std::sync::Mutex<Option<Drag>> = std::sync::Mutex::new(None);
+
+    fn drag_of(hwnd: Hwnd) -> Option<Drag> {
+        DRAG.lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .filter(|drag| drag.overlay == hwnd)
+    }
+
+    fn end_drag(hwnd: Hwnd) {
+        if let Ok(mut slot) = DRAG.lock() {
+            if slot.as_ref().is_some_and(|drag| drag.overlay == hwnd) {
+                *slot = None;
+            }
+        }
+    }
 
     fn collect_dropped(hdrop: Hwnd) {
         const ALL: u32 = 0xFFFF_FFFF;
@@ -228,23 +315,102 @@ mod win {
             return 0;
         }
         if msg == WM_LBUTTONDOWN {
-            // 画面这块属于叠加窗口，按下去默认什么都不会发生（它还是个不抢焦点的
-            // 工具窗）。这里转成「按住标题栏」交给系统，于是按住画面就能拖动整个窗体：
-            // 主窗口是它的 owner，跟着一起走，画面靠 tick 的 sync_overlay_rect 追上。
-            let owner = unsafe { GetWindow(hwnd, GW_OWNER) };
-            if owner != 0 {
+            // 画面这块不在主窗口的区域里，按下来的是我们：自己开一轮拖动。
+            let main = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
+            if main != 0 && unsafe { IsIconic(main) } == 0 && unsafe { IsZoomed(main) } == 0 {
+                let mut cursor = Point::default();
+                let mut rect = Rect::default();
                 unsafe {
-                    ReleaseCapture();
-                    SendMessageW(owner, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+                    GetCursorPos(&mut cursor);
+                    GetWindowRect(main, &mut rect);
+                }
+                if let Ok(mut slot) = DRAG.lock() {
+                    *slot = Some(Drag {
+                        overlay: hwnd,
+                        main,
+                        cursor: (cursor.x, cursor.y),
+                        origin: (rect.left, rect.top),
+                    });
+                }
+                unsafe {
+                    SetCapture(hwnd);
+                }
+                return 0;
+            }
+            // 最大化/最小化状态下不拖：拖一个最大化窗口得先去掉 WS_MAXIMIZE，
+            // 那是拖到一半变形的另一套状态机，双击还原就够了。
+        }
+        if msg == WM_MOUSEMOVE {
+            if let Some(drag) = drag_of(hwnd) {
+                let mut cursor = Point::default();
+                unsafe {
+                    GetCursorPos(&mut cursor);
+                    let x = drag.origin.0 + (cursor.x - drag.cursor.0);
+                    let y = drag.origin.1 + (cursor.y - drag.cursor.1);
+                    SetWindowPos(
+                        drag.main,
+                        0,
+                        x,
+                        y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                    // 叠加窗立刻贴上去：不等 GPUI 的 100ms tick，
+                    // 否则拖动过程中画面会明显落后于窗口边框。
+                    let (mx, my, mw, mh) = outer_rect(drag.main);
+                    SetWindowPos(hwnd, 0, mx, my, mw, mh, SWP_NOZORDER | SWP_NOACTIVATE);
                 }
                 return 0;
             }
         }
-        DefWindowProcW(hwnd, msg, wparam, lparam)
+        if msg == WM_LBUTTONUP || msg == WM_CAPTURECHANGED {
+            if drag_of(hwnd).is_some() {
+                end_drag(hwnd);
+                unsafe {
+                    ReleaseCapture();
+                }
+            }
+            return 0;
+        }
+        if msg == WM_LBUTTONDBLCLK {
+            // 双击画面 = 双击标题栏。走自己的 `set_zoomed`（`ShowWindowAsync`），
+            // 而不是转交 `WM_NCLBUTTONDBLCLK`：那条路在 GPUI 窗口上会把 `WS_MAXIMIZE`
+            // 位弄丢（窗口撑到工作区、`IsZoomed` 却是假，标题带图标和"再点还原"全乱）。
+            let main = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
+            if main != 0 {
+                let zoomed = unsafe { IsZoomed(main) } != 0;
+                crate::window_actions::set_zoomed(main, !zoomed);
+            }
+            return 0;
+        }
+        if msg == WM_ERASEBKGND {
+            // mpv 第一帧到达之前这块窗口是空白的。它在透明主窗口**下面**，
+            // 不铺黑就会透出桌面（切换视频时会闪一下桌面）。
+            let mut rect = Rect::default();
+            unsafe {
+                GetClientRect(hwnd, &mut rect);
+                FillRect(wparam as Hwnd, &rect, GetStockObject(BLACK_BRUSH));
+            }
+            return 1;
+        }
+        unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// 外框矩形（物理屏幕像素）：x, y, w, h。
+    fn outer_rect(hwnd: Hwnd) -> (i32, i32, i32, i32) {
+        let mut rect = Rect::default();
+        unsafe { GetWindowRect(hwnd, &mut rect) };
+        (
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        )
     }
 
     static REGISTER: Once = Once::new();
@@ -255,14 +421,14 @@ mod win {
             let class_name = wide(CLASS_NAME);
             let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
             let class = WndClassW {
-                style: 0,
+                style: CS_DBLCLKS,
                 lpfn_wnd_proc: wnd_proc as *const () as usize,
                 cb_cls_extra: 0,
                 cb_wnd_extra: 0,
                 h_instance: instance,
                 h_icon: 0,
                 h_cursor: 0,
-                hbr_background: 0, // 不擦背景，避免闪白
+                hbr_background: 0, // 走 WM_ERASEBKGND 自己铺黑
                 lpsz_menu_name: std::ptr::null(),
                 lpsz_class_name: class_name.as_ptr(),
             };
@@ -275,7 +441,8 @@ mod win {
         unsafe { CLASS_READY }
     }
 
-    pub fn create_overlay(owner: Hwnd) -> Option<Hwnd> {
+    /// 建一个**没有 owner** 的隐藏弹窗（`hWndParent = 0`）。
+    pub fn create_overlay(main: Hwnd) -> Option<Hwnd> {
         if !ensure_class() {
             return None;
         }
@@ -291,19 +458,22 @@ mod win {
                 0,
                 0,
                 0,
-                owner,
+                0,
                 0,
                 GetModuleHandleW(std::ptr::null()),
                 std::ptr::null_mut(),
             )
         };
         if hwnd == 0 {
-            None
-        } else {
-            // 让 Explorer 把拖到这块窗口上的文件转成 WM_DROPFILES
-            unsafe { DragAcceptFiles(hwnd, 1) };
-            Some(hwnd)
+            return None;
         }
+        unsafe {
+            // 拖动画面时要知道该把「按住标题栏」转交给谁
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, main);
+            // 让 Explorer 把拖到画面上的文件转成 WM_DROPFILES
+            DragAcceptFiles(hwnd, 1);
+        }
+        Some(hwnd)
     }
 
     /// 取走并清空拖放队列（主线程 tick 调用）。
@@ -347,103 +517,162 @@ mod win {
         }
     }
 
-    /// 把 chrome 占的区域从窗口可见范围里挖掉（`holes` 为空 = 恢复整窗矩形）。
+    /// 把它插到主窗口**正下方**。
     ///
-    /// 窗口区域既裁剪**渲染**也裁剪**命中测试**：挖掉的那几块会露出下面的 GPUI
-    /// 主窗口（标题带/胶囊/歌单就画在那儿），点在洞里也会直接给主窗口。
-    /// 传 `scale` 是因为区域只能用物理像素，而布局是逻辑像素。
-    pub fn set_holes(hwnd: Hwnd, width: i32, height: i32, holes: &[Hole], scale: f32) {
+    /// `SetWindowPos` 的 `hWndInsertAfter` 是「排在谁后面（下面）」，
+    /// 所以直接传主窗口句柄。主窗口自己的 z 序不动。
+    pub fn keep_below(hwnd: Hwnd, main: Hwnd) {
+        if hwnd == 0 || main == 0 {
+            return;
+        }
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                main,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    pub fn is_minimized(hwnd: Hwnd) -> bool {
+        hwnd != 0 && unsafe { IsIconic(hwnd) } != 0
+    }
+
+    /// 客户区左上角相对**窗口矩形**的物理偏移（含边框与不可见边框）。
+    fn client_offset(hwnd: Hwnd) -> (i32, i32) {
+        let mut window = Rect::default();
+        let mut point = Point::default();
+        unsafe {
+            GetWindowRect(hwnd, &mut window);
+            ClientToScreen(hwnd, &mut point);
+        }
+        (point.x - window.left, point.y - window.top)
+    }
+
+    fn window_size(hwnd: Hwnd) -> (i32, i32) {
+        let mut window = Rect::default();
+        unsafe { GetWindowRect(hwnd, &mut window) };
+        (window.right - window.left, window.bottom - window.top)
+    }
+
+    /// 给**主窗口**设区域：整窗 − 画面区 ＋ chrome。
+    ///
+    /// 为什么必须减掉画面区：系统只认窗口矩形/区域，不认逐像素透明度。主窗口整块
+    /// 盖着视频窗时，mpv 的呈现会被当成「完全被遮挡」而停止出帧（见模块头）。
+    /// 减掉之后画面露出来；而画面区之外的部分（含非客户区的边框）仍留在区域里，
+    /// 所以四边拖动缩放、系统边框都是正常的。
+    pub fn set_region(hwnd: Hwnd, stage: (f32, f32, f32, f32), chrome: &[ChromeRect], scale: f32) {
         if hwnd == 0 {
             return;
         }
-        if holes.is_empty() {
-            // NULL 区域 = 整窗，交给系统接管（原来的区域会被系统释放）
-            unsafe { SetWindowRgn(hwnd, 0, 1) };
-            return;
-        }
+        let (width, height) = window_size(hwnd);
+        let (ox, oy) = client_offset(hwnd);
         let px = |value: f32| (value * scale).round() as i32;
+        // 逻辑（客户区）→ 区域（窗口矩形、物理像素）
+        let place = |x: f32, y: f32, w: f32, h: f32| {
+            (ox + px(x), oy + px(y), ox + px(x + w), oy + px(y + h))
+        };
         unsafe {
             let region = CreateRectRgn(0, 0, width.max(1), height.max(1));
             if region == 0 {
                 return;
             }
-            for hole in holes {
-                let (left, top) = (px(hole.x), px(hole.y));
-                let (right, bottom) = (px(hole.x + hole.width), px(hole.y + hole.height));
-                let cut = if hole.radius > 0.0 {
+            let (left, top, right, bottom) = place(stage.0, stage.1, stage.2, stage.3);
+            let cut = CreateRectRgn(left, top, right, bottom);
+            if cut != 0 {
+                CombineRgn(region, region, cut, RGN_DIFF);
+                // CombineRgn 是复制语义，源区域用完自己释放
+                DeleteObject(cut);
+            }
+            for item in chrome {
+                let (left, top, right, bottom) = place(item.x, item.y, item.width, item.height);
+                let add = if item.radius > 0.0 {
                     // CreateRoundRectRgn 收的是椭圆的**宽高**，不是半径
-                    let d = px(hole.radius) * 2;
+                    let d = px(item.radius) * 2;
                     CreateRoundRectRgn(left, top, right, bottom, d, d)
                 } else {
                     CreateRectRgn(left, top, right, bottom)
                 };
-                if cut != 0 {
-                    CombineRgn(region, region, cut, RGN_DIFF);
-                    // CombineRgn 是复制语义，源区域用完要自己释放
-                    DeleteObject(cut);
+                if add != 0 {
+                    CombineRgn(region, region, add, RGN_OR);
+                    DeleteObject(add);
                 }
             }
-            // SetWindowRgn 成功后 region 归系统所有，**不要**再 DeleteObject
+            // 成功后 region 归系统所有，**不要** DeleteObject
             SetWindowRgn(hwnd, region, 1);
         }
     }
 
-    /// 主窗口客户区左上角在屏幕上的物理坐标。
-    pub fn client_origin(hwnd: Hwnd) -> (i32, i32) {
+    /// 恢复整窗矩形（NULL 区域交给系统接管，原区域会被释放）。
+    pub fn clear_region(hwnd: Hwnd) {
+        if hwnd != 0 {
+            unsafe { SetWindowRgn(hwnd, 0, 1) };
+        }
+    }
+
+    /// 窗口**外框**在屏幕上的物理矩形（含边框）。
+    pub fn window_rect(hwnd: Hwnd) -> (i32, i32, i32, i32) {
         if hwnd == 0 {
-            return (0, 0);
+            return (0, 0, 0, 0);
         }
-        let mut point = Point::default();
-        let ok = unsafe { ClientToScreen(hwnd, &mut point) };
-        if ok == 0 {
-            (0, 0)
-        } else {
-            (point.x, point.y)
-        }
+        let mut rect = Rect::default();
+        unsafe { GetWindowRect(hwnd, &mut rect) };
+        (
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        )
     }
 }
 
 #[cfg(not(windows))]
 mod win {
-    use super::{Hole, Hwnd};
+    use super::{ChromeRect, Hwnd};
 
-    pub fn create_overlay(_owner: Hwnd) -> Option<Hwnd> {
+    pub fn create_overlay(_main: Hwnd) -> Option<Hwnd> {
         None
+    }
+    pub fn take_dropped() -> Vec<String> {
+        Vec::new()
     }
     pub fn destroy(_hwnd: Hwnd) {}
     pub fn show(_hwnd: Hwnd) {}
     pub fn hide(_hwnd: Hwnd) {}
     pub fn set_rect(_hwnd: Hwnd, _x: i32, _y: i32, _w: i32, _h: i32, _visible: bool) {}
-    pub fn set_holes(_hwnd: Hwnd, _w: i32, _h: i32, _holes: &[Hole], _scale: f32) {}
-    pub fn client_origin(_hwnd: Hwnd) -> (i32, i32) {
-        (0, 0)
+    pub fn keep_below(_hwnd: Hwnd, _main: Hwnd) {}
+    pub fn is_minimized(_hwnd: Hwnd) -> bool {
+        false
     }
-    pub fn take_dropped() -> Vec<String> {
-        Vec::new()
+    pub fn set_region(_hwnd: Hwnd, _stage: (f32, f32, f32, f32), _chrome: &[ChromeRect], _s: f32) {}
+    pub fn clear_region(_hwnd: Hwnd) {}
+    pub fn window_rect(_hwnd: Hwnd) -> (i32, i32, i32, i32) {
+        (0, 0, 0, 0)
     }
 }
 
-/// 视频叠加窗口。
+/// 视频叠加窗口（mpv 的画布，垫在主窗口下面）。
 pub struct VideoOverlay {
     hwnd: Hwnd,
+    /// GPUI 主窗口：z 序、最小化、拖动转交都要跟它对齐
+    main: Hwnd,
     visible: bool,
     rect: (i32, i32, i32, i32),
-    /// 当前挖掉的 chrome 区域（逻辑像素），窗口尺寸变化后要按新尺寸重新应用
-    holes: Vec<Hole>,
-    /// 逻辑 → 物理的换算比（区域只能用物理像素）
-    scale: f32,
 }
 
 impl VideoOverlay {
-    /// 创建所有者为主窗口的隐藏弹窗。
-    pub fn create(owner: Hwnd) -> Option<Self> {
-        let hwnd = win::create_overlay(owner)?;
+    /// 创建无 owner 的隐藏弹窗。
+    pub fn create(main: Hwnd) -> Option<Self> {
+        let hwnd = win::create_overlay(main)?;
         Some(Self {
             hwnd,
+            main,
             visible: false,
             rect: (0, 0, 0, 0),
-            holes: Vec::new(),
-            scale: 1.0,
         })
     }
 
@@ -463,35 +692,26 @@ impl VideoOverlay {
         }
         self.rect = rect;
         win::set_rect(self.hwnd, rect.0, rect.1, rect.2, rect.3, self.visible);
-        // 区域不会跟着 SetWindowPos 自动缩放，改尺寸后必须重新算一遍
-        if !self.holes.is_empty() {
-            win::set_holes(self.hwnd, rect.2, rect.3, &self.holes, self.scale);
-        }
-    }
-
-    /// 设置要从画面里挖掉的 chrome 区域（逻辑像素）。内容没变就什么都不做。
-    pub fn set_holes(&mut self, holes: Vec<Hole>, scale: f32) {
-        self.scale = scale;
-        if holes == self.holes {
-            return;
-        }
-        self.holes = holes;
-        win::set_holes(self.hwnd, self.rect.2, self.rect.3, &self.holes, self.scale);
+        // z 序不会因为改尺寸自动维持，改完补一次
+        win::keep_below(self.hwnd, self.main);
     }
 
     pub fn show(&mut self) {
-        if !self.visible {
-            self.visible = true;
-            win::set_rect(
-                self.hwnd,
-                self.rect.0,
-                self.rect.1,
-                self.rect.2,
-                self.rect.3,
-                true,
-            );
-            win::show(self.hwnd);
+        if self.visible {
+            return;
         }
+        self.visible = true;
+        win::set_rect(
+            self.hwnd,
+            self.rect.0,
+            self.rect.1,
+            self.rect.2,
+            self.rect.3,
+            true,
+        );
+        win::show(self.hwnd);
+        // `ShowWindow` 会把它提到最前，必须立刻压回主窗口下面
+        win::keep_below(self.hwnd, self.main);
     }
 
     pub fn hide(&mut self) {
@@ -499,6 +719,17 @@ impl VideoOverlay {
             self.visible = false;
             win::hide(self.hwnd);
         }
+    }
+
+    /// 主窗口最小化时把它一起藏起来（没有 owner 关系，系统不再代劳）。
+    ///
+    /// 返回 `true` 表示「刚刚因为最小化被藏起来」。
+    pub fn follow_minimize(&mut self) -> bool {
+        if self.visible && win::is_minimized(self.main) {
+            self.hide();
+            return true;
+        }
+        false
     }
 }
 
@@ -508,12 +739,26 @@ impl Drop for VideoOverlay {
     }
 }
 
-/// 主窗口客户区原点（物理屏幕坐标）。
-pub fn client_origin(hwnd: Hwnd) -> (i32, i32) {
-    win::client_origin(hwnd)
+/// 主窗口外框矩形（物理屏幕坐标：x, y, w, h）。
+///
+/// 视频窗要铺满**外框**而不是客户区：客户区之外那一圈是窗口边框，它留在主窗口的
+/// 区域里（否则四边拖动缩放失效），而那一圈我们不画任何东西——铺到客户区就会
+/// 从边框里透出桌面（实测左边会露出别的窗口的文字）。
+pub fn window_rect(hwnd: Hwnd) -> (i32, i32, i32, i32) {
+    win::window_rect(hwnd)
 }
 
-/// 取走叠加窗口收到的拖放路径。
+/// 取走视频窗收到的拖放路径（主线程 tick 调用）。
 pub fn take_dropped() -> Vec<String> {
     win::take_dropped()
+}
+
+/// 视频模式下给主窗口设区域：整窗 − 画面区 ＋ chrome。
+pub fn set_region(main: Hwnd, stage: (f32, f32, f32, f32), chrome: &[ChromeRect], scale: f32) {
+    win::set_region(main, stage, chrome, scale);
+}
+
+/// 退出视频模式：主窗口恢复整窗矩形。
+pub fn clear_region(main: Hwnd) {
+    win::clear_region(main);
 }

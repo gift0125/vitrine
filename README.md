@@ -23,7 +23,7 @@
 | 自动连播 | 一曲结束自动下一首；播完列表末尾停止 |
 | 进度与音量 | 拖动进度条跳转、音量 0–100 实时生效 |
 | 影院模式 | 视频播放时一键全屏并隐藏歌单，退出自动恢复 |
-| 画面拖动窗体 | 按住画面拖拽即移动窗口（叠加窗把这一下转交给系统当标题栏拖动） |
+| 画面拖动窗体 | 按住画面拖拽即移动窗口；双击画面最大化/还原 |
 | 明暗主题 | 右上角一键切换，配色全部走主题 token |
 | 状态持久化 | 播放列表、上次曲目、音量、窗口尺寸自动保存 |
 | 错误提示 | 文件损坏、格式不支持、mpv 缺失等都有提示：音频模式走右上角 toast，视频模式走标题带胶囊 |
@@ -149,10 +149,12 @@ GPUI 的 Windows 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`）
 
 实际方案：
 
-1. 应用创建一个 `WS_POPUP` 顶层窗口（owner = 主窗口），不带激活、不进任务栏；
+1. 应用创建一个 `WS_POPUP` 顶层窗口，**没有 owner、垫在主窗口正下方**（不带激活、不进任务栏）；
 2. mpv 用 `--wid=<该窗口句柄>` 直接把硬解帧画上去，Rust 侧零像素搬运；
 3. GPUI 每帧用 `canvas` 回调报告视频区矩形，叠加窗口据此 `SetWindowPos` 跟随（缩放、全屏、影院模式都跟随）；
 4. 播放控制走 mpv 的 JSON IPC 命名管道。
+
+垫在下面而不是盖在上面，是为了让控制条的玻璃能真的透出画面（见下一节）。
 
 ### 最大化 / 还原为什么自己实现
 
@@ -173,29 +175,65 @@ GPUI 的 Windows 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`）
 顺带修掉一个持久化问题：最大化时窗口尺寸不再被当成「用户尺寸」写进设置
 （以前最大化后等 5 秒，下次启动就会按最大化尺寸开窗）。
 
-### 视频上方为什么会「浮」着控件
+### 视频窗为什么垫在主窗下面（以及那块区域为什么要「减掉」）
 
-叠加窗口盖住整个窗口，所以视频模式的画面是**铺满整窗**的，标题带、胶囊、歌单要浮在画面上，
-就得让叠加窗口在自己身上「开洞」：
+早先的做法是让叠加窗口盖在主窗口上面，再在叠加窗口自己身上开洞把 chrome 露出来。
+那样 chrome 虽然「浮」在画面上，但它背后只有主窗口的不透明表面——玻璃永远是实心黑板。
+
+现在是反过来：**主窗口逐像素透明，画面垫在它下面**，同一句 `overlay::glass()`
+（`#0B0C10` @72%）就真的透出画面了。两件事缺一不可：
+
+1. `WindowOptions.window_background = Transparent`；
+2. 把 gpui-component `RootPlugin` 给窗口表面 refine 的那层 `.bg(tokens.background)`
+   逐窗覆盖掉（`Root` 实现 `Styled`，在 `render` 里做一次；`new` 那会儿 `Root` 还没挂上）。
+
+**但只做这两步画面是黑的**：系统判定「窗口是否被遮挡」只看窗口矩形/区域，不看逐像素
+透明度。视频窗整块被主窗口盖着时，mpv 的呈现会停下来不出帧（`PrintWindow` 也是黑的，
+`--d3d11-flip=no` 无效）。三次实测确认：把视频窗挪到没被盖住的地方 → 画面正常；在主窗口
+区域上挖个 300×300 的洞 → 画面正好出现在洞里。
+
+于是主窗口在视频模式下把自己的窗口区域改成：
 
 ```
-SetWindowRgn(overlay, 整窗圆角矩形 RGN_DIFF 标题带 − RGN_DIFF 胶囊 − RGN_DIFF 歌单)
+整窗矩形 − 画面区 + chrome（标题带 / 胶囊 / 歌单）
 ```
 
-窗口区域同时裁剪**渲染**和**命中测试**，挖掉的那几块自然露出下面的 GPUI 主窗口——
-chrome 就真的压在画面上了（`video_overlay::set_holes` + `PlayerView::chrome_holes`）。
+- 非客户区那圈边框留在区域里 → 四边拖动缩放、系统边框照常；
+- chrome 必须用 `RGN_OR` 加回去，否则它自己也被剪掉——区域同时裁剪**渲染**和**命中测试**，
+  表现就是「控件没画出来、也点不到」；
+- 区域只认**物理像素**、坐标相对**窗口矩形**，所以要按 `ClientToScreen − GetWindowRect`
+  的偏移换算；`CreateRoundRectRgn` 收的是椭圆**宽高**（直径）不是半径；
+- 视频窗铺的是主窗口**外框**（`GetWindowRect`）而不是客户区：边框那一圈仍在主窗口区域里，
+  而我们在那儿不画东西，铺到客户区就会从边框透出桌面；
+- 胶囊高度是内容撑开的，不能写死，由胶囊内部的 `canvas` 每帧量出来（`capsule_rect`），
+  再外扩 1.5px，否则会切掉 1px 白描边；
+- 区域重设有去重键（不含窗口位置——区域坐标相对窗口矩形，纯移动不用重设），
+  否则拖动时每帧 `SetWindowRgn` 会让整窗重绘、画面发抖。
 
-三个细节：
+`ui_tests::chrome_region_covers_capsule_and_panel` 盯着「区域矩形 vs 实际布局」的对齐，
+`scripts/verify_floating_chrome.py` 在真机上验收（画面出帧、玻璃透色、拖动、双击最大化）。
 
-- 区域只认**物理像素**，且 `SetWindowPos` 改尺寸时**不会**自动跟着缩放，所以 `set_rect`
-  之后必须按新尺寸重算一遍；
-- `CreateRoundRectRgn` 收的是椭圆的**宽高**（直径），不是半径；
-- 胶囊高度是内容撑开的（随字号/行距变），不能写死，只能由胶囊内部的 `canvas` 每帧量出来
-  （`capsule_rect`）；再外扩 1.5px，否则挖得太贴边会把 1px 白描边切掉半个像素。
+### 按住画面拖动 / 双击最大化
 
-顺带解决的另一件事：**按住画面也能拖窗体**。叠加窗口的 wndproc 收到 `WM_LBUTTONDOWN`
-就 `ReleaseCapture()` + `SendMessageW(owner, WM_NCLBUTTONDOWN, HTCAPTION)`，把这一下「转交」
-给系统当标题栏拖动，主窗口走系统自己的移动循环，叠加窗由 100ms 的 tick 追上。
+画面区不在主窗口的区域里了，点在上面命中的是视频窗，所以这两件事由
+`video_overlay` 的 wndproc 接：
+
+- `WM_LBUTTONDOWN` 记起点 + `SetCapture`，`WM_MOUSEMOVE` 里按**累计位移** `SetWindowPos`
+  主窗口，并同步把叠加窗粘上去（不等 100ms 的 tick，拖动时画面才不落后）；
+- `WM_LBUTTONDBLCLK` 直接调 `window_actions::set_zoomed`（等价于双击标题栏）。
+
+不用「转交系统」的两条捷径，都踩过：
+
+- `SendMessageW(main, WM_NCLBUTTONDOWN, HTCAPTION)` 让系统做模态拖动——在这个窗口上
+  只跟上头一两步就停住（GPUI 的 wndproc 自己处理 `WM_MOUSEMOVE`，系统的模态循环拿不到
+  位移），紧接着的双击还会被当成「继续拖动」，窗口挪一段而不是最大化；
+- 转交 `WM_NCLBUTTONDBLCLK`——窗口会撑到工作区，但 `WS_MAXIMIZE` 位丢了，`IsZoomed`
+  为假，标题带图标和「再点一次还原」全乱。
+
+代价：没有 Aero Snap（贴边吸附）和「拖最大化窗口还原」，最大化状态下按住画面不拖。
+
+> 也别给叠加窗加 `WS_EX_TRANSPARENT` 想「命中穿透」：实测会让整块窗口**不再被合成**，
+> 帧还在但完全看不见。
 
 > 踩坑记录：Windows 命名管道上挂起的 `ReadFile` 会阻塞 `WriteFile`（即使句柄是 `try_clone` 出来的），
 > 所以 IPC 不能「读线程 + 写线程」并发，必须单线程串行 + `PeekNamedPipe` 非阻塞探测。
@@ -203,12 +241,12 @@ chrome 就真的压在画面上了（`video_overlay::set_holes` + `PlayerView::c
 
 ### 拖放为什么要两条接收路径
 
-拖进来的文件有两条落地路径，因为叠加窗口把窗口 80% 的面积盖住了：
+拖进来的文件有两条落地路径：
 
-1. **GPUI 自己的 `IDropTarget`**（注册在主窗口上）覆盖标题带、控制条、歌单面板这些**没有**被
-   叠加窗口遮住的区域：`.on_drop::<ExternalPaths>(...)` 挂在根节点上，整窗都是投放区。
+1. **GPUI 自己的 `IDropTarget`**（注册在主窗口上）覆盖标题带、控制条、歌单面板这些**留在**
+   主窗口区域里的区域：`.on_drop::<ExternalPaths>(...)` 挂在根节点上，整窗都是投放区。
 2. **叠加窗口自己收**：OLE 查找投放目标是由 `WindowFromPoint` 从光标下的窗口沿父链向上的，
-   走到叠加窗口就断了（GPUI 的 target 在主窗口上，够不到）。所以叠加窗口调
+   而画面区已经被从主窗口区域里减掉了，光标下命中的就是叠加窗。所以叠加窗口调
    `DragAcceptFiles(hwnd, TRUE)`，由系统把投放转成 `WM_DROPFILES`，wndproc 里
    `DragQueryFileW` 取出路径丢进队列，主线程 100ms 的 tick 再统一消费。
 
@@ -231,6 +269,10 @@ chrome 就真的压在画面上了（`video_overlay::set_holes` + `PlayerView::c
 白底控制条会糊在亮画面上（OSC 的通用做法，IINA 同样如此）。`theme.rs` 的
 `overlay` 模块集中提供这组颜色（`canvas` / `glass` / `border` / `fg` / `dim` /
 `accent` / `play`），界面代码不写死色值。
+
+从第七轮起这层玻璃是**真的半透明**：画面垫在主窗下面，72% 的深色底会真的透出画面色相
+（验收脚本取两个不同色条处的胶囊像素做色差判定）。唯一缺的是**区域级 backdrop blur**：
+Windows 的 acrylic 只能整窗生效，做不到「只糊 chrome 底下那块」。
 
 应用表面的语义 token（`theme.rs` 把设计稿色板翻译成 gpui-component token）：
 
@@ -260,9 +302,9 @@ Mocha Mauve `#CBA6F7`，播放键仍是品牌色 `#8839EF`。
 `BOTTOM_BAND` 也相应收到 116。窗口按钮不能沿用 `xsmall` 图标按钮（20×20）——
 Windows 的点击热区就是 46 宽整块，图标 10px，悬停铺满底色、关闭键用系统红 `#C42B1C`。
 
-标题带的前景色**跟着底色走**，不跟主题走：视频模式下这条带压在深色画布上，
-若还取浅色主题的 `muted_foreground`，对比度只有 3:1 左右，曲名和窗口按钮几乎看不见
-（`chrome_fg` / `chrome_dim`）。
+标题带的前景色**跟着底色走**，不跟主题走：视频模式下这条带压低在画面上的深玻璃
+（`overlay::glass()`），若还取浅色主题的 `muted_foreground`，对比度只有 3:1 左右，
+曲名和窗口按钮几乎看不见（`chrome_fg` / `chrome_dim`）。
 
 提示（toast）分两种呈现，按**底色**而不是按内容选：
 
