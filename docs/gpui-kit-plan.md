@@ -275,6 +275,57 @@ UI 测试改为先装真实皮肤再断言；`scripts/shot.py` 按 DPI 缩放截
 
 ---
 
+### 🖱 拖放 / 窗口按钮 / 胶囊比例（2026-10-18 第二轮修）
+
+用户反馈三条：拖文件进窗口不播、右上角窗口按钮太小不像 Windows、控制条相对窗口过于笨重。
+
+**1. 拖放（原实现完全没有监听）**
+
+GPUI 的拖放链路：系统投放 → `FileDropEvent::Entered { position, paths: ExternalPaths }`
+→ 存进 `cx.active_drag`（载荷 `Arc<ExternalPaths>`）→ `Submit` 变成一次合成 MouseUp →
+鼠标下元素的 drop listener 被调用（前提：`drag.value.type_id()` 与 listener 的 `T` 相同、
+且该 hitbox 处于 hover）。所以根节点挂 `.on_drop::<ExternalPaths>(...)` 就是「整窗可投放」。
+
+但叠加窗口把窗口 80% 盖住了，而 OLE 找投放目标是 `WindowFromPoint` + 沿父链向上，
+断在叠加窗口（GPUI 的 target 注册在主窗口上）。于是叠加窗口自己收：
+`DragAcceptFiles(hwnd, TRUE)` + wndproc 里处理 `WM_DROPFILES` → `DragQueryFileW` 取路径
+→ 队列 → 100ms tick 消费。**两个前置事实要先确认**（都实测过）：
+`cx.active_drag` 是 `pub(crate)`（应用侧读不到状态）、`ExternalPaths` 的载荷类型
+是私有 smallvec（应用侧构造不了，除非自己加一份 `smallvec` dev-dependency）。
+
+**拖入提示**只能靠 `drag_over::<ExternalPaths>`——它的回调只给 `&StyleRefinement`，
+拿不到 `Context`，既不能改普通字段也不能 `cx.notify()`。做法：回调里只写
+`Cell<Option<Instant>>` 时间戳，tick 判断「250ms 内还有时间戳 = 仍在拖」再
+`cx.notify()`。这样拖走时提示会自己熄灭，不依赖 `Exited` 有没有送到。
+
+**2. 窗口按钮**：`IconName::WindowMinimize/Maximize/Close` 是 24 网格 + 2px 描边的
+字形，缩到 10px 只剩半个像素，栅格化是一团糊。改成手写 10×10、1px 描边的 SVG，
+用 `Icon::default().data(SVG_BYTES).size(px(10.))` 渲染；按钮本体 46 宽 × 标题栏高，
+悬停铺满底色，关闭键用系统红 `#C42B1C`；最大化时按 `window.is_maximized()` 换还原图标。
+
+**3. 胶囊比例**：padding 20×12 → 16×8、圆角 14 → 12、行距 6 → 4、进度条容器 12 → 10、
+时间码 11 → 10，实高 107 → ~90，`BOTTOM_BAND` 132 → 116。
+
+**顺带修的对比度问题**：视频模式下整块 chrome 是深色画布，但标题带/窗口按钮还在取
+浅色主题的 `muted_foreground` / `secondary_foreground`，3:1 左右，「看着像没渲染」。
+新增 `chrome_fg` / `chrome_dim`：前景色跟着**底色**走（`video_active ? overlay::* : theme.*`）。
+
+**验证手段**（这次没靠肉眼）：
+- UI 用例 `dropping_files_adds_them_and_starts_playback`：直接 `window.dispatch_event(
+  FileDropEvent::Entered/Submit)` 打进无头窗口，断言「入列表 + 当前曲目 = 0」——
+  这是唯一能覆盖 GPUI drop 链路的办法（`ExternalPaths` 应用侧构造不了，只能靠
+  `smallvec` dev-dependency 补齐）。
+- 叠加窗口那条路径：用 `PostMessage(WM_DROPFILES)` + 手工拼 `DROPFILES` 结构体验
+  wndproc 解析正确（路径原样进 `session.log` 的 `drop N path(s): …`），
+  并确认运行时 `GetWindowLong(GWL_EXSTYLE)` 带上了 `WS_EX_ACCEPTFILES`（0x10）。
+- 真实 OLE 拖源（ctypes 手搓 `IDropSource` + `SHCreateDataObject`）试过：能让应用
+  收到投放，但 `DoDragDrop` 的模态循环在自动化环境里不返回（需要真人松手），
+  所以没把它做成常驻测试。
+
+**测试** 15（player-core）+ 16（app）全绿，`clippy --workspace --all-targets` 零警告。
+
+---
+
 ## 4. 里程碑与时间线
 
 | 里程碑 | 内容 | 累计工期 |

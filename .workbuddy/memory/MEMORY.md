@@ -30,10 +30,16 @@
 - 自绘标题带：`TitlebarOptions.appears_transparent = true` 后，**只有左侧拖动区域**能设 `WindowControlArea::Drag`；整条都设会把右侧最小化/关闭按钮变成非客户区，点击到不了 GPUI。双击最大化要 `on_double_click` + `.id()` + `InteractiveElementExt`。
 - 测试里 `window.find(id)` 只认得**注册进命中测试树**的元素：普通 `div().id(x)` 查不到，要加 `.test_support()`（如 `seek-bar`、`stage`）。
 - 模拟点击：`PostMessage(WM_LBUTTONDOWN)` 的 lparam 不总被采信，命中测试用**真实光标**；`SetCursorPos`+`mouse_event` 又会被窗口位置抖动带偏（误点在自绘标题带上会变成"拖动窗口"）。稳定做法是 `scripts/shot.py` 的 PostMessage 路径 + 按布局算出的逻辑坐标。
+- **文件拖放（GPUI 侧）**：系统投放 → `FileDropEvent::Entered{paths: ExternalPaths}` → `cx.active_drag = AnyDrag{value: Arc<ExternalPaths>}`；`Submit` 转成合成 MouseUp，鼠标下 hitbox 的 drop listener 才被调用。根节点 `.on_drop::<ExternalPaths>(...)` = 整窗可投放。`cx.active_drag` 是 `pub(crate)`（读不到）；`ExternalPaths` 要自己构造必须加 `smallvec = "1"` dev-dependency。UI 测试可用 `window.dispatch_event(FileDropEvent::Entered/Submit)` 直接驱动整条链路（`dropping_files_adds_them_and_starts_playback`）。
+- **拖放（叠加窗口侧）**：OLE 找投放目标 = `WindowFromPoint` + 沿**父链**向上，mpv 叠加窗会截断；实测给窗口/mpv 子窗口加 `WS_EX_TRANSPARENT` **不会**改变 `WindowFromPoint`（别走这条路）。正解是把路径从同一进程的 GPUI 主窗口取回来：`DragAcceptFiles(hwnd, TRUE)`（exstyle 带 `WS_EX_ACCEPTFILES`）→ wndproc 处理 `WM_DROPFILES` → `DragQueryFileW` → 队列 → tick 消费。
+- `drag_over::<T>` 的样式回调只给 `&StyleRefinement`：**拿不到 `Context`**，改不了字段也 `notify` 不了。要视觉反馈就把时间戳写进 `Cell<Option<Instant>>`，由 100ms tick 判断并 `notify`（`on_file_drop_exit` 只给 `&mut App`、只对 `Exited` 且仍 hover 时触发，不够稳）。
+- 标题栏窗口按钮：`IconName::WindowMinimize/Maximize/Close` 是 24 网格 + 2px 描边，缩到 10px 会糊；要手写 10×10、1px 描边的 SVG 用 `Icon::default().data(SVG_BYTES)`。按钮本体按 Windows 规范 **46 宽 × 标题栏高**，关闭键悬停 `#C42B1C`。
+- **chrome 前景色跟底色走，不跟主题走**：视频模式整块 chrome 是深色画布，此时用浅色主题的 `muted_foreground`/`secondary_foreground` 只有 ≈3:1 对比度（`chrome_fg`/`chrome_dim` 就是干这个的）。
 
 ## 设计稿要点（详见 2026-10-17 / 2026-10-18 日志）
 - 色板严格取 Catppuccin Latte 官方值；Mauve #8839EF 唯一强调色。**v2 起是两套色板**：应用表面 Latte/Mocha，叠加层（胶囊）深色玻璃，见 `theme::overlay`。
-- 布局 v2 = IINA 式沉浸布局：自绘 34px 标题带 + 悬浮玻璃胶囊（内缩 24、圆角 14）+ 默认收起的 320 悬浮歌单面板；内容占满窗口。
+- 布局 v2 = IINA 式沉浸布局：自绘 34px 标题带 + 悬浮玻璃胶囊（内缩 24、圆角 12、padding 16×8）+ 默认收起的 320 悬浮歌单面板；内容占满窗口。
+- 尺寸口径要按「占窗口多少」定，不按像素堆：胶囊曾经 107 高（680 窗口的 15.7%）像一块黑板，现在约 90（13%），`BOTTOM_BAND` = 116。
 - **皮肤落地在 `crates/app/src/theme.rs`**：设计稿色板 → gpui-component 语义 token（Latte/Mocha 两套），界面只读 token。改动前一直用默认中性灰主题，这是"与设计稿差别很大"的根因（2026-10-18 修复）。
 - 图标规范：播放三角占圆直径 48%（B 档），32px 以下重绘而非缩放（占比 50-54%、去描边）；图标为正圆。
 - Ardot 可用字体仅 Inter / Noto 系列 / JetBrains Mono。

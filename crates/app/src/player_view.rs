@@ -13,7 +13,7 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use player_core::{
     find_mpv, is_video_file, load_track_meta, scan_dir_for_tracks, AudioEngine, PlaybackState,
@@ -46,12 +46,32 @@ const TICK_INTERVAL: Duration = Duration::from_millis(100);
 const TITLE_BAND: f32 = 34.0;
 /// 底部悬浮胶囊的内缩。
 const CAPSULE_INSET: f32 = 24.0;
-/// 底部为悬浮胶囊预留的高度（胶囊 ~106 高 + 24 内缩 + 余量）。
-const BOTTOM_BAND: f32 = 132.0;
+/// 底部为悬浮胶囊预留的高度。
+///
+/// 胶囊实高约 90（上下 padding 8 + 进度 10 + 时间行 14 + 走带 44 + 间距 8），
+/// 加上 24 内缩再留 2px 余量：留多了窗口下方会空出一条死气沉沉的黑带，
+/// 留少了 mpv 叠加窗会啃掉胶囊上沿。
+const BOTTOM_BAND: f32 = 116.0;
+/// 多久没有新的拖拽经过就算「拖走了」：`drag_over` 在拖动过程中会持续触发，
+/// 停更这么久只可能是鼠标带着文件离开了窗口。
+const DROP_HINT_IDLE: Duration = Duration::from_millis(250);
+/// 窗口按钮宽度：Windows 10/11 的标题栏按钮就是 46 宽、与标题栏等高。
+const CAPTION_BUTTON_WIDTH: f32 = 46.0;
 /// 悬浮播放列表面板宽度（设计稿 320）。
 const PLAYLIST_WIDTH: f32 = 320.0;
 /// 时间码字体（设计稿用等宽）。
 const MONO_FONT: &str = "Consolas";
+/// 关闭按钮的悬停底色（Windows 原生的 #C42B1C）。
+const CLOSE_DANGER: u32 = 0xC42B1C;
+/// 标题栏控制图标（10×10 网格、1 单位描边 = 1 物理逻辑像素）。
+///
+/// 不能用图标库里的 `WindowMinimize/Maximize/Close`：那些是 24 格、2px 描边的画法，
+/// 缩到 10px 后描边被抗锯齿糊成一坨（最大化看着像个实心小方块）。这里按 Windows
+/// 真实字形的尺寸重画，落点对齐到像素中心，1.5 倍屏下也干净。
+const ICON_MINIMIZE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M0 5h10" stroke="currentColor" stroke-width="1"/></svg>"#;
+const ICON_MAXIMIZE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1"/></svg>"#;
+const ICON_RESTORE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1"><rect x="2.5" y="0.5" width="7" height="7"/><rect x="0.5" y="2.5" width="7" height="7"/></svg>"#;
+const ICON_CLOSE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><path d="M0.5 0.5l9 9M9.5 0.5l-9 9" stroke="currentColor" stroke-width="1"/></svg>"#;
 
 /// ±10 秒图标的 path（24 格）。
 ///
@@ -118,6 +138,15 @@ pub struct PlayerView {
     pending_infos: Vec<SharedString>,
     /// 启动即播放的曲目（命令行 `--play` / 位置参数）；在第一次 tick 消费
     pending_autoplay: Option<usize>,
+    /// 最近一次「有外部文件在窗口上方」的时间戳（用于画「松开即可播放」提示）。
+    ///
+    /// 用 `Cell` 而不是普通字段：判定「拖的是外部文件」只能靠 `drag_over::<ExternalPaths>`
+    /// 的样式回调，它拿不到 `Context`，改不了普通字段、也没法 `cx.notify()`。
+    /// 所以这里只记时间戳，让 100ms 的 tick 去决定「显示/隐藏 + 重绘」——
+    /// 拖走时不再有新时间戳，250ms 后自动熄灭，不依赖 `Exited` 事件是否送到。
+    drop_activity: Rc<Cell<Option<Instant>>>,
+    /// 上一帧是否画了拖放提示（tick 用它判断要不要重绘）
+    drop_hint_shown: bool,
     /// 最近一条错误（便于测试断言，也给未来的状态栏复用）
     last_error: Option<SharedString>,
 }
@@ -157,14 +186,17 @@ impl PlayerView {
                 }
             }),
             // 拖动进度条：Change 期间仅跟随显示，Release 才真正 seek（避免拖动爆音）
-            cx.subscribe(&seek, |this, _slider, event: &SliderEvent, cx| match event {
-                SliderEvent::Change(_) => this.user_seeking = true,
-                SliderEvent::Release(value) => {
-                    this.user_seeking = false;
-                    this.seek_to(value.start() as f64);
-                    cx.notify();
-                }
-            }),
+            cx.subscribe(
+                &seek,
+                |this, _slider, event: &SliderEvent, cx| match event {
+                    SliderEvent::Change(_) => this.user_seeking = true,
+                    SliderEvent::Release(value) => {
+                        this.user_seeking = false;
+                        this.seek_to(value.start() as f64);
+                        cx.notify();
+                    }
+                },
+            ),
             // 音量
             cx.subscribe(&volume, |this, _slider, event: &SliderEvent, cx| {
                 if let SliderEvent::Change(value) = event {
@@ -175,16 +207,20 @@ impl PlayerView {
 
         let mut subscriptions = subscriptions;
         // 窗口移动/缩放时同步叠加窗口位置
-        subscriptions.push(
-            cx.observe_window_bounds(window, |this, window, _cx| {
-                this.sync_overlay_rect(window);
-            }),
-        );
+        subscriptions.push(cx.observe_window_bounds(window, |this, window, _cx| {
+            this.sync_overlay_rect(window);
+        }));
         // 退出应用时结束 mpv 子进程（避免孤儿进程）
         subscriptions.push(cx.on_app_quit(|this, _cx| {
             let detail = match this.current {
-                Some(i) => format!("app_quit requested (video_active={}, current={i})", this.video_active),
-                None => format!("app_quit requested (video_active={}, current=none)", this.video_active),
+                Some(i) => format!(
+                    "app_quit requested (video_active={}, current={i})",
+                    this.video_active
+                ),
+                None => format!(
+                    "app_quit requested (video_active={}, current=none)",
+                    this.video_active
+                ),
             };
             persistence::log_session(&detail);
             this.shutdown_video();
@@ -252,6 +288,8 @@ impl PlayerView {
             pending_errors: startup_errors,
             pending_infos: Vec::new(),
             pending_autoplay: autoplay,
+            drop_activity: Rc::new(Cell::new(None)),
+            drop_hint_shown: false,
         };
 
         // 100ms 轮询：进度同步 + 自动连播 + 叠加窗口跟随 + 窗口尺寸节流落盘
@@ -305,6 +343,23 @@ impl PlayerView {
             self.play_track(index, cx);
         }
 
+        // 拖到视频区上的文件由叠加窗口代收（见 video_overlay::take_dropped）
+        let dropped = video_overlay::take_dropped();
+        if !dropped.is_empty() {
+            self.import_dropped(dropped.into_iter().map(PathBuf::from).collect(), cx);
+        }
+
+        // 拖放提示：`drag_over` 的样式回调拿不到 cx，只能留时间戳。
+        // 250ms 内还有时间戳 = 仍在拖；没有 = 拖走了，提示自己熄灭。
+        let dragging = self
+            .drop_activity
+            .get()
+            .is_some_and(|stamp| stamp.elapsed() < DROP_HINT_IDLE);
+        if dragging != self.drop_hint_shown {
+            self.drop_hint_shown = dragging;
+            cx.notify();
+        }
+
         // 影院模式只对视频成立：自动连播切到音频（或无视频可播）时必须退出全屏，
         // 否则影院按钮消失、用户被困在全屏里。
         if self.cinema && !self.video_active {
@@ -348,10 +403,7 @@ impl PlayerView {
         // 窗口尺寸节流落盘（变化后 ~5s 保存一次）
         // 影院模式下 bounds 是全屏尺寸，不能当窗口尺寸存（否则下次启动开成全屏大小）。
         let bounds = window.bounds();
-        let size = (
-            bounds.size.width.as_f32(),
-            bounds.size.height.as_f32(),
-        );
+        let size = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
         if self.cinema || size == self.last_saved_size {
             self.window_dirty_ticks = 0;
         } else {
@@ -930,6 +982,172 @@ impl PlayerView {
     }
 
     // ------------------------------------------------------------------
+    // 从资源管理器拖文件进来
+    // ------------------------------------------------------------------
+
+    /// 外部文件被拖进窗口（GPUI 把平台的拖放事件转成内部拖拽，松开时命中根节点）。
+    ///
+    /// 目录递归扫描、文件读元数据都在后台线程做；回来后追加进列表并把**拖入的第一条**
+    /// 直接播起来——「拖进来就能看」是这个交互的默认预期，不该再让用户点一下。
+    fn import_dropped(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        // 拖放路径是外部世界给的，出问题时（相对路径、被剪短、编码）只有原样记下来才查得动
+        persistence::log_session(&format!(
+            "drop {} path(s): {}",
+            paths.len(),
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+        // 让用户立刻看到"东西进来了"，而不是猜有没有成功
+        self.playlist_open = true;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let tracks = cx
+                .background_spawn(async move {
+                    let mut out: Vec<TrackMeta> = Vec::new();
+                    for path in paths {
+                        if path.is_dir() {
+                            out.extend(scan_dir_for_tracks(&path));
+                        } else if path.is_file() {
+                            out.push(load_track_meta(&path));
+                        }
+                    }
+                    out
+                })
+                .await;
+
+            let _ = this.update(cx, |view, cx| {
+                if tracks.is_empty() {
+                    view.report_info("拖入的内容里没有可播放的媒体文件");
+                    cx.notify();
+                } else {
+                    view.append_dropped_and_play(tracks, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 追加拖入的曲目（按路径去重），并播放拖入的第一条。
+    fn append_dropped_and_play(&mut self, tracks: Vec<TrackMeta>, cx: &mut Context<Self>) {
+        let first_key = tracks.first().map(|track| path_key(&track.path));
+
+        let mut seen: Vec<String> = self
+            .playlist
+            .read(cx)
+            .delegate()
+            .tracks()
+            .iter()
+            .map(|track| path_key(&track.path))
+            .collect();
+        let mut fresh = Vec::new();
+        for track in tracks {
+            let key = path_key(&track.path);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            fresh.push(track);
+        }
+        if !fresh.is_empty() {
+            self.append_tracks(fresh, cx);
+        }
+
+        // 拖的可能本来就是列表里的曲目：那就直接播那一条
+        let target = first_key.and_then(|key| {
+            let delegate = self.playlist.read(cx).delegate();
+            (0..delegate.track_count()).find(|&row| {
+                delegate
+                    .track(row)
+                    .map(|track| path_key(&track.path) == key)
+                    .unwrap_or(false)
+            })
+        });
+        match target {
+            Some(index) => self.play_track(index, cx),
+            None => cx.notify(),
+        }
+    }
+
+    /// 拖入文件时的提示层（盖住整个窗口）。
+    ///
+    /// 视频模式只能放在标题带里：画面那一块被 mpv 的叠加窗口盖着，居中卡片根本看不见，
+    /// 只会看到四周暗下去、中间什么都没有。
+    fn render_drop_hint(&self) -> Div {
+        let scrim = div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full()
+            .bg(gpui_kit::rgba(0x08090CC0));
+
+        if self.video_active {
+            return scrim
+                .flex()
+                .items_center()
+                .justify_center()
+                .h(px(TITLE_BAND))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .px(px(14.))
+                        .py(px(5.))
+                        .rounded(px(999.))
+                        .bg(overlay::glass())
+                        .border_1()
+                        .border_color(overlay::border())
+                        .child(
+                            Icon::new(IconName::Music)
+                                .size(px(13.))
+                                .text_color(overlay::accent()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(overlay::fg())
+                                .child("松开即可导入并播放"),
+                        ),
+                );
+        }
+
+        scrim.flex().items_center().justify_center().child(
+            v_flex()
+                .items_center()
+                .gap(px(10.))
+                .px(px(28.))
+                .py(px(20.))
+                .rounded(px(14.))
+                .bg(overlay::glass())
+                .border_1()
+                .border_color(overlay::border())
+                .child(
+                    Icon::new(IconName::Music)
+                        .size(px(30.))
+                        .text_color(overlay::accent()),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(overlay::fg())
+                        .child("松开即可导入并播放"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(overlay::dim())
+                        .child("支持音视频文件，拖文件夹会递归扫描"),
+                ),
+        )
+    }
+
+    // ------------------------------------------------------------------
     // 渲染
     // ------------------------------------------------------------------
     //
@@ -944,8 +1162,30 @@ impl PlayerView {
     //   2. 视频模式下列表展开时，画面右侧让位，否则面板会被 mpv 盖住。
     //   音频模式没有这个限制，封面可以真正铺满整窗。
 
+    /// 标题带只压在两种底色上：音频模式是主题 `background`，视频模式是深色画布。
+    /// 前景色必须跟着**底色**走，不能跟着应用主题走——浅色主题 + 深色画布的组合下
+    /// 直接用 `muted_foreground` / `secondary_foreground` 会得到 3:1 左右的对比度，
+    /// 曲名和窗口按钮看着像没渲染。
+    fn chrome_fg(&self, cx: &Context<Self>) -> gpui_kit::Hsla {
+        if self.video_active {
+            overlay::fg()
+        } else {
+            cx.theme().foreground
+        }
+    }
+
+    fn chrome_dim(&self, cx: &Context<Self>) -> gpui_kit::Hsla {
+        if self.video_active {
+            overlay::dim()
+        } else {
+            cx.theme().muted_foreground
+        }
+    }
+
     /// 顶部标题带：当前曲名 + 自绘窗口按钮（系统标题栏已在 main 里关掉）。
-    fn render_title_band(&self, cx: &Context<Self>) -> Div {
+    fn render_title_band(&self, window: &Window, cx: &Context<Self>) -> Div {
+        // 最大化时 Windows 会把"最大化"换成"还原"图标
+        let maximized = window.is_maximized();
         let title = match self.current_track(cx) {
             Some(track) => match &track.artist {
                 Some(artist) if !artist.is_empty() => format!("{} · {}", track.title, artist),
@@ -975,7 +1215,7 @@ impl PlayerView {
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(overlay::dim())
+                            .text_color(self.chrome_dim(cx))
                             .child(title),
                     ),
             )
@@ -985,46 +1225,55 @@ impl PlayerView {
                     .items_center()
                     .when(self.cinema, |el| {
                         // 影院模式下仍然留一个退出按钮，否则用户没法回到普通窗口
+                        let fg = self.chrome_fg(cx);
                         el.child(
                             Button::new("exit-cinema")
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Minimize)
+                                .text_color(fg)
                                 .tooltip("退出全屏")
                                 .accessibility_label("退出全屏")
+                                .mr(px(8.))
                                 .on_click(cx.listener(|this, _e, window, cx| {
                                     this.toggle_cinema(window, cx);
                                 })),
                         )
                     })
-                    .child(
-                        Button::new("win-min")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::WindowMinimize)
-                            .tooltip("最小化")
-                            .accessibility_label("最小化")
-                            .on_click(|_, window, _| window.minimize_window()),
-                    )
-                    .child(
-                        Button::new("win-max")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::WindowMaximize)
-                            .tooltip("最大化")
-                            .accessibility_label("最大化")
-                            .on_click(|_, window, _| window.zoom_window()),
-                    )
-                    .child(
-                        Button::new("win-close")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::WindowClose)
-                            .tooltip("关闭")
-                            .accessibility_label("关闭")
-                            .on_click(|_, window, _| window.remove_window()),
-                    )
-                    .pr(px(4.)),
+                    // Windows 的标题栏按钮是「46 宽 × 标题栏高」的矩形块，
+                    // 悬停铺满整块底色；之前用的 xsmall 图标按钮只有 20×20，
+                    // 在自绘标题栏里明显偏小（也不符合 Win 的点击热区）。
+                    .child(caption_button(
+                        "win-min",
+                        ICON_MINIMIZE,
+                        "最小化",
+                        false,
+                        self.video_active,
+                        |_, window, _| window.minimize_window(),
+                        cx,
+                    ))
+                    .child(caption_button(
+                        "win-max",
+                        if maximized {
+                            ICON_RESTORE
+                        } else {
+                            ICON_MAXIMIZE
+                        },
+                        if maximized { "还原" } else { "最大化" },
+                        false,
+                        self.video_active,
+                        |_, window, _| window.zoom_window(),
+                        cx,
+                    ))
+                    .child(caption_button(
+                        "win-close",
+                        ICON_CLOSE,
+                        "关闭",
+                        true,
+                        self.video_active,
+                        |_, window, _| window.remove_window(),
+                        cx,
+                    )),
             )
     }
 
@@ -1279,16 +1528,20 @@ impl PlayerView {
     }
 
     /// 悬浮胶囊：进度轨道 + 时间行 + 控制行，深色玻璃。
+    ///
+    /// 尺寸是按「占窗口多少」调的，不是按像素堆的：三条横排控件加上上下 padding
+    /// 曾经撑到 107 高（窗口 680 时占 15.7%），远看像一块压在下沿的黑板。
+    /// 现在压到 ~90（占 13%），间距也从 12/6 收到 8/4，视觉重量才和画面匹配。
     fn render_capsule(&self, cx: &mut Context<Self>) -> Div {
         v_flex()
             .absolute()
             .left(px(CAPSULE_INSET))
             .right(px(CAPSULE_INSET))
             .bottom(px(CAPSULE_INSET))
-            .px(px(20.))
-            .py(px(12.))
-            .gap(px(6.))
-            .rounded(px(14.))
+            .px(px(16.))
+            .py(px(8.))
+            .gap(px(4.))
+            .rounded(px(12.))
             .bg(overlay::glass())
             .border_1()
             .border_color(overlay::border())
@@ -1335,7 +1588,7 @@ impl PlayerView {
 
         v_flex()
             .w_full()
-            .gap(px(6.))
+            .gap(px(2.))
             // Slider 自身没有 id / 无障碍信息（上游未实现），用带 id 的容器承载，
             // 既给读屏软件一个可命名的分组，也让 UI 测试能定位到进度条几何。
             .child(
@@ -1343,7 +1596,7 @@ impl PlayerView {
                     .id("seek-bar")
                     .aria_label("播放进度")
                     .w_full()
-                    .h(px(12.))
+                    .h(px(10.))
                     .flex()
                     .items_center()
                     .test_support()
@@ -1362,14 +1615,14 @@ impl PlayerView {
                     .child(
                         div()
                             .font_family(MONO_FONT)
-                            .text_size(px(11.))
+                            .text_size(px(10.))
                             .text_color(overlay::fg())
                             .child(fmt_time(position)),
                     )
                     .child(
                         div()
                             .font_family(MONO_FONT)
-                            .text_size(px(11.))
+                            .text_size(px(10.))
                             .text_color(overlay::dim())
                             .child(format!("剩余 {}", fmt_time(remaining))),
                     ),
@@ -1515,7 +1768,11 @@ impl PlayerView {
                                 })
                                 .text_color(overlay::fg())
                                 .tooltip(if cinema { "退出全屏" } else { "全屏" })
-                                .accessibility_label(if cinema { "退出全屏" } else { "进入全屏" })
+                                .accessibility_label(if cinema {
+                                    "退出全屏"
+                                } else {
+                                    "进入全屏"
+                                })
                                 .on_click(cx.listener(|this, _e, window, cx| {
                                     this.toggle_cinema(window, cx);
                                 })),
@@ -1525,7 +1782,11 @@ impl PlayerView {
                         Button::new("theme-toggle")
                             .ghost()
                             .with_size(px(28.))
-                            .icon(if is_dark { IconName::Sun } else { IconName::Moon })
+                            .icon(if is_dark {
+                                IconName::Sun
+                            } else {
+                                IconName::Moon
+                            })
                             .text_color(overlay::fg())
                             .tooltip("明暗主题切换")
                             .accessibility_label(if is_dark {
@@ -1556,7 +1817,11 @@ impl PlayerView {
         forward: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let label = if forward { "快进 10 秒" } else { "快退 10 秒" };
+        let label = if forward {
+            "快进 10 秒"
+        } else {
+            "快退 10 秒"
+        };
         let svg = if forward {
             ICON_FORWARD_10
         } else {
@@ -1642,7 +1907,12 @@ impl PlayerView {
 }
 
 impl Render for PlayerView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 拖放：GPUI 把系统的文件拖放转成内部拖拽（载荷类型是 ExternalPaths），
+        // 松开时在鼠标下的元素上派发 MouseUp；把监听挂在根节点，整个窗口都是投放区。
+        let drop_view = cx.weak_entity();
+        let drag_stamp = self.drop_activity.clone();
+
         div()
             .relative()
             .size_full()
@@ -1652,10 +1922,22 @@ impl Render for PlayerView {
                 cx.theme().background
             })
             .text_color(cx.theme().foreground)
+            // 外部文件拖到窗口上：只记时间戳，提示层由 tick 控制（见 drop_activity）
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                drag_stamp.set(Some(Instant::now()));
+                style
+            })
+            .on_drop::<ExternalPaths>(move |paths, _window, cx| {
+                let dropped: Vec<PathBuf> = paths.paths().to_vec();
+                let _ = drop_view.update(cx, |view, cx| {
+                    view.drop_activity.set(None);
+                    view.import_dropped(dropped, cx);
+                });
+            })
             .child(
                 v_flex()
                     .size_full()
-                    .child(self.render_title_band(cx))
+                    .child(self.render_title_band(window, cx))
                     .child(
                         h_flex()
                             .flex_1()
@@ -1674,7 +1956,73 @@ impl Render for PlayerView {
             .when(self.playlist_open && !self.cinema, |el| {
                 el.child(self.render_playlist_panel(cx))
             })
+            .when(self.drop_hint_shown, |el| el.child(self.render_drop_hint()))
     }
+}
+
+/// 路径比较用的归一化键：`\` 和 `/` 视为同一个字符。
+///
+/// 三处来源写法不统一——`load_track_meta` 用平台原生分隔符、命令行参数被我们改成 `/`、
+/// 用户拖进来的又是原生分隔符，不归一化就会把同一个文件当成两条。
+fn path_key(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+/// 标题栏上的窗口按钮。
+///
+/// 尺寸按 Windows 10/11 的窗口按钮来：**46 宽、与标题栏等高**（不是跟着图标缩放的
+/// 小方块），悬停铺满整块底色，关闭键悬停用系统红 `#C42B1C` + 白色图标。
+/// 水平/垂直居中的 10×10 字形。`data()` 直接吃 SVG 源码：
+/// `IconName::WindowMinimize` 这类内置图标是 24 网格 + 2px 描边，缩到 10px 后
+/// 描边只剩半个像素，栅格化出来是一团糊；手写 10 网格 + 1px 描边才是 Windows 的样子。
+fn caption_button(
+    id: &'static str,
+    glyph: &'static [u8],
+    label: &'static str,
+    close: bool,
+    on_dark: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui_kit::App) + 'static,
+    cx: &Context<PlayerView>,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    let (rest_fg, hover_bg, hover_fg): (gpui_kit::Hsla, gpui_kit::Hsla, gpui_kit::Hsla) = if close {
+        (
+            if on_dark {
+                overlay::fg()
+            } else {
+                theme.secondary_foreground
+            },
+            gpui_kit::rgb(CLOSE_DANGER).into(),
+            gpui_kit::rgb(0xFFFFFF).into(),
+        )
+    } else if on_dark {
+        (
+            overlay::fg(),
+            gpui_kit::rgba(0xFFFFFF1F).into(),
+            gpui_kit::rgb(0xFFFFFF).into(),
+        )
+    } else {
+        (
+            theme.secondary_foreground,
+            theme.secondary_hover,
+            theme.foreground,
+        )
+    };
+
+    div()
+        .id(id)
+        .w(px(CAPTION_BUTTON_WIDTH))
+        .h_full()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_color(rest_fg)
+        .hover(move |style| style.bg(hover_bg).text_color(hover_fg))
+        .active(move |style| style.bg(hover_bg))
+        .aria_label(label)
+        .on_click(on_click)
+        .child(Icon::default().data(glyph).size(px(10.)))
 }
 
 /// 秒数格式化为 `m:ss`。

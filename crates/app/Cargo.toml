@@ -17,3 +17,6 @@ raw-window-handle = "0.6"
 [dev-dependencies]
 # UI 集成测试需要无头窗口驱动（`gpui_kit::test`），只在测试构建打开该 feature。
 gpui-kit = { workspace = true, features = ["test-support"] }
+# 构造 `ExternalPaths`（拖放载荷）要写它的字段，而字段类型是 smallvec；
+# 必须与 gpui-pre 用同一个 smallvec 版本，否则类型对不上。
+smallvec = "1"

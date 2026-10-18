@@ -32,6 +32,12 @@ const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
 const SW_HIDE: i32 = 0;
 const SW_SHOWNA: i32 = 8;
 
+/// 文件拖放：这块窗口盖住了整个视频区，也就是窗口 80% 的面积。
+/// GPUI 的 `IDropTarget` 注册在**主窗口**上，而 OLE 的拖放目标查找是按
+/// `WindowFromPoint` 从光标下的窗口开始的（只沿父链向上找），走到叠加窗口就断了，
+/// 拖进去只会看到「禁止」光标。所以叠加窗口自己接一份。
+const WM_DROPFILES: u32 = 0x0233;
+
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
 const SWP_SHOWWINDOW: u32 = 0x0040;
@@ -102,12 +108,56 @@ mod win {
         fn GetLastError() -> u32;
     }
 
+    #[link(name = "shell32")]
+    extern "system" {
+        fn DragAcceptFiles(hwnd: Hwnd, accept: i32);
+        fn DragQueryFileW(hdrop: Hwnd, index: u32, file: *mut u16, len: u32) -> u32;
+        fn DragFinish(hdrop: Hwnd);
+    }
+
+    /// 叠加窗口收到的拖放路径，等主线程的 100ms tick 来取走。
+    ///
+    /// `WM_DROPFILES` 只在 wndproc 里能拿到，拿完必须立刻 `DragFinish`；
+    /// 而拿到的这一刻我们不在 GPUI 的 `App` 上下文里，不能直接改视图状态，
+    /// 所以先落在队列里，由 tick 统一消费（和通知的「入队 + flush」同一套路）。
+    static DROPPED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn collect_dropped(hdrop: Hwnd) {
+        const ALL: u32 = 0xFFFF_FFFF;
+        let count = unsafe { DragQueryFileW(hdrop, ALL, std::ptr::null_mut(), 0) };
+        let mut paths = Vec::new();
+        for index in 0..count {
+            let len = unsafe { DragQueryFileW(hdrop, index, std::ptr::null_mut(), 0) };
+            if len == 0 {
+                continue;
+            }
+            let mut buf = vec![0u16; len as usize + 1];
+            let copied =
+                unsafe { DragQueryFileW(hdrop, index, buf.as_mut_ptr(), buf.len() as u32) };
+            if copied == 0 {
+                continue;
+            }
+            paths.push(String::from_utf16_lossy(&buf[..copied as usize]));
+        }
+        unsafe { DragFinish(hdrop) };
+        if paths.is_empty() {
+            return;
+        }
+        if let Ok(mut queue) = DROPPED.lock() {
+            queue.extend(paths);
+        }
+    }
+
     unsafe extern "system" fn wnd_proc(
         hwnd: Hwnd,
         msg: u32,
         wparam: usize,
         lparam: isize,
     ) -> isize {
+        if msg == WM_DROPFILES {
+            collect_dropped(wparam as Hwnd);
+            return 0;
+        }
         DefWindowProcW(hwnd, msg, wparam, lparam)
     }
 
@@ -168,8 +218,18 @@ mod win {
         if hwnd == 0 {
             None
         } else {
+            // 让 Explorer 把拖到这块窗口上的文件转成 WM_DROPFILES
+            unsafe { DragAcceptFiles(hwnd, 1) };
             Some(hwnd)
         }
+    }
+
+    /// 取走并清空拖放队列（主线程 tick 调用）。
+    pub fn take_dropped() -> Vec<String> {
+        DROPPED
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue))
+            .unwrap_or_default()
     }
 
     pub fn destroy(hwnd: Hwnd) {
@@ -201,15 +261,7 @@ mod win {
             flags |= SWP_SHOWWINDOW;
         }
         unsafe {
-            SetWindowPos(
-                hwnd,
-                0,
-                x,
-                y,
-                width.max(1),
-                height.max(1),
-                flags,
-            );
+            SetWindowPos(hwnd, 0, x, y, width.max(1), height.max(1), flags);
         }
     }
 
@@ -241,6 +293,9 @@ mod win {
     pub fn set_rect(_hwnd: Hwnd, _x: i32, _y: i32, _w: i32, _h: i32, _visible: bool) {}
     pub fn client_origin(_hwnd: Hwnd) -> (i32, i32) {
         (0, 0)
+    }
+    pub fn take_dropped() -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -283,7 +338,14 @@ impl VideoOverlay {
     pub fn show(&mut self) {
         if !self.visible {
             self.visible = true;
-            win::set_rect(self.hwnd, self.rect.0, self.rect.1, self.rect.2, self.rect.3, true);
+            win::set_rect(
+                self.hwnd,
+                self.rect.0,
+                self.rect.1,
+                self.rect.2,
+                self.rect.3,
+                true,
+            );
             win::show(self.hwnd);
         }
     }
@@ -305,4 +367,9 @@ impl Drop for VideoOverlay {
 /// 主窗口客户区原点（物理屏幕坐标）。
 pub fn client_origin(hwnd: Hwnd) -> (i32, i32) {
     win::client_origin(hwnd)
+}
+
+/// 取走叠加窗口收到的拖放路径。
+pub fn take_dropped() -> Vec<String> {
+    win::take_dropped()
 }

@@ -14,10 +14,11 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
-    AnyWindowHandle, AppContext as _, Bounds, Entity, TestAppContext, WindowBounds, WindowOptions,
-    point, px, size,
+    point, px, size, AnyWindowHandle, AppContext as _, Bounds, Entity, ExternalPaths,
+    FileDropEvent, InputEvent as _, TestAppContext, WindowBounds, WindowOptions,
 };
 use player_core::TrackMeta;
+use smallvec::SmallVec;
 
 use crate::persistence::{self, Settings};
 use crate::player_view::PlayerView;
@@ -437,4 +438,52 @@ fn transport_controls_are_horizontally_centered(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+}
+
+// ----------------------------------------------------------------------
+// 文件拖放：外部文件拖进窗口应当「入列表 + 立刻播第一首」
+// ----------------------------------------------------------------------
+
+/// 拖入文件后应当把它加进播放列表并立刻起播。
+///
+/// 这条链路是 GPUI 内部完成的：系统拖放 → `FileDropEvent::Entered`（载荷 `ExternalPaths`）
+/// → 内部拖拽 → `Submit` 变成 MouseUp → 鼠标下元素的 `on_drop`。
+/// 以前根节点上什么都没挂，所以「拖进去毫无反应」。
+#[gpui_kit::test]
+fn dropping_files_adds_them_and_starts_playback(cx: &mut TestAppContext) {
+    let dir = fresh_dir("drop");
+    let wav = write_silent_wav(&dir, 1.0);
+    let (window, view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        // 落在舞台中间：整窗都该是投放区，而不是只有控制栏那一条
+        let position = point(px(520.), px(340.));
+        let paths = ExternalPaths(SmallVec::from_vec(vec![wav.clone()]));
+        window.dispatch_event(
+            FileDropEvent::Entered { position, paths }.to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+        window.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    // 读元数据走的是后台任务，等它回来
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        let snapshot = view.read(cx).snapshot();
+        assert_eq!(
+            snapshot.current,
+            Some(0),
+            "拖入的文件应成为当前曲目（空列表时是第 0 首）"
+        );
+        assert!(
+            snapshot.last_error.is_none(),
+            "拖入已有文件不应报错：{:?}",
+            snapshot.last_error
+        );
+    });
 }
