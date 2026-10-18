@@ -29,6 +29,11 @@
 9. **方向键接通播放器** —— 左右 ±5 秒（`seek`）、上下 ±5% 音量
    （`set_property volume`）。判据取 mpv 的 IPC trace：只看界面动没动不够，
    那可能只是 tick 的乐观更新；命令真的发出去才算接通。
+10. **ⓘ 信息卡压在画面上** —— 点开之后左下角那块必须从"画面"变成"深玻璃"，
+    而且那两个角点还在主窗口区域里（区域没把它加回去的话，卡片会被叠加窗盖住，
+    用户看到的是"点了没反应"）；再点一次收起，那块要回到画面。
+11. **字幕 / 音轨按钮接线通** —— 判据取 IPC trace 里的 `cycle sid/aid`：
+    素材只有一条轨时 mpv 什么也不做，"点了没反应"和"切到了"肉眼分不出。
 
 每一步都打印取样像素与窗口几何，判据在最后统一汇总。
 """
@@ -63,12 +68,27 @@ if not exe.is_absolute():
 # 验收产物落到 target/（不进仓库）；docs 里只保留两张正式截图
 out_dir = root / "target" / "verify-shots"
 out_dir.mkdir(parents=True, exist_ok=True)
-# 时长要够：整套流程要跑二十几秒，5 秒的样片会在中途播完 → 叠加窗被隐藏，
-# 后面的"按住画面拖窗"就变成"点在一块 GPUI 画布上"，假失败。
-# 仓库里的样片都只有 5 秒，所以这里优先用一段现生成的长片（不进仓库）：
-#   mpv av://lavfi:testsrc2=duration=40:size=1280x720:rate=24 \
+# 时长要够：整套流程要跑 50 秒上下（全屏/回窗口/拖窗每一步都要等窗口稳定），
+# 素材播完之后叠加窗会被隐藏，后面的取样全变成主窗底色——"按住画面拖窗"就成了
+# "点在一块 GPUI 画布上"，歌单/方向键也一起假失败。仓库里的样片只有 5 秒，
+# 所以这里用一段现生成的 2 分钟长片（落在 target/，不进仓库）：
+#   mpv av://lavfi:testsrc2=duration=120:size=1280x720:rate=24 \
 #       --o=target/verify-long.mp4 --ovc=libx264 --oac=libmp3lame --of=mp4
 media = root / "target" / "verify-long.mp4"
+if not media.exists():
+    mpv = root / "dist" / "simple-media-player-1.0.0" / "mpv.exe"
+    subprocess.run(
+        [
+            str(mpv) if mpv.exists() else "mpv",
+            "av://lavfi:testsrc2=duration=120:size=1280x720:rate=24",
+            f"--o={media}",
+            "--ovc=libx264",
+            "--oac=libmp3lame",
+            "--of=mp4",
+            "--really-quiet",
+        ],
+        check=False,
+    )
 if not media.exists():
     media = root / "test-media" / "gen-1080p.mp4"
 
@@ -83,6 +103,37 @@ VK_RIGHT = 0x27
 VK_DOWN = 0x28
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
+# 控制栏几何（逻辑像素，必须和 crates/app/src/player_view.rs 的常数一致）：
+# 胶囊固定 760×92、距窗口下沿 24、内边距 20/12；ⓘ 在胶囊内左侧，信息卡
+# 240×180 浮在胶囊上方 16。写死这些数字是因为验收脚本按**像素**判定，
+# 拿不到应用的布局树；对不上就说明布局被改过，应该同步这里。
+CAPSULE_WIDTH = 760.0
+CAPSULE_HEIGHT = 92.0
+CAPSULE_INSET = 24.0
+CAPSULE_PAD_X = 20.0
+INFO_WIDTH = 240.0
+INFO_HEIGHT = 180.0
+INFO_GAP = 16.0
+
+
+def right_group_button(index_from_right):
+    """控制栏右组第 N 个按钮的中心（0 = 主题切换，从右往左数）。
+
+    胶囊固定 760 宽、水平居中，右组从「胶囊右沿 − padding 20」开始往左排：
+    每个按钮 20 宽、间距 20，所以第 N 个的中心是 `右沿 − 10 − N×40`。
+    视频模式下的顺序（右→左）：主题 0、全屏 1、列表 2、音轨 3、字幕 4。
+
+    以前按「胶囊铺满整宽」写成 `lw - 123`：胶囊收窄之后那个点落到胶囊外的
+    画面上，点击被叠加窗吃掉——表现为"点列表没反应"，实际是根本没点中。
+    """
+    group_right = (lw + CAPSULE_WIDTH) / 2 - CAPSULE_PAD_X
+    return group_right - 10 - index_from_right * 40, lh - (CAPSULE_INSET + 12 + 22)
+
+
+def playlist_button():
+    """「列表」按钮的中心（逻辑坐标）。"""
+    return right_group_button(2)
+
 # 双击：叠加窗认这一组消息（真实双击就是它们，见 `double_click`）
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
@@ -234,7 +285,7 @@ def wait_settled(timeout=3.0):
     wait_aligned(timeout)
     wait_region(2, 17, True, timeout)
     wait_region(lw - 2, 17, True, timeout)
-    wait_region(lw - 123, lh - 55, True, timeout)
+    wait_region(*playlist_button(), True, timeout)
     time.sleep(0.15)
 
 
@@ -535,6 +586,7 @@ spread = abs(caps_a[0] - caps_b[0]) + abs(caps_a[1] - caps_b[1]) + abs(caps_a[2]
 print(f"胶囊内左侧 (40,{lh - 54:.0f}) = {caps_a}")
 print(f"胶囊内右侧 ({lw * 0.55:.0f},{lh - 54:.0f}) = {caps_b}   ← 两处色差 {spread}（>25 才算透出画面）")
 
+
 def toggle_playlist(want_open, tries=4):
     """把歌单切到目标状态，最多试 `tries` 次。
 
@@ -542,8 +594,9 @@ def toggle_playlist(want_open, tries=4):
     激活/命中是两套时序），这不是应用的问题；这里按**结果**重试，
     最后一次仍不对就如实报失败。
     """
+    px, py = playlist_button()
     for _ in range(tries):
-        click(lw - 123, lh - 55)
+        click(px, py)
         time.sleep(0.6)
         if region_contains(lw - 172, 120) == want_open:
             return True
@@ -559,9 +612,6 @@ def refresh_geometry():
 
 
 # ---- 3. 展开歌单：面板浮在右侧，画面不被挤窄 ---------------------------
-# 坐标不是算出来的，是 UI 测试实测的：`toggle-playlist` 的中心距窗口右沿 123、
-# 距下沿 55（三键各 28 宽、间距 6，胶囊内缩 24 + padding 16）。算出来的值差 1~2px
-# 看着没问题，但按钮之间只有 6px 间隙，偏一点就落进空档，点击"点了没反应"。
 opened = toggle_playlist(True)
 img2 = grab(out_dir / "floating-02-playlist.png")
 panel_px = sample(img2, lw - 12 - 160, 120)
@@ -766,6 +816,57 @@ print(
     f"volume 命令 {vols_before}→{vols_after} 条"
 )
 
+# ---- 6.5 字幕 / 音轨按钮接通 mpv ---------------------------------------
+#
+# mpv 的 `cycle sid/aid` 没有返回值，素材里只有一条轨时它**什么也不做**——
+# 界面上"点了没反应"和"切到了"长得一样。所以判据同样落在 IPC trace 上：
+# 两条 cycle 命令真的发出去了，说明按钮到引擎这段是通的（应用会给 800ms 的
+# 超时提示"没有其他字幕轨可切"，那是取值的表现，不是接线问题）。
+cycles_before = trace_hits('"cycle"')
+click(*right_group_button(3))  # 音轨
+click(*right_group_button(4))  # 字幕
+time.sleep(0.6)
+cycles_after = trace_hits('"cycle"')
+cycle_ok = cycles_after >= cycles_before + 2
+print(f"字幕/音轨 → cycle 命令 {cycles_before}→{cycles_after} 条")
+
+# ---- 7. ⓘ 视频信息卡：贴左下、压在画面上、再点收起 ----------------------
+#
+# 卡片是「画在画面上」的东西，所以踩的坑和胶囊一样：不进窗口区域就被叠加窗整块
+# 盖住。判据用像素而非 `try_find`：区域没减对时节点是在的，只是用户看不见。
+cw4, ch4 = client_rect()
+cw4, ch4 = cw4 / scale, ch4 / scale
+info_pt = (
+    (cw4 - CAPSULE_WIDTH) / 2 + CAPSULE_PAD_X + 10,
+    ch4 - (CAPSULE_INSET + 12 + 22),
+)
+# 胶囊底边 24 + 胶囊高 92 + 间距 16 → 卡片底边，再往上 180 是顶边
+CARD_TOP = ch4 - (CAPSULE_INSET + CAPSULE_HEIGHT + INFO_GAP + INFO_HEIGHT)
+CARD_LEFT = CAPSULE_INSET
+card_probe = (CARD_LEFT + INFO_WIDTH / 2, CARD_TOP + INFO_HEIGHT / 2)  # 卡片正中
+wait_region(*info_pt, True)
+
+info_before = sample(grab(out_dir / "verify-info-0-before.png"), *card_probe)
+click(*info_pt)
+time.sleep(0.45)
+info_img = grab(out_dir / "verify-info-1-open.png")
+info_open_px = sample(info_img, *card_probe)
+# 两个角点都要归主窗口：左上角的文字区 + 右下角的空白玻璃
+info_in_region = region_contains(CARD_LEFT + 10, CARD_TOP + 10) and region_contains(
+    CARD_LEFT + INFO_WIDTH - 10, CARD_TOP + INFO_HEIGHT - 10
+)
+click(*info_pt)
+time.sleep(0.45)
+info_closed_px = sample(grab(out_dir / "verify-info-2-closed.png"), *card_probe)
+# 收起之后那块要回到"画面"（不属于主窗口区域）。这比看像素稳：素材换成暗画面
+# 时，"收起后应该变亮"会误判，而区域里有没有这块是结构性事实。
+info_closed_region = region_contains(CARD_LEFT + 10, CARD_TOP + 10)
+info_hole_gone = not info_closed_region
+print(
+    f"信息卡 {card_probe} 采样：之前 {info_before} → 展开 {info_open_px} → "
+    f"收起 {info_closed_px}；区域 展开={info_in_region} 收起={info_closed_region}"
+)
+
 proc.terminate()
 try:
     proc.wait(timeout=5)
@@ -889,4 +990,22 @@ if not volume_keys_ok:
     ok = False
 else:
     print("OK: 上下键真的把 volume 发给了 mpv")
+if not cycle_ok:
+    print(f"FAIL: 字幕/音轨按钮没把 cycle 发给 mpv（{cycles_before}→{cycles_after}）")
+    ok = False
+else:
+    print("OK: 字幕/音轨按钮各把一条 cycle 发给了 mpv")
+# 深玻璃 ≈ (27,29,20)，彩条那一块和 ≈ 300+：用亮度差而不是颜色值，换素材也不飘
+info_dark = sum(info_open_px[:3]) + 80 < sum(info_before[:3])
+if not info_dark:
+    print(f"FAIL: 点 ⓘ 之后那块还是画面（{info_before} → {info_open_px}，卡片没画出来）")
+    ok = False
+elif not info_in_region:
+    print("FAIL: 信息卡两个角点不在主窗口区域里（会被叠加窗盖住）")
+    ok = False
+elif not info_hole_gone:
+    print(f"FAIL: 再点一次 ⓘ 没收回信息卡（那块仍在窗口区域里，{info_closed_px}）")
+    ok = False
+else:
+    print(f"OK: ⓘ 信息卡压住画面（{info_before} → {info_open_px}），再点收回 {info_closed_px}")
 print("ALL OK" if ok else "SOME CHECKS FAILED")

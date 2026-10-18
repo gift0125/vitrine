@@ -55,6 +55,13 @@
 - **字体必须系统自带**：设计稿 Inter / Noto Sans SC 在 Win 不预装（写死退宋体）。见 `theme::ui_font_family()`（Win `Microsoft YaHei UI` / mac `PingFang SC` / 其他 `Noto Sans SC`）+ `mono_font_family()`；`ThemeConfig.font_family` 铺整棵树（`root.rs`）。
 - 换肤：`ThemeConfig`（`#[serde(default)]`）+ `Theme::update` + `apply_config`。**`ThemeConfigColors` 的 `blue/red/green/cyan/magenta/yellow`(±`_light`) 是私有字段** → crate 外只能 `default()` 后逐字段赋值。别在同一 closure 里既换 mode 又换 config。
 - 布局铁律：一组控件居中，左右两栏必须**等宽**（都 `flex_1`），否则 `justify_between` 把中间顶偏。
+- **控制栏 v3 几何（改任何一条都要同步 `scripts/verify_floating_chrome.py` 的常数）**：胶囊固定 **760×92** 水平居中（`max_w_full` 防窄窗溢出）、距下沿 24、圆角 14、padding 20/12；进度轨道 596，时间夹在两端（各 `flex_1`）；左组 ⓘ + 音量条 96（gap 16），右组 5–7 个 20px 键（gap 20）；信息卡 **240×180** 浮在胶囊上方 16、贴 x24；`BOTTOM_BAND` 118。按钮从右数的中心 = `胶囊右沿 − 20 − 10 − i×40`（i=0 主题、1 全屏、2 列表、3 音轨、4 字幕）。
+- **`overlay::glass()` 实际是 72%（`0x0B0C10B8`）**，设计稿写的是 60–65%：验收里"玻璃透出画面"的色差判据是在 72% 下过的，改淡会让 11px 文字在亮画面上掉到 4:1 左右。动它要重跑第 3 项。
+- 画在画面上的东西（胶囊 / 歌单 / 信息卡）**都必须进 `chrome_rects`**：漏了 = 节点在、看不见、点不到，用户看到的是"点了没反应"（信息卡、胶囊、歌单各踩过一次）。
+- mpv 的编码名是**并列别名**（`h264 (High) / AVC / MPEG-4 AVC / MPEG-4`），塞进窄卡片会溢出 → 取第一段（`short_codec`）；`video-bitrate` 对部分容器报 `unavailable`（合成 mp4 就是），这时显示 `—` 是对的，别去"补"一个假数。
+- `cycle sid/aid` **没有返回值**、单轨时不做事 → "点了没反应"和"切到了"分不出。做法：记切换前轨号 + 时间戳，tick 比对 observed 值，800ms 超时就说"没有其他轨可切"。
+- 验收脚本**永远别按"胶囊铺满整宽"算坐标**（`lw-123` 这类）：胶囊 760 居中后那些点落在画面上，点击被叠加窗吃掉，表现成"应用 bug"。同理 `wait_settled()` 里的探针点也要跟着改，否则每次白等 3s。
+- 验收素材要 **120s**（`target/verify-long.mp4`，脚本缺了就自动生成）：整套流程 50s 上下，40s 的片子播完 → 叠加窗隐藏 → 之后所有取样都变成主窗底色 `#EFF1F5`，歌单/方向键/信息卡一起假失败。
 - **`h_flex()` 默认 `items_center`**：子元素全绝对定位（内容高 0）会在交叉轴塌成 0 → `canvas` bounds 变 `Wx0`（视觉看不出）。视频区要 `.self_stretch()`，回归用例 `stage_fills_space_between_title_band_and_bottom_band`（黑屏有声音的根因）。
 - **`height:100%` 在不定高父级退化成 auto** → `.h_full()` 解析不出来（按钮只剩图标高）。写死 `.h(px(..))`，父级再补 `.h_full()`。
 - 自绘标题带：`appears_transparent = true` 后**只有左侧拖动区**能设 `WindowControlArea::Drag`（整条都设会让右侧按钮变非客户区）。窗口按钮：`IconName::WindowMinimize/Maximize/Close` 是 24 网格 + 2px 描边，缩到 10px 会糊 → 手写 10×10、1px 描边 SVG；按钮 46 宽 × 标题栏高，关闭键悬停 `#C42B1C`。
@@ -97,6 +104,7 @@
 - **Win 设置窗 `21:807`**（960×720 = 原 680 + 40 标题带）：root 改 vertical → [标题带 40, 主体 horizontal]；标题带 layout:none，"设置" x16 y11、控件组 x868 y4。mac 版仍是无标题带的 `2:139`（960×680）。
 - **窗口控件图标是浅色 `#E6E9EF`**（为压深色画面设计），复制到浅色首屏/设置窗上会看不见 → 必须逐 vector 改 `#4C4F69`。**`I()` 新建 frame 别传 `fill_container` 尺寸**（实测 width 变 480、height 变成 fill_container，标题带会吃满整窗），建完用 `U()` 给数值。
 - 音量条 **96 宽**（`2:84` / Win `2:350`），已填充 70%。**Ardot 的 `strokeDashes` 不生效**（`U()` 回 `updated:{}` 但实际仍是实线），要虚线只能自己拼帧。
+- **视频信息 OSD**（点 ⓘ 出现）：240 宽深色玻璃卡（`#0B0C10` 65% + blur32 + 白 10% 描边），贴**左下角** x24、底边距控制栏 16（y=488，高 180）；结构 = 标题 11/Medium + 6 行（分辨率/编码/码率/帧率/色彩/音频），行高 22、label `#A6ADC8` 左、值 `#D5D9E2` 右（`SPACE_BETWEEN`，值用 JetBrains Mono）。演示帧 mac `21:928` / Win `21:1108`——默认态不含 OSD，单独一帧演示。
 - 图标规范：播放三角占圆直径 48%（B 档），32px 以下重绘而非缩放（50–54%、去描边）；图标为正圆。
 - Ardot 可用字体仅 Inter / Noto 系列 / JetBrains Mono。
 - 视频截图素材的「AI生成」水印：取原图裁底（1536×1024 → 1536×960，与 1280×800 同比）再覆盖。

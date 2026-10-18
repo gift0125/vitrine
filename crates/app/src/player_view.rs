@@ -49,12 +49,40 @@ const TICK_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) const TITLE_BAND: f32 = 34.0;
 /// 底部悬浮胶囊的内缩。
 const CAPSULE_INSET: f32 = 24.0;
+/// 胶囊**固定宽度**（设计稿 760）。
+///
+/// 以前是 `left/right: 24` 跟着窗口拉伸，1280 宽的窗口上会撑成 1232——设计稿里
+/// 它是画面下方一块窄条，两侧都留出画面。窄窗口用 `max_w_full` 退让，别让它在
+/// 600 宽的小窗上溢出被裁掉。
+const CAPSULE_WIDTH: f32 = 760.0;
+/// 胶囊左右内边距（设计稿 20）。
+const CAPSULE_PAD_X: f32 = 20.0;
+/// 胶囊上下内边距（设计稿 12）。
+///
+/// 12×2 + 进度行 16 + 间距 8 + 走带 44 = 92，正好是设计稿的胶囊高度。
+const CAPSULE_PAD_Y: f32 = 12.0;
+/// 胶囊圆角（设计稿 14）。
+const CAPSULE_RADIUS: f32 = 14.0;
+/// 进度轨道固定宽度（设计稿 596）。
+///
+/// **不能用 `fill_container`**：那样两段时间码会被挤到胶囊最边上，和设计稿的
+/// 「时间夹滑块」不是一个东西；固定宽度以后，时间码自然各占两侧剩余空间。
+const SEEK_TRACK_WIDTH: f32 = 596.0;
+/// 时间码字号（设计稿 11，等宽）。
+const TIME_SIZE: f32 = 11.0;
+/// 音量条宽度（设计稿 96）。
+const VOLUME_WIDTH: f32 = 96.0;
+/// 视频信息卡宽度/高度（设计稿 240×180）。
+const INFO_WIDTH: f32 = 240.0;
+const INFO_HEIGHT: f32 = 180.0;
+/// 信息卡与胶囊之间的间距（设计稿 16）。
+const INFO_GAP: f32 = 16.0;
 /// 底部为悬浮胶囊预留的高度。
 ///
-/// 胶囊实高约 90（上下 padding 8 + 进度 10 + 时间行 14 + 走带 44 + 间距 8），
-/// 加上 24 内缩再留 2px 余量：留多了窗口下方会空出一条死气沉沉的黑带，
-/// 留少了 mpv 叠加窗会啃掉胶囊上沿。
-const BOTTOM_BAND: f32 = 116.0;
+/// 胶囊实高 92（见 `CAPSULE_PAD_Y`：12 + 16 + 8 + 44 + 12），加上 24 内缩再留
+/// 2px 余量。留多了窗口下方会空出一条死气沉沉的黑带，留少了 mpv 叠加窗会啃掉
+/// 胶囊上沿。
+const BOTTOM_BAND: f32 = 118.0;
 /// 多久没有新的拖拽经过就算「拖走了」：`drag_over` 在拖动过程中会持续触发，
 /// 停更这么久只可能是鼠标带着文件离开了窗口。
 const DROP_HINT_IDLE: Duration = Duration::from_millis(250);
@@ -152,6 +180,27 @@ impl ArrowKey {
     }
 }
 
+/// 切轨回执的等待上限：超过这么久观测值还没变，就认定「没有别的轨可切」。
+///
+/// mpv 处理 `cycle` 是毫秒级的，800ms 已经非常宽松；再长用户会觉得点了没反应。
+const TRACK_ACK_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// 等回执的两种「切轨」动作。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackKind {
+    Subtitle,
+    Audio,
+}
+
+impl TrackKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Subtitle => "字幕",
+            Self::Audio => "音轨",
+        }
+    }
+}
+
 /// 相对跳转的落点：夹到 `[0, 时长]` 之间。
 ///
 /// 越界后播放器自己会回弹，用户在进度条上看到的就是「按了右键、进度却往回退」。
@@ -202,6 +251,16 @@ pub struct PlayerView {
     /// 出帧，见 `video_overlay` 模块头），而胶囊是浮在画面上的，得再加回区域里。
     /// 胶囊高度是内容撑开的（随字号/行距变），不能写死，只能量。
     capsule_rect: VideoRectCell,
+    /// 等 mpv 回执的切轨动作：`(类型, 切换前的轨号, 发起时刻)`。
+    ///
+    /// 见 `cycle_subtitles`：`cycle` 是单向命令、没有返回值，只能靠观测值变化确认。
+    pending_track: Option<(TrackKind, u32, Instant)>,
+    /// 是否展开「视频信息」卡（胶囊左端的 `ⓘ`）。
+    ///
+    /// 它压在画面上，和胶囊一样要加回窗口区域（见 `chrome_rects`）；尺寸是写死的
+    /// 240×180，但仍然量一次——字号/行距跟着主题变，实际高度未必是 180。
+    info_open: bool,
+    info_rect: VideoRectCell,
     /// 当前已应用的窗口区域（用内容做键，避免每帧都打 SetWindowRgn——
     /// 那会让整窗重绘，画面跟着闪）。第二项是 scale 的位模式（跨屏换 DPI 要重算）。
     chrome_region: Option<(Vec<ChromeRect>, u32)>,
@@ -372,6 +431,7 @@ impl PlayerView {
 
         let video_rect: VideoRectCell = Rc::new(Cell::new(None));
         let capsule_rect: VideoRectCell = Rc::new(Cell::new(None));
+        let info_rect: VideoRectCell = Rc::new(Cell::new(None));
         let maximized = window.is_maximized();
 
         let mut this = Self {
@@ -394,6 +454,9 @@ impl PlayerView {
             fit_seen: None,
             video_rect,
             capsule_rect,
+            pending_track: None,
+            info_open: false,
+            info_rect,
             chrome_region: None,
             corners_rounded: false,
             client_kick: None,
@@ -767,6 +830,25 @@ impl PlayerView {
             return;
         }
 
+        // 切轨回执：`cycle` 是单向命令、没有返回值，"观测值没变"就等于没有别的轨。
+        if let Some((kind, before, at)) = self.pending_track {
+            let now = match kind {
+                TrackKind::Subtitle => status.sub_track,
+                TrackKind::Audio => status.audio_track,
+            };
+            if now != before {
+                self.pending_track = None;
+                self.report_info(if now == 0 {
+                    format!("{}已关闭", kind.label())
+                } else {
+                    format!("{}轨 {now}", kind.label())
+                });
+            } else if at.elapsed() >= TRACK_ACK_TIMEOUT {
+                self.pending_track = None;
+                self.report_info(format!("没有其他{}轨可切", kind.label()));
+            }
+        }
+
         // 时长补齐：元数据缺失时以 mpv 报告的时长重建量程
         if status.duration > 0.5 && (status.duration as f32 - self.seek_max).abs() > 1.0 {
             self.rebuild_seek(status.duration as f32, cx);
@@ -927,11 +1009,10 @@ impl PlayerView {
         let width = bounds.size.width.as_f32();
         let height = bounds.size.height.as_f32();
 
-        // 抗锯齿留白：区域切得太贴边会把胶囊的白描边切掉半个像素
+        // 抗锯齿留白：区域切得太贴边会把圆角的白描边切掉半个像素
         const PAD: f32 = 1.5;
-        const CAPSULE_RADIUS: f32 = 12.0;
 
-        let mut chrome = Vec::with_capacity(3);
+        let mut chrome = Vec::with_capacity(4);
         // 标题带整条留下：右端还有窗口按钮，中间截断会很奇怪
         chrome.push(ChromeRect::rect(0., 0., width, TITLE_BAND));
 
@@ -943,6 +1024,20 @@ impl PlayerView {
                 h + PAD * 2.,
                 CAPSULE_RADIUS + PAD,
             ));
+        }
+
+        // 视频信息卡：和胶囊同样的道理——它画在画面上，不进区域就被叠加窗盖住，
+        // 用户看到的是"点了 ⓘ 什么都没发生"。
+        if self.info_open && self.video_active {
+            if let Some((x, y, w, h)) = self.info_rect.get() {
+                chrome.push(ChromeRect::rounded(
+                    x - PAD,
+                    y - PAD,
+                    w + PAD * 2.,
+                    h + PAD * 2.,
+                    12. + PAD,
+                ));
+            }
         }
 
         // 歌单：展开时浮在画面右侧
@@ -1319,6 +1414,40 @@ impl PlayerView {
                 self.playlist_open, self.video_active
             ));
         }
+        cx.notify();
+    }
+
+    /// 展开/收起「视频信息」卡（胶囊左端的 `ⓘ`）。
+    ///
+    /// 只跟视频走：音频没有 mpv，卡上一半字段都是空的，不如不给这个入口
+    /// （按钮在音频模式下也是 disabled）。
+    fn toggle_info(&mut self, cx: &mut Context<Self>) {
+        if !self.video_active {
+            return;
+        }
+        self.info_open = !self.info_open;
+        cx.notify();
+    }
+
+    /// 循环切换字幕轨。
+    ///
+    /// mpv 的 `cycle` 没有返回值，而且**没有别的轨可切时它什么也不做**——用户看到的
+    /// 就是"点了没反应"。这里记下切换前的轨号，下一轮 tick 比对观测值：变了报新轨，
+    /// 800ms 还没变就明说"没有其他字幕轨"。
+    fn cycle_subtitles(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = &self.video.engine else { return };
+        let before = engine.status().sub_track;
+        engine.cycle_subtitles();
+        self.pending_track = Some((TrackKind::Subtitle, before, Instant::now()));
+        cx.notify();
+    }
+
+    /// 循环切换音轨（同上）。
+    fn cycle_audio_track(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = &self.video.engine else { return };
+        let before = engine.status().audio_track;
+        engine.cycle_audio_track();
+        self.pending_track = Some((TrackKind::Audio, before, Instant::now()));
         cx.notify();
     }
 
@@ -2172,21 +2301,193 @@ impl PlayerView {
             )
     }
 
-    /// 悬浮胶囊：进度轨道 + 时间行 + 控制行，深色玻璃。
+    /// 底部 chrome：可选的「视频信息」卡 + 悬浮胶囊。
     ///
-    /// 尺寸是按「占窗口多少」调的，不是按像素堆的：三条横排控件加上上下 padding
-    /// 曾经撑到 107 高（窗口 680 时占 15.7%），远看像一块压在下沿的黑板。
-    /// 现在压到 ~90（占 13%），间距也从 12/6 收到 8/4，视觉重量才和画面匹配。
+    /// 整列按 `bottom(CAPSULE_INSET)` 锚定，信息卡在胶囊上方 16——设计稿里那张卡
+    /// 贴的是**画面左下角**（x24），高度 180、底边正好压在胶囊上沿之上 16。用
+    /// 「一列自底向上排」而不是给卡片算 `bottom = 窗口高 - 胶囊高 - 24 - 16`：
+    /// 胶囊高度是内容撑开的，写死算式会在换字号/换皮肤时错位。
+    fn render_bottom_chrome(&self, cx: &mut Context<Self>) -> Div {
+        div()
+            .absolute()
+            .left(px(0.))
+            .right(px(0.))
+            .bottom(px(CAPSULE_INSET))
+            .flex()
+            .flex_col()
+            .items_center()
+            .when(self.info_open && self.video_active, |el| {
+                el.child(
+                    h_flex()
+                        .w_full()
+                        .px(px(CAPSULE_INSET))
+                        .mb(px(INFO_GAP))
+                        .items_end()
+                        .child(self.render_info_card(cx)),
+                )
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .px(px(CAPSULE_INSET))
+                    .justify_center()
+                    .child(self.render_capsule(cx)),
+            )
+    }
+
+    /// 「视频信息」卡：240×180 深色玻璃，贴画面左下（设计稿 `ⓘ` 的弹出层）。
+    ///
+    /// 数据全部来自 mpv 的 `observe_property`（见 `VideoStatus` 的那些字段），
+    /// 拿不到就显示 `—`：宁可空着，也不要编一个像样但不对的数。
+    ///
+    /// 它压在画面上 → 必须进 `chrome_rects` 的挖洞列表，否则会被叠加窗整块盖住
+    /// （画是画了，用户看不见、也点不到）。
+    fn render_info_card(&self, _cx: &Context<Self>) -> impl gpui_kit::IntoElement {
+        let slot = self.info_rect.clone();
+        let status = self
+            .video
+            .engine
+            .as_ref()
+            .map(|e| e.status())
+            .unwrap_or_default();
+
+        // 编码尺寸优先；个别容器（纯音频、未解码）只有显示尺寸，退回去用后者
+        let (sw, sh) = if status.source_width > 0 && status.source_height > 0 {
+            (status.source_width, status.source_height)
+        } else {
+            (status.width, status.height)
+        };
+        let resolution = if sw > 0 && sh > 0 {
+            format!("{sw}×{sh}")
+        } else {
+            DASH.to_string()
+        };
+
+        let bitrate = status.video_bitrate + status.audio_bitrate;
+        let has_audio = !status.audio_codec.is_empty()
+            || status.audio_channels > 0
+            || status.audio_rate > 0;
+        let audio = if !has_audio {
+            // 一个音轨都没有时说「无音轨」，而不是留个 `—`：`—` 会被读成
+            // "还没读到"，而这件事其实是确定的
+            "无音轨".to_string()
+        } else {
+            let mut parts: Vec<String> = Vec::new();
+            if !status.audio_codec.is_empty() {
+                parts.push(short_codec(&status.audio_codec));
+            }
+            if status.audio_channels > 0 {
+                parts.push(format!("{}ch", status.audio_channels));
+            }
+            if status.audio_rate > 0 {
+                parts.push(format!("{} kHz", status.audio_rate / 1000));
+            }
+            parts.join(" · ")
+        };
+
+        let rows = [
+            ("分辨率", resolution),
+            ("编码", non_empty(&short_codec(&status.video_codec))),
+            ("码率", fmt_bitrate(bitrate)),
+            ("帧率", fmt_fps(status.fps)),
+            (
+                "色彩",
+                match (status.primaries.is_empty(), status.gamma.is_empty()) {
+                    (false, false) => format!("{} / {}", status.primaries, status.gamma),
+                    (false, true) => status.primaries.clone(),
+                    (true, false) => status.gamma.clone(),
+                    (true, true) => DASH.to_string(),
+                },
+            ),
+            ("音频", audio),
+        ];
+
+        div()
+            .id("video-info-card")
+            .test_support()
+            .w(px(INFO_WIDTH))
+            .h(px(INFO_HEIGHT))
+            .rounded(px(12.))
+            .bg(overlay::glass())
+            .border_1()
+            .border_color(overlay::border())
+            .shadow_lg()
+            .p(px(12.))
+            .child(
+                canvas(
+                    move |bounds, _window, _cx| {
+                        slot.set(Some((
+                            bounds.origin.x.as_f32(),
+                            bounds.origin.y.as_f32(),
+                            bounds.size.width.as_f32(),
+                            bounds.size.height.as_f32(),
+                        )));
+                    },
+                    |_bounds, _out, _window, _cx| {},
+                )
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .size_full(),
+            )
+            .child(
+                v_flex()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .text_color(overlay::fg())
+                            .child("视频信息"),
+                    )
+                    .child(
+                        v_flex()
+                            .gap(px(0.))
+                            .children(rows.into_iter().map(|(label, value)| {
+                                h_flex()
+                                    .h(px(22.))
+                                    .w_full()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(8.))
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_size(px(11.))
+                                            .text_color(overlay::label())
+                                            .child(label),
+                                    )
+                                    .child(
+                                        // 值必须能收窄 + 省略号：mpv 的编码名是
+                                        // `h264 / AVC / MPEG-4 AVC / MPEG-4` 这种并列
+                                        // 别名串，不截断会直接冲出卡片右边
+                                        div()
+                                            .min_w_0()
+                                            .flex_shrink(1.)
+                                            .truncate()
+                                            .font_family(mono_font())
+                                            .text_size(px(11.))
+                                            .text_color(overlay::fg())
+                                            .child(value),
+                                    )
+                            })),
+                    ),
+            )
+    }
+
+    /// 悬浮胶囊：时间夹进度条 + 控制行，深色玻璃，**固定 760 宽**。
+    ///
+    /// 高度是算出来的：12 + 16（进度行）+ 8 + 44（走带）+ 12 = 92，正好是设计稿的
+    /// 92。所有尺寸都是常数，不随窗口拉伸——设计稿里它是画面下方的一条窄带，
+    /// 两侧留出画面，不是铺满整宽的黑条。
     fn render_capsule(&self, cx: &mut Context<Self>) -> Div {
         // 外框负责定位/底色/圆角，内层负责 padding —— 夹在中间的 canvas 量到的
         // 就是胶囊的真实外框（含 padding），算区域时不会差一圈。
         let slot = self.capsule_rect.clone();
         div()
-            .absolute()
-            .left(px(CAPSULE_INSET))
-            .right(px(CAPSULE_INSET))
-            .bottom(px(CAPSULE_INSET))
-            .rounded(px(12.))
+            .w(px(CAPSULE_WIDTH))
+            .max_w_full()
+            .rounded(px(CAPSULE_RADIUS))
             .bg(overlay::glass())
             .border_1()
             .border_color(overlay::border())
@@ -2210,9 +2511,9 @@ impl PlayerView {
             )
             .child(
                 v_flex()
-                    .px(px(16.))
-                    .py(px(8.))
-                    .gap(px(4.))
+                    .px(px(CAPSULE_PAD_X))
+                    .py(px(CAPSULE_PAD_Y))
+                    .gap(px(8.))
                     .child(self.render_seek_row(cx))
                     .child(self.render_controls_row(cx)),
             )
@@ -2254,45 +2555,68 @@ impl PlayerView {
         };
         let remaining = (duration - position).max(0.0);
 
-        v_flex()
+        // 「时间夹滑块」：`42:17 | 8 | 轨道 596 | 8 | -1:26:27`。
+        //
+        // 左右两段时间各占剩余空间（`flex_1` + 贴向轨道那一侧），轨道固定 596。
+        // 以前是"轨道一行、时间一行"，高度多占 16px 不说，眼睛还得上下跳着看；
+        // 夹在两端就能一边看进度一边看时间。
+        h_flex()
             .w_full()
-            .gap(px(2.))
+            .h(px(16.))
+            .items_center()
+            .gap(px(8.))
+            .child(
+                div()
+                    .id("time-current")
+                    // 普通 div 不进命中测试树，`window.find(id)` 查不到 → 测试要用它
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .justify_end()
+                    .child(
+                        div()
+                            .font_family(mono_font())
+                            .text_size(px(TIME_SIZE))
+                            .text_color(overlay::fg())
+                            // 等宽数字：时间跳动时整行宽度不能跟着抖
+                            .child(fmt_time(position)),
+                    ),
+            )
             // Slider 自身没有 id / 无障碍信息（上游未实现），用带 id 的容器承载，
             // 既给读屏软件一个可命名的分组，也让 UI 测试能定位到进度条几何。
             .child(
                 div()
                     .id("seek-bar")
                     .aria_label("播放进度")
-                    .w_full()
-                    .h(px(10.))
+                    .w(px(SEEK_TRACK_WIDTH))
+                    .h(px(16.))
+                    // 窄窗口（< 808）时允许收窄，否则 760 的胶囊会溢出被裁掉
+                    .flex_shrink(1.)
                     .flex()
                     .items_center()
                     .test_support()
                     .child(
                         Slider::new(&self.seek)
                             .bg(overlay::accent())
-                            .flex_1()
+                            .w_full()
                             .disabled(self.current.is_none()),
                     ),
             )
             .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .justify_between()
+                div()
+                    .id("time-remaining")
+                    .test_support()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .justify_start()
                     .child(
                         div()
                             .font_family(mono_font())
-                            .text_size(px(10.))
-                            .text_color(overlay::fg())
-                            .child(fmt_time(position)),
-                    )
-                    .child(
-                        div()
-                            .font_family(mono_font())
-                            .text_size(px(10.))
+                            .text_size(px(TIME_SIZE))
                             .text_color(overlay::dim())
-                            .child(format!("剩余 {}", fmt_time(remaining))),
+                            .child(format!("-{}", fmt_time(remaining))),
                     ),
             )
     }
@@ -2316,32 +2640,60 @@ impl PlayerView {
         let is_video = self.video_active;
         let cinema = self.cinema;
         let playlist_open = self.playlist_open;
+        let info_open = self.info_open;
 
         h_flex()
             .w_full()
             .h(px(44.))
             .items_center()
             .gap(px(12.))
-            // ---- 左：音量 ----
+            // ---- 左：信息（ⓘ）+ 音量 ----
+            //
+            // 设计稿把 ⓘ 放在左侧控制组的**最左**、音量图标之前；右组已经塞了
+            // 六个键（6×20 + 5×20 = 220），再挪进去就超宽了。
             .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(16.))
+                    .when(is_video, |el| {
+                        el.child(
+                            Button::new("video-info")
+                                .ghost()
+                                .with_size(px(20.))
+                                .icon(IconName::Info)
+                                .text_color(if info_open {
+                                    overlay::accent()
+                                } else {
+                                    overlay::fg()
+                                })
+                                .tooltip("视频信息")
+                                .accessibility_label("视频信息")
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.toggle_info(cx);
+                                })),
+                        )
+                    })
                     .child(
-                        Icon::new(volume_icon)
-                            .size(px(16.))
-                            .text_color(overlay::fg()),
-                    )
-                    .child(
-                        div()
-                            .id("volume-bar")
-                            .aria_label("音量")
-                            .w(px(64.))
-                            .flex()
-                            .test_support()
-                            .child(Slider::new(&self.volume).bg(overlay::accent())),
+                        h_flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                Icon::new(volume_icon)
+                                    .size(px(16.))
+                                    .text_color(overlay::fg()),
+                            )
+                            .child(
+                                div()
+                                    .id("volume-bar")
+                                    .aria_label("音量")
+                                    .w(px(VOLUME_WIDTH))
+                                    .flex()
+                                    .test_support()
+                                    .child(Slider::new(&self.volume).bg(overlay::accent())),
+                            ),
                     ),
             )
             // ---- 中：走带控制（不参与伸缩，恒在窗口正中） ----
@@ -2392,18 +2744,44 @@ impl PlayerView {
                             })),
                     ),
             )
-            // ---- 右：列表 / 全屏 / 换肤 ----
+            // ---- 右：字幕 / 音轨 / 列表 / 全屏 / 换肤（设计稿 gap 20） ----
             .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
                     .items_center()
                     .justify_end()
-                    .gap(px(6.))
+                    .gap(px(20.))
+                    .when(is_video, |el| {
+                        el.child(
+                            Button::new("subtitles")
+                                .ghost()
+                                .with_size(px(20.))
+                                .icon(IconName::Captions)
+                                .text_color(overlay::fg())
+                                .tooltip("切换字幕轨")
+                                .accessibility_label("切换字幕轨")
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.cycle_subtitles(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("audio-track")
+                                .ghost()
+                                .with_size(px(20.))
+                                .icon(IconName::Volume2)
+                                .text_color(overlay::fg())
+                                .tooltip("切换音轨")
+                                .accessibility_label("切换音轨")
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.cycle_audio_track(cx);
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("toggle-playlist")
                             .ghost()
-                            .with_size(px(28.))
+                            .with_size(px(20.))
                             .icon(IconName::ListMusic)
                             .text_color(if playlist_open {
                                 overlay::accent()
@@ -2428,7 +2806,7 @@ impl PlayerView {
                         el.child(
                             Button::new("cinema")
                                 .ghost()
-                                .with_size(px(28.))
+                                .with_size(px(20.))
                                 .icon(if cinema {
                                     IconName::Minimize
                                 } else {
@@ -2449,7 +2827,7 @@ impl PlayerView {
                     .child(
                         Button::new("theme-toggle")
                             .ghost()
-                            .with_size(px(28.))
+                            .with_size(px(20.))
                             .icon(if is_dark {
                                 IconName::Sun
                             } else {
@@ -2638,6 +3016,11 @@ impl PlayerView {
         self.flush_errors(window, cx);
     }
 
+    /// 测试用：视频信息卡是否展开。
+    pub(crate) fn test_info_open(&self) -> bool {
+        self.info_open
+    }
+
     /// 测试用：影院状态（`Esc` / 双击画面 / 最大化按钮都要能改它）。
     pub(crate) fn test_cinema(&self) -> bool {
         self.cinema
@@ -2666,11 +3049,6 @@ impl PlayerView {
     /// 测试用：点「最大化」按钮（全屏时它的语义是回到窗口）。
     pub(crate) fn test_toggle_maximize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_maximize(window, cx);
-    }
-
-    /// 测试用：当前音量（百分点，镜像自音量滑块）。
-    pub(crate) fn test_volume_pct(&self) -> i32 {
-        self.volume_pct
     }
 
     /// 测试用：音量滑块自己那份状态——拇指位置靠它，光改 `volume_pct` 界面不会动。
@@ -2763,7 +3141,7 @@ impl Render for PlayerView {
                     // 底部预留悬浮胶囊的位置（视频模式下这块是画布）
                     .child(div().h(px(BOTTOM_BAND)).flex_shrink_0()),
             )
-            .child(self.render_capsule(cx))
+            .child(self.render_bottom_chrome(cx))
             .when(self.playlist_open && !self.cinema, |el| {
                 el.child(self.render_playlist_panel(cx))
             })
@@ -2842,8 +3220,64 @@ fn caption_button(
         .child(Icon::default().data(glyph).size(px(10.)))
 }
 
-/// 秒数格式化为 `m:ss`。
+/// 信息卡里的空值占位。
+const DASH: &str = "—";
+
+/// 空串/nil 一律显示占位符：卡上留白会被当成"渲染坏了"。
+fn non_empty(value: &str) -> String {
+    if value.is_empty() {
+        DASH.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// 从 mpv 的编码串里取第一段。
+///
+/// mpv 的 `video-codec` / `audio-codec-name` 报的是**并列别名**：
+/// `h264 (High) / AVC / MPEG-4 AVC / MPEG-4`、`aac / AAC (LC)`。全塞进卡片会
+/// 冲出 240 宽的正文，而这一段里的人名按重要性递减——第一个就够用户认了。
+pub(crate) fn short_codec(codec: &str) -> String {
+    codec
+        .split('/')
+        .next()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 码率：`4.4 Mbps` / `192 kbps`（>= 1 Mbps 才用 Mbps，否则数字全是 0.x）。
+fn fmt_bitrate(bps: f64) -> String {
+    if bps <= 0.0 {
+        DASH.to_string()
+    } else if bps >= 1_000_000.0 {
+        format!("{:.1} Mbps", bps / 1_000_000.0)
+    } else {
+        format!("{:.0} kbps", bps / 1000.0)
+    }
+}
+
+/// 帧率：`23.976 fps`。整数帧率（30/60）不补小数位。
+fn fmt_fps(fps: f64) -> String {
+    if fps <= 0.0 {
+        return DASH.to_string();
+    }
+    if (fps - fps.round()).abs() < 0.01 {
+        format!("{:.0} fps", fps)
+    } else {
+        format!("{fps:.3} fps")
+    }
+}
+
+/// 秒数格式化为 `m:ss`（过 1 小时写 `h:mm:ss`）。
 fn fmt_time(secs: f64) -> String {
     let total = secs.max(0.0) as u32;
-    format!("{}:{:02}", total / 60, total % 60)
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    // 只有真过了 1 小时才写小时位：`0:42:17` 比 `42:17` 多占 3 个字宽，
+    // 而设计稿里两段时间是夹着轨道的，多一位就会把轨道挤歪
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }

@@ -288,6 +288,14 @@ pub mod overlay {
         gpui_kit::rgb(0x8B909C).into()
     }
 
+    /// 信息卡里的字段名（设计稿 `#A6ADC8`）。
+    ///
+    /// 比 `dim()` 亮一档：信息卡是**要读**的卡片，成对出现的 label 太暗就只剩
+    /// 右边一列值，扫读时对不上号。
+    pub fn label() -> Hsla {
+        gpui_kit::rgb(0xA6ADC8).into()
+    }
+
     /// 已播放进度 / 音量：Mocha 的 Mauve，在暗底上比 `#8839EF` 更亮
     pub fn accent() -> Hsla {
         gpui_kit::rgb(0xCBA6F7).into()

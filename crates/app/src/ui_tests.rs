@@ -21,7 +21,7 @@ use player_core::TrackMeta;
 use smallvec::SmallVec;
 
 use crate::persistence::{self, Settings};
-use crate::player_view::{seek_target, PlayerView};
+use crate::player_view::{seek_target, short_codec, PlayerView};
 use crate::video_overlay::OverlayEvent;
 
 /// 每个用例一个独立临时目录，避免并行执行时互相踩。
@@ -931,4 +931,145 @@ fn arrow_keys_seek_and_adjust_volume(cx: &mut TestAppContext) {
         assert!(revived.playing, "停止态按左键应重新起播，而不是纹丝不动");
     })
     .unwrap();
+}
+
+// ----------------------------------------------------------------------
+// 控制栏 v3：固定 760 宽 + 时间夹滑块 + ⓘ 视频信息卡
+// ----------------------------------------------------------------------
+
+/// 设计稿口径：胶囊**固定 760×92**、居中，进度轨道固定 596，时间码夹在两端。
+///
+/// 这些都是写死的数字，一旦被 `flex_1`/`fill_container` 带跑，界面上看起来只是
+/// "有点不一样"，很难用手眼发现——所以必须有测试直接量。
+#[gpui_kit::test]
+fn capsule_is_760_by_92_and_time_clamped(cx: &mut TestAppContext) {
+    fresh_dir("capsule-v3");
+    let (window, view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| view.test_set_video_mode(true));
+        window.render_frame(cx);
+
+        let bounds = window.bounds();
+        let rects = view.read(cx).test_chrome_rects(window);
+        // 第 0 个是标题带，第 1 个是胶囊（挖洞时各自带 1.5 的抗锯齿留白）
+        let capsule = rects.get(1).expect("视频模式必须有胶囊的窗口区域");
+        assert!(
+            (capsule.width - 760.0).abs() <= 3.5,
+            "胶囊宽应贴设计稿 760（含留白），实际 {}",
+            capsule.width
+        );
+        assert!(
+            (capsule.height - 92.0).abs() <= 3.5,
+            "胶囊高应贴设计稿 92（含留白），实际 {}",
+            capsule.height
+        );
+        let capsule_center = capsule.x + capsule.width / 2.0;
+        assert!(
+            (capsule_center - bounds.size.width.as_f32() / 2.0).abs() <= 2.0,
+            "胶囊必须水平居中：中心 {capsule_center} vs 窗口 {}",
+            bounds.size.width.as_f32()
+        );
+
+        // 时间夹滑块：轨道固定 596，左右两段时间各在轨道外侧
+        let seek = window.find("seek-bar").bounds();
+        assert!(
+            (seek.size.width.as_f32() - 596.0).abs() <= 1.0,
+            "进度轨道应固定 596，实际 {}",
+            seek.size.width.as_f32()
+        );
+        let left = window.find("time-current").bounds();
+        let right = window.find("time-remaining").bounds();
+        assert!(
+            left.right().as_f32() <= seek.left().as_f32() + 0.5,
+            "左侧时间码不能压到轨道上：{left:?} vs {seek:?}"
+        );
+        assert!(
+            right.left().as_f32() >= seek.right().as_f32() - 0.5,
+            "右侧剩余时间不能压到轨道上：{right:?} vs {seek:?}"
+        );
+
+        // 音量条 96（设计稿），ⓘ 在它左边
+        let volume = window.find("volume-bar").bounds();
+        assert!(
+            (volume.size.width.as_f32() - 96.0).abs() <= 1.0,
+            "音量条应 96 宽，实际 {}",
+            volume.size.width.as_f32()
+        );
+        let info = window.find("video-info").bounds();
+        assert!(
+            info.right().as_f32() <= volume.left().as_f32() + 0.5,
+            "ⓘ 应在音量组左侧（设计稿：左组 = ⓘ + gap16 + 音量）"
+        );
+    })
+    .unwrap();
+}
+
+/// ⓘ 打开的信息卡：240×180、贴左下、**并且要进窗口区域**。
+///
+/// 最后一条最容易漏：卡片画在画面上，不进 `chrome_rects` 就会被叠加窗整块盖住，
+/// 用户看到的是"点了 ⓘ 什么都没发生"（和胶囊当初一个坑）。
+#[gpui_kit::test]
+fn info_card_toggles_and_is_carved_out(cx: &mut TestAppContext) {
+    fresh_dir("info-card");
+    let (window, view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| view.test_set_video_mode(true));
+        window.render_frame(cx);
+        assert!(
+            window.try_find("video-info-card").is_none(),
+            "默认不该展开信息卡"
+        );
+        // 关着的时候 chrome 只有标题带 + 胶囊
+        assert_eq!(view.read(cx).test_chrome_rects(window).len(), 2);
+
+        window.click("video-info", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).test_info_open(), "点 ⓘ 应展开信息卡");
+
+        let card = window.find("video-info-card").bounds();
+        assert_eq!(card.size.width.as_f32(), 240.0, "信息卡宽 240");
+        assert_eq!(card.size.height.as_f32(), 180.0, "信息卡高 180");
+        assert!(
+            (card.left().as_f32() - 24.0).abs() <= 0.5,
+            "信息卡贴画面左侧 24，实际 {}",
+            card.left().as_f32()
+        );
+
+        let rects = view.read(cx).test_chrome_rects(window);
+        assert_eq!(rects.len(), 3, "展开后 chrome 应多一块（信息卡）");
+        // 区域比布局框多一圈 1.5 抗锯齿留白，`canvas` 量的又比布局框略小一点（边框 +
+        // 内边距的盒模型差），所以按 ±3 比，不追那零点几像素
+        assert!(
+            rects.iter().any(|rect| {
+                (rect.x - card.left().as_f32()).abs() <= 3.0
+                    && (rect.width - card.size.width.as_f32()).abs() <= 3.0
+            }),
+            "信息卡必须进窗口区域，否则会被叠加窗盖住：{rects:?}"
+        );
+
+        // 再点一次收起，chrome 也要收回去（否则画面上留一块"洞"）
+        window.click("video-info", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).test_info_open());
+        assert_eq!(view.read(cx).test_chrome_rects(window).len(), 2);
+    })
+    .unwrap();
+}
+
+/// 编码串只留第一段。
+///
+/// mpv 报的是并列别名（`h264 (High) / AVC / MPEG-4 AVC / MPEG-4`），整串塞进
+/// 240 宽的卡片会冲出正文边界（实机截图里那段字已经压到画面上）。
+#[test]
+fn codec_string_keeps_only_its_first_alias() {
+    assert_eq!(
+        short_codec("h264 (High) / AVC / MPEG-4 AVC / MPEG-4"),
+        "h264 (High)"
+    );
+    assert_eq!(short_codec("aac / AAC (LC)"), "aac");
+    // 单段/空串不能被切断或留下空白
+    assert_eq!(short_codec("vp9"), "vp9");
+    assert_eq!(short_codec(""), "");
 }

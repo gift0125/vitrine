@@ -84,6 +84,38 @@ pub struct VideoStatus {
     pub error: Option<String>,
     /// IPC 连接是否仍然有效
     pub connected: bool,
+
+    // ---- 下面这些只给「视频信息」卡用（`ⓘ`）----
+    //
+    // mpv 通过 `observe_property` 推，未加载/音频文件时为空串或 0。UI 侧只读不写，
+    // 所以字段一律是「显示用的原样字符串 + 数字」，格式化留给视图层：
+    // 这里换成 `HumanWidth` 之类反而会让 `PartialEq` 每秒都判不等。
+    /// 编码描述，mpv 的 `video-codec`（例：`h264 (High)`）
+    pub video_codec: String,
+    /// 编码尺寸（`width`/`height`），与 `width`/`height`（显示尺寸）不同：
+    /// 变形像素的片子两者不等，信息卡要显示的是**编码尺寸**。
+    pub source_width: u32,
+    pub source_height: u32,
+    /// 容器帧率（`container-fps`）
+    pub fps: f64,
+    /// 视频码率（bps）
+    pub video_bitrate: f64,
+    /// 音频码率（bps）
+    pub audio_bitrate: f64,
+    /// 色彩：`video-params/primaries`（例 `bt.709`）
+    pub primaries: String,
+    /// 色彩：`video-params/gamma`（例 `bt.1886`）
+    pub gamma: String,
+    /// 音频编码名（`audio-codec-name`，例 `aac`）
+    pub audio_codec: String,
+    /// 声道数（`audio-params/channel-count`）
+    pub audio_channels: u32,
+    /// 采样率（`audio-params/samplerate`）
+    pub audio_rate: u32,
+    /// 当前字幕轨号，0 = 关闭（mpv 的 `sid` 在「无字幕」时是 `false`）
+    pub sub_track: u32,
+    /// 当前音轨号，0 = 无音频（`aid`）
+    pub audio_track: u32,
 }
 
 /// mpv 启动参数。
@@ -256,6 +288,22 @@ impl VideoEngine {
             // `width`/`height` 只是编码尺寸，变形画面的比例会算错。
             (5, "dwidth"),
             (6, "dheight"),
+            // 视频信息卡（`ⓘ`）要的几项。mpv 对每个属性都会先推一次当前值，
+            // 加载新文件时再推一次，所以不用额外 get_property。
+            (7, "video-codec"),
+            (8, "width"),
+            (9, "height"),
+            (10, "container-fps"),
+            (11, "video-bitrate"),
+            (12, "audio-bitrate"),
+            (13, "video-params/primaries"),
+            (14, "video-params/gamma"),
+            (15, "audio-codec-name"),
+            (16, "audio-params/channel-count"),
+            (17, "audio-params/samplerate"),
+            // 字幕/音轨的当前选择：☷ 与 ♪ 两个按钮循环切换后，回执靠它。
+            (18, "sid"),
+            (19, "aid"),
         ] {
             engine.send(serde_json::json!({ "command": ["observe_property", id, name] }));
         }
@@ -299,6 +347,19 @@ impl VideoEngine {
     /// 停止当前文件（回到 idle，保留进程）。
     pub fn stop(&self) {
         self.send(serde_json::json!({ "command": ["stop"] }));
+    }
+
+    /// 循环切换字幕轨（含「关闭」）。
+    ///
+    /// 用 mpv 的 `cycle` 而不是自己算下一轨：轨到底是 1 条还是 5 条、有没有
+    /// forced/外挂字幕，全在 mpv 那边；自己维护一份「第几条」立刻就会和它对不上。
+    pub fn cycle_subtitles(&self) {
+        self.send(serde_json::json!({ "command": ["cycle", "sid"] }));
+    }
+
+    /// 循环切换音轨。
+    pub fn cycle_audio_track(&self) {
+        self.send(serde_json::json!({ "command": ["cycle", "aid"] }));
     }
 
     /// 状态快照。
@@ -486,6 +547,11 @@ fn dimension(data: &serde_json::Value) -> u32 {
         .unwrap_or(0)
 }
 
+/// 字符串型属性：mpv 对「没有这个属性」推的是 `false` / `null`，一律当空串。
+fn text(data: &serde_json::Value) -> String {
+    data.as_str().unwrap_or_default().to_string()
+}
+
 /// 解析单行 mpv 事件并更新状态。
 fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
     trace(&format!("<- {line}"));
@@ -536,6 +602,21 @@ fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
                         st.idle = idle;
                     }
                 }
+                // ---- 视频信息卡 ----
+                "video-codec" => st.video_codec = text(&data),
+                "width" => st.source_width = dimension(&data),
+                "height" => st.source_height = dimension(&data),
+                "container-fps" => st.fps = data.as_f64().unwrap_or(0.0),
+                "video-bitrate" => st.video_bitrate = data.as_f64().unwrap_or(0.0),
+                "audio-bitrate" => st.audio_bitrate = data.as_f64().unwrap_or(0.0),
+                "video-params/primaries" => st.primaries = text(&data),
+                "video-params/gamma" => st.gamma = text(&data),
+                "audio-codec-name" => st.audio_codec = text(&data),
+                "audio-params/channel-count" => st.audio_channels = dimension(&data),
+                "audio-params/samplerate" => st.audio_rate = dimension(&data),
+                // 「无字幕/无音轨」时 mpv 推的是 `false`，这里统一折成 0
+                "sid" => st.sub_track = dimension(&data),
+                "aid" => st.audio_track = dimension(&data),
                 _ => {}
             }
         }
@@ -547,6 +628,21 @@ fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
             // 留着旧值就会先跳成上一部片的形状，再跳回来。
             st.width = 0;
             st.height = 0;
+            // 信息卡同理：新片子还没解码出参数之前，卡上不能挂着上一部片的编码/
+            // 码率/色彩——那种"看起来有值"的错数据比空白更难发现。
+            st.video_codec.clear();
+            st.source_width = 0;
+            st.source_height = 0;
+            st.fps = 0.0;
+            st.video_bitrate = 0.0;
+            st.audio_bitrate = 0.0;
+            st.primaries.clear();
+            st.gamma.clear();
+            st.audio_codec.clear();
+            st.audio_channels = 0;
+            st.audio_rate = 0;
+            st.sub_track = 0;
+            st.audio_track = 0;
         }
         "file-loaded" => {
             st.idle = false;
@@ -716,6 +812,57 @@ mod tests {
             &status,
         );
         assert_eq!(status.lock().unwrap().width, 0);
+    }
+
+    /// 视频信息卡的数据全部来自 `property-change`，一项都不能漏：
+    /// 名字写错 mpv 不会报错，只是永远推 `null`，卡上那行就一直是空白。
+    #[test]
+    fn info_card_properties_are_tracked() {
+        let status = Arc::new(Mutex::new(VideoStatus::default()));
+        for line in [
+            r#"{"event":"property-change","name":"video-codec","data":"h264 (High)"}"#,
+            r#"{"event":"property-change","name":"width","data":1920}"#,
+            r#"{"event":"property-change","name":"height","data":1080}"#,
+            r#"{"event":"property-change","name":"container-fps","data":23.976}"#,
+            r#"{"event":"property-change","name":"video-bitrate","data":4200000.0}"#,
+            r#"{"event":"property-change","name":"audio-bitrate","data":192000.0}"#,
+            r#"{"event":"property-change","name":"video-params/primaries","data":"bt.709"}"#,
+            r#"{"event":"property-change","name":"video-params/gamma","data":"bt.1886"}"#,
+            r#"{"event":"property-change","name":"audio-codec-name","data":"aac"}"#,
+            r#"{"event":"property-change","name":"audio-params/channel-count","data":2}"#,
+            r#"{"event":"property-change","name":"audio-params/samplerate","data":48000}"#,
+            r#"{"event":"property-change","name":"sid","data":1}"#,
+            r#"{"event":"property-change","name":"aid","data":1}"#,
+        ] {
+            handle_line(line, &status);
+        }
+        let st = status.lock().unwrap().clone();
+        assert_eq!(st.video_codec, "h264 (High)");
+        assert_eq!((st.source_width, st.source_height), (1920, 1080));
+        assert!((st.fps - 23.976).abs() < 0.001);
+        assert_eq!(st.video_bitrate, 4_200_000.0);
+        assert_eq!(st.audio_bitrate, 192_000.0);
+        assert_eq!(st.primaries, "bt.709");
+        assert_eq!(st.gamma, "bt.1886");
+        assert_eq!(st.audio_codec, "aac");
+        assert_eq!((st.audio_channels, st.audio_rate), (2, 48_000));
+        assert_eq!((st.sub_track, st.audio_track), (1, 1));
+
+        // 关闭字幕 / 无音轨时 mpv 推的是 `false`，不能留成上一部片子的轨号
+        handle_line(
+            r#"{"event":"property-change","name":"sid","data":false}"#,
+            &status,
+        );
+        assert_eq!(status.lock().unwrap().sub_track, 0);
+
+        // 换片：全部清空（旧数据比空白更难发现）
+        handle_line(r#"{"event":"start-file"}"#, &status);
+        let st = status.lock().unwrap();
+        assert!(st.video_codec.is_empty());
+        assert_eq!((st.source_width, st.source_height), (0, 0));
+        assert_eq!(st.fps, 0.0);
+        assert!(st.primaries.is_empty());
+        assert_eq!((st.sub_track, st.audio_track), (0, 0));
     }
 
     #[test]
