@@ -41,11 +41,17 @@
 - **字体必须用系统自带的那套**：设计稿的 Inter / Noto Sans SC 在 Windows 上不预装（写死会在用户机器上退成宋体）。平台映射在 `theme::ui_font_family()`（Win `Microsoft YaHei UI` / mac `PingFang SC` / 其他 `Noto Sans SC`）与 `mono_font_family()`。`ThemeConfig.font_family` 改一处即全局生效（`root.rs` 把它铺到整棵树）。
 - **任务栏图标靠 PE 资源 ID=1**：`gpui-pre-windows::load_icon` 用 `LoadImageW(module, MAKEINTRESOURCE(1), IMAGE_ICON, …)`，没有这条资源就是空句柄（任务栏显示系统占位图），`WindowOptions.icon` 是 x11 only。`crates/app/build.rs` 用 embed-resource 写 `1 ICON` + VERSIONINFO；`canonicalize` 的 `\\?\` 前缀会让 rc 报「找不到文件」，要剥掉并换正斜杠。
 - **验收脚本跑隔离配置目录**：`SMP_DATA_DIR` 可整体顶掉 `%APPDATA%\simple-media-player`。曾直接改真实 playlist.json 覆盖了用户正在用的列表。
+- **视频 chrome 压在画面上 = 给叠加窗口开洞**（2026-10-18 第五轮）：`SetWindowRgn` + `RGN_DIFF` 把标题带/胶囊/歌单从叠加窗口的区域里减掉，窗口区域同时裁剪渲染与命中测试 → 下面的 GPUI 主窗口露出来。要点：`CreateRoundRectRgn` 收的是椭圆**直径**不是半径；区域只认物理像素且 `SetWindowPos` 不会重算（`set_rect` 后要重新应用）；空 holes = `SetWindowRgn(hwnd, 0, 1)` 恢复整窗；洞外扩 1.5px 免得切掉描边。`render()` 里视频舞台先声明（绝对定位铺满整窗），chrome 排后面才是"在上面"。
+- **胶囊尺寸不能写死**：高度是内容撑开的（随字号/行距变），用胶囊内部的 `canvas` 每帧把 bounds 写进 `capsule_rect`，`chrome_holes()` 用它算洞；`set_holes` 按内容去重，别让 100ms tick 反复打系统调用。
+- **按住画面拖窗体**：叠加窗 wndproc 收 `WM_LBUTTONDOWN` → `GetWindow(hwnd, GW_OWNER)` → `ReleaseCapture()` + `SendMessageW(owner, WM_NCLBUTTONDOWN, HTCAPTION, 0)`，把这一下转交给系统当标题栏拖动（贴边吸附/最大化还原/跨屏白拿）；叠加窗自己由 tick 追上。
+- **拖放不弹提示**：拖进来这个动作本身就是意图，画面换了就是回执。只保留「没有可播放的媒体文件」这类真失败提示。
+- **验收取样要用实测客户区换算**：`SetWindowPos` 设的是外框，实测 1898×1189 物理 ÷1.5 = 1265×793 而非设的 1280×800；按目标尺寸换算整体偏几像素，点 28px 图标正好点进间隙（`scripts/verify_floating_chrome.py` 里记了这条）。
+- **洞露出来的是不透明画布，不是画面**：GPUI Windows 后端（DComp + `WS_EX_NOREDIRECTIONBITMAP`）不支持窗口级透明，所以设计稿的"60% 黑 + 模糊"退成实心深色；歌单面板保持 Latte 浅底（改深底会让 `List` 的行文字不可读，颜色取主题 token）。
 
 
 ## 设计稿要点（详见 2026-10-17 / 2026-10-18 日志）
 - 色板严格取 Catppuccin Latte 官方值；Mauve #8839EF 唯一强调色。**v2 起是两套色板**：应用表面 Latte/Mocha，叠加层（胶囊）深色玻璃，见 `theme::overlay`。
-- 布局 v2 = IINA 式沉浸布局：自绘 34px 标题带 + 悬浮玻璃胶囊（内缩 24、圆角 12、padding 16×8）+ 默认收起的 320 悬浮歌单面板；内容占满窗口。
+- 布局 v2 = IINA 式沉浸布局：自绘 34px 标题带 + 悬浮玻璃胶囊（内缩 24、圆角 12、padding 16×8）+ 默认收起的 320 悬浮歌单面板；内容占满窗口。**视频模式下画面真的铺满整窗**，标题带/胶囊/歌单挖洞浮在画面上（2026-10-18 第五轮，之前的"画面让位"已废）。
 - 尺寸口径要按「占窗口多少」定，不按像素堆：胶囊曾经 107 高（680 窗口的 15.7%）像一块黑板，现在约 90（13%），`BOTTOM_BAND` = 116。
 - **皮肤落地在 `crates/app/src/theme.rs`**：设计稿色板 → gpui-component 语义 token（Latte/Mocha 两套），界面只读 token。改动前一直用默认中性灰主题，这是"与设计稿差别很大"的根因（2026-10-18 修复）。
 - 图标规范：播放三角占圆直径 48%（B 档），32px 以下重绘而非缩放（占比 50-54%、去描边）；图标为正圆。

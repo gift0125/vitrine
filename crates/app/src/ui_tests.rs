@@ -404,6 +404,70 @@ fn stage_fills_space_between_title_band_and_bottom_band(cx: &mut TestAppContext)
     .unwrap();
 }
 
+/// 视频模式：画面铺满**整窗**，标题带 / 胶囊 / 歌单压在画面上。
+///
+/// 两句都来自用户：「顶栏和控制栏未悬停在视频上方」「播放列表在视频上方，不挤视频位置」。
+/// 分两层实现——GPUI 侧靠子节点声明顺序（后画的在上面），系统侧靠
+/// `chrome_holes` 把这几块从 mpv 叠加窗的窗口区域里挖掉（`SetWindowRgn`）。
+/// 这条用例守的是 GPUI 侧：画面必须铺满，chrome 必须落在画面范围内。
+#[gpui_kit::test]
+fn video_mode_floats_chrome_over_a_full_window_picture(cx: &mut TestAppContext) {
+    fresh_dir("video-float");
+    let (window, view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| view.test_set_video_mode(true));
+        window.render_frame(cx);
+
+        let window_bounds = window.bounds();
+        let stage = window.find("stage").bounds();
+        let near = |a: f32, b: f32| (a - b).abs() <= 1.0;
+
+        assert!(
+            near(stage.top().as_f32(), window_bounds.top().as_f32()),
+            "画面要顶到窗口上沿（标题带压在画面上，不是让位）：{stage:?} vs {window_bounds:?}"
+        );
+        assert!(
+            near(stage.bottom().as_f32(), window_bounds.bottom().as_f32()),
+            "画面要铺到窗口下沿（胶囊压在画面上）：{stage:?} vs {window_bounds:?}"
+        );
+        assert!(
+            near(stage.left().as_f32(), window_bounds.left().as_f32())
+                && near(stage.right().as_f32(), window_bounds.right().as_f32()),
+            "画面要铺满整个横向宽度：{stage:?} vs {window_bounds:?}"
+        );
+
+        // 胶囊落在画面范围内 = 它浮在画面上，而不是把画面顶上去
+        let seek = window.find("seek-bar").bounds();
+        assert!(
+            seek.top() > stage.top() && seek.bottom() < stage.bottom(),
+            "进度条应在画面内部：{seek:?} vs 画面 {stage:?}"
+        );
+
+        // 展开歌单：面板浮在右侧，画面宽度一像素都不该变
+        window.click("toggle-playlist", cx);
+        window.render_frame(cx);
+
+        let stage_after = window.find("stage").bounds();
+        let panel = window.find("playlist-panel").bounds();
+        assert!(
+            near(stage_after.size.width.as_f32(), stage.size.width.as_f32()),
+            "展开歌单不能挤窄画面：{stage_after:?} vs {stage:?}"
+        );
+        assert!(
+            near(stage_after.right().as_f32(), window_bounds.right().as_f32()),
+            "歌单展开后画面仍铺到窗口右沿：{stage_after:?}"
+        );
+        assert!(
+            panel.right() <= window_bounds.right()
+                && panel.left() >= window_bounds.left()
+                && panel.right() > stage_after.center().x,
+            "歌单面板应浮在画面右侧且不出窗口：{panel:?} vs {window_bounds:?}"
+        );
+    })
+    .unwrap();
+}
+
 /// 走带控制（上一首 / 播放 / 下一首）必须落在窗口水平正中。
 ///
 /// 这里守的是一个很容易回归的布局写法：左右两栏宽度不等时（例如
@@ -484,6 +548,10 @@ fn dropping_files_adds_them_and_starts_playback(cx: &mut TestAppContext) {
             snapshot.last_error.is_none(),
             "拖入已有文件不应报错：{:?}",
             snapshot.last_error
+        );
+        assert_eq!(
+            snapshot.pending_info, 0,
+            "拖进来就安静地播，不要排任何提示（用户明确要求去掉通知）"
         );
     });
 }

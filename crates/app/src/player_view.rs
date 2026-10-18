@@ -36,7 +36,7 @@ use gpui_kit::*;
 use crate::persistence::{self, Settings};
 use crate::playlist::PlaylistDelegate;
 use crate::theme::overlay;
-use crate::video_overlay::{self, Hwnd, VideoOverlay};
+use crate::video_overlay::{self, Hole, Hwnd, VideoOverlay};
 
 /// 进度条量程未知时的兜底（元数据解析失败）。
 const SEEK_FALLBACK_MAX: f32 = 600.0;
@@ -136,6 +136,11 @@ pub struct PlayerView {
     video_error: Option<String>,
     /// render 阶段由 canvas 捕获的视频区（窗口逻辑坐标 x, y, w, h）
     video_rect: VideoRectCell,
+    /// render 阶段由 canvas 捕获的控制胶囊矩形。
+    ///
+    /// 视频模式要把胶囊从 mpv 的可见区域里挖掉（见 `chrome_holes`），
+    /// 而胶囊高度是内容撑开的（随字号/行距变），不能写死，只能量。
+    capsule_rect: VideoRectCell,
     /// GPUI 主窗口句柄（叠加窗口的 owner）
     main_hwnd: Hwnd,
     /// 影院模式（隐藏歌单 + 系统全屏）
@@ -282,6 +287,7 @@ impl PlayerView {
             .unwrap_or(0);
 
         let video_rect: VideoRectCell = Rc::new(Cell::new(None));
+        let capsule_rect: VideoRectCell = Rc::new(Cell::new(None));
 
         let this = Self {
             engine,
@@ -300,6 +306,7 @@ impl PlayerView {
             video_active: false,
             video_error: None,
             video_rect,
+            capsule_rect,
             main_hwnd,
             cinema: false,
             playlist_open: false,
@@ -548,6 +555,7 @@ impl PlayerView {
     fn sync_overlay_rect(&mut self, window: &Window) {
         if !self.video_active {
             if let Some(overlay) = &mut self.video.overlay {
+                overlay.set_holes(Vec::new(), 1.0);
                 overlay.hide();
             }
             return;
@@ -566,12 +574,58 @@ impl PlayerView {
             (w * scale).round() as i32,
             (h * scale).round() as i32,
         );
+        let holes = self.chrome_holes(window);
         if let Some(overlay) = &mut self.video.overlay {
             overlay.set_rect(physical.0, physical.1, physical.2, physical.3);
+            overlay.set_holes(holes, scale);
             if !overlay.is_visible() {
                 overlay.show();
             }
         }
+    }
+
+    /// 视频模式下要「从画面里挖掉」的 chrome 区域。
+    ///
+    /// 画面铺满整窗，而标题带/胶囊/歌单是画在 GPUI 主窗口里的——mpv 的叠加窗口
+    /// 浮在主窗口之上，所以这几块必须从它的窗口区域里减掉，否则永远看不见。
+    /// 只挖 chrome 本身（不是整条底栏），画面才能在胶囊四周一直铺到窗口边缘。
+    fn chrome_holes(&self, window: &Window) -> Vec<Hole> {
+        let bounds = window.bounds();
+        let width = bounds.size.width.as_f32();
+        let height = bounds.size.height.as_f32();
+
+        // 抗锯齿留白：挖得太贴边会把胶囊的白描边切掉半个像素
+        const PAD: f32 = 1.5;
+        const CAPSULE_RADIUS: f32 = 12.0;
+
+        let mut holes = Vec::with_capacity(3);
+        // 标题带整条让开：右端还有窗口按钮，中间截断会很奇怪
+        holes.push(Hole::rect(0., 0., width, TITLE_BAND));
+
+        if let Some((x, y, w, h)) = self.capsule_rect.get() {
+            holes.push(Hole::rounded(
+                x - PAD,
+                y - PAD,
+                w + PAD * 2.,
+                h + PAD * 2.,
+                CAPSULE_RADIUS + PAD,
+            ));
+        }
+
+        // 歌单：展开时浮在画面右侧，不再挤占画面宽度
+        if self.playlist_open && !self.cinema {
+            let panel_x = width - 12. - PLAYLIST_WIDTH;
+            let panel_y = TITLE_BAND + 6.;
+            let panel_h = (height - panel_y - BOTTOM_BAND).max(0.);
+            holes.push(Hole::rounded(
+                panel_x - PAD,
+                panel_y - PAD,
+                PLAYLIST_WIDTH + PAD * 2.,
+                panel_h + PAD * 2.,
+                12. + PAD,
+            ));
+        }
+        holes
     }
 
     /// 重建进度条量程（SliderState 不支持运行时改 max）。
@@ -1108,8 +1162,7 @@ impl PlayerView {
             seen.push(key);
             fresh.push(track);
         }
-        let added = fresh.len();
-        if added > 0 {
+        if !fresh.is_empty() {
             self.append_tracks(fresh, cx);
         }
 
@@ -1124,18 +1177,10 @@ impl PlayerView {
             })
         });
         match target {
-            Some(index) => {
-                self.play_track(index, cx);
-                let title = self
-                    .current_track(cx)
-                    .map(|track| track.title)
-                    .unwrap_or_default();
-                self.report_info(if added > 0 {
-                    format!("已导入 {added} 个文件 · 正在播放「{title}」")
-                } else {
-                    format!("正在播放「{title}」")
-                });
-            }
+            // 安静地播，不弹提示：拖进来的动作本身就是意图，
+            // 画面换了 / 走带动了就是最好的反馈，再来一条「已导入 N 个文件」
+            // 只是把用户已经知道的事复述一遍（2026-10-18 用户明确要求去掉）。
+            Some(index) => self.play_track(index, cx),
             None => cx.notify(),
         }
     }
@@ -1385,25 +1430,33 @@ impl PlayerView {
             )
     }
 
-    /// 舞台：视频/音频两种内容，占满标题带与底部胶囊之间的区域。
+    /// 舞台：视频/音频两种内容。
+    ///
+    /// 两种模式的占位方式不同：
+    /// - **视频**：绝对定位铺满整窗，画面直接顶到窗口四边，chrome 压在上面；
+    /// - **音频**：占「标题带以下、胶囊以上」的流式空间。
     ///
     /// `self_stretch` 不能少：`h_flex()` 默认 `items_center`，舞台的子元素又全是
     /// 绝对定位（内容高度 0），不撑满交叉轴的话舞台高度会塌成 0——视频区 canvas
     /// 捕获到 `0x0`，mpv 叠加窗就永远定不到位（表现为黑屏但有声音）。
     fn render_stage(&self, cx: &Context<Self>) -> impl gpui_kit::IntoElement {
-        let stage = div()
-            .id("stage")
-            .test_support()
-            .flex_1()
-            .self_stretch()
-            .min_w_0()
-            .min_h_0()
-            .relative()
-            .bg(if self.video_active {
-                overlay::canvas()
-            } else {
-                cx.theme().background
-            });
+        let stage = div().id("stage").test_support().relative();
+
+        let stage = if self.video_active {
+            stage
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .size_full()
+                .bg(overlay::canvas())
+        } else {
+            stage
+                .flex_1()
+                .self_stretch()
+                .min_w_0()
+                .min_h_0()
+                .bg(cx.theme().background)
+        };
 
         if self.video_active {
             stage.child(self.render_video_surface(cx))
@@ -1548,11 +1601,13 @@ impl PlayerView {
     }
 
     /// 悬浮播放列表面板：320 宽、Latte 底、浮在画面上（默认可收起）。
-    fn render_playlist_panel(&self, cx: &Context<Self>) -> Div {
+    fn render_playlist_panel(&self, cx: &Context<Self>) -> impl gpui_kit::IntoElement {
         let theme = cx.theme();
         let count = self.playlist.read(cx).delegate().track_count();
 
         v_flex()
+            .id("playlist-panel")
+            .test_support()
             .absolute()
             .top(px(TITLE_BAND + 6.))
             .right(px(12.))
@@ -1641,21 +1696,44 @@ impl PlayerView {
     /// 曾经撑到 107 高（窗口 680 时占 15.7%），远看像一块压在下沿的黑板。
     /// 现在压到 ~90（占 13%），间距也从 12/6 收到 8/4，视觉重量才和画面匹配。
     fn render_capsule(&self, cx: &mut Context<Self>) -> Div {
-        v_flex()
+        // 外框负责定位/底色/圆角，内层负责 padding —— 这样夹在中间的 canvas
+        // 量到的就是胶囊的真实外框（含 padding），挖洞时才不会差一圈。
+        let slot = self.capsule_rect.clone();
+        div()
             .absolute()
             .left(px(CAPSULE_INSET))
             .right(px(CAPSULE_INSET))
             .bottom(px(CAPSULE_INSET))
-            .px(px(16.))
-            .py(px(8.))
-            .gap(px(4.))
             .rounded(px(12.))
             .bg(overlay::glass())
             .border_1()
             .border_color(overlay::border())
             .shadow_lg()
-            .child(self.render_seek_row(cx))
-            .child(self.render_controls_row(cx))
+            .child(
+                canvas(
+                    move |bounds, _window, _cx| {
+                        slot.set(Some((
+                            bounds.origin.x.as_f32(),
+                            bounds.origin.y.as_f32(),
+                            bounds.size.width.as_f32(),
+                            bounds.size.height.as_f32(),
+                        )));
+                    },
+                    |_bounds, _out, _window, _cx| {},
+                )
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .size_full(),
+            )
+            .child(
+                v_flex()
+                    .px(px(16.))
+                    .py(px(8.))
+                    .gap(px(4.))
+                    .child(self.render_seek_row(cx))
+                    .child(self.render_controls_row(cx)),
+            )
     }
 
     /// 进度：轨道在上、时间行在下（左当前 / 右剩余）。
@@ -2001,6 +2079,8 @@ pub(crate) struct ViewSnapshot {
     pub using_audio_device: bool,
     /// 当前画在标题带里的状态胶囊文案（视频模式专属）
     pub pill: Option<String>,
+    /// 排队待弹的普通提示条数（>0 表示下一次 tick 会弹 toast/胶囊）
+    pub pending_info: usize,
 }
 
 #[cfg(test)]
@@ -2015,6 +2095,7 @@ impl PlayerView {
             pill: self
                 .status_pill_live()
                 .map(|(message, _, _)| message.to_string()),
+            pending_info: self.pending_infos.len(),
         }
     }
 
@@ -2066,6 +2147,9 @@ impl Render for PlayerView {
                     view.import_dropped(dropped, cx);
                 });
             })
+            // 视频模式：舞台铺满**整个窗口**，标题带/胶囊/歌单压在画面上（见 chrome_holes）。
+            // 必须排在最前面——GPUI 按子节点顺序绘制，后画的才在上面。
+            .when(self.video_active, |el| el.child(self.render_stage(cx)))
             .child(
                 v_flex()
                     .size_full()
@@ -2074,12 +2158,10 @@ impl Render for PlayerView {
                         h_flex()
                             .flex_1()
                             .min_h_0()
-                            .child(self.render_stage(cx))
-                            // 视频模式下列表展开 → 画面右侧让位，
-                            // 否则悬浮面板会被 mpv 叠加窗整个盖住。
-                            .when(self.video_active && self.playlist_open, |el| {
-                                el.child(div().w(px(PLAYLIST_WIDTH + 24.)).flex_shrink_0())
-                            }),
+                            // 音频模式舞台在流里（占标题带与胶囊之间）；视频模式已经在
+                            // 上面单独铺满了，这里留空，chrome 才能浮在画面上。
+                            // 歌单展开也不再挤画面——它本来就是悬浮面板。
+                            .when(!self.video_active, |el| el.child(self.render_stage(cx))),
                     )
                     // 底部预留悬浮胶囊的位置（视频模式下这块是画布）
                     .child(div().h(px(BOTTOM_BAND)).flex_shrink_0()),
