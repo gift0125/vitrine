@@ -14,6 +14,10 @@ rfd = "0.15"
 directories = "6"
 raw-window-handle = "0.6"
 
+[target.'cfg(windows)'.build-dependencies]
+# 把图标 + 版本信息写进 exe 的 PE 资源（GPUI 只认 ID=1 的图标组，见 build.rs）
+embed-resource = "3"
+
 [dev-dependencies]
 # UI 集成测试需要无头窗口驱动（`gpui_kit::test`），只在测试构建打开该 feature。
 gpui-kit = { workspace = true, features = ["test-support"] }

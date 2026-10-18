@@ -38,6 +38,10 @@
 - **提示按底色分流**（`flush_errors`）：`video_active` → 标题带胶囊 `status_pill`（4s 自动退场，出现/消失由 tick 比对 `status_pill_shown` 触发重绘）；否则 `window.push_notification`。原因：视频模式内容区整块被 mpv 叠加窗盖着，in-app toast 等于没画。通知层位置/宽度在 `theme::install` 里改（`notification.margins.top = TITLE_BAND + 12`、`width = 320`），`apply_config`/`change` 不会重置它。
 - **`height: 100%` 在不定高父级上退化成 auto**：`h_flex()` 高度由内容撑开时，子元素 `.h_full()` 解析不出来（实测按钮只剩图标 10px 高，悬停底色成一条横线）。要写死 `.h(px(...))`，父级再补 `.h_full()`。
 - 测试侧：`window.find(id)` 缺元素会 **panic**，判"不存在"用 `try_find`（Option）；`bounds()` 直接返回 `Bounds`（不是 Option）。无头测试要覆盖视频模式用 `#[cfg(test)]` 的 `test_set_video_mode`/`test_notify`，不必真起 mpv。
+- **字体必须用系统自带的那套**：设计稿的 Inter / Noto Sans SC 在 Windows 上不预装（写死会在用户机器上退成宋体）。平台映射在 `theme::ui_font_family()`（Win `Microsoft YaHei UI` / mac `PingFang SC` / 其他 `Noto Sans SC`）与 `mono_font_family()`。`ThemeConfig.font_family` 改一处即全局生效（`root.rs` 把它铺到整棵树）。
+- **任务栏图标靠 PE 资源 ID=1**：`gpui-pre-windows::load_icon` 用 `LoadImageW(module, MAKEINTRESOURCE(1), IMAGE_ICON, …)`，没有这条资源就是空句柄（任务栏显示系统占位图），`WindowOptions.icon` 是 x11 only。`crates/app/build.rs` 用 embed-resource 写 `1 ICON` + VERSIONINFO；`canonicalize` 的 `\\?\` 前缀会让 rc 报「找不到文件」，要剥掉并换正斜杠。
+- **验收脚本跑隔离配置目录**：`SMP_DATA_DIR` 可整体顶掉 `%APPDATA%\simple-media-player`。曾直接改真实 playlist.json 覆盖了用户正在用的列表。
+
 
 ## 设计稿要点（详见 2026-10-17 / 2026-10-18 日志）
 - 色板严格取 Catppuccin Latte 官方值；Mauve #8839EF 唯一强调色。**v2 起是两套色板**：应用表面 Latte/Mocha，叠加层（胶囊）深色玻璃，见 `theme::overlay`。

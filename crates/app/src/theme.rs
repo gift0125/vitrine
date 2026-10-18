@@ -98,6 +98,36 @@ const MOCHA: Palette = Palette {
     blue: "#89B4FA",
 };
 
+/// 界面正文字体：挑**系统自带**的那一套。
+///
+/// 设计稿（Ardot）写的是 Inter / Noto Sans SC，这两套 Windows 都不预装——
+/// 之前写死 `Noto Sans SC`，本机装过所以看着正常，但发行包到别人机器上
+/// 字体解析失败会退到系统兜底：中文常常落到宋体，11px 下横细竖粗、笔画发糊，
+/// 和设计稿的观感差得远。
+///
+/// 微软雅黑是 Windows 从 Vista 起自带的中文 UI 字体（`Microsoft YaHei UI` 是
+/// 它的 UI 变体，字面更紧凑），资源管理器/设置页本身就是这套，中英混排最稳。
+fn ui_font_family() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Microsoft YaHei UI"
+    } else if cfg!(target_os = "macos") {
+        "PingFang SC"
+    } else {
+        "Noto Sans SC"
+    }
+}
+
+/// 等宽字体：时间码、序号用，必须真的等宽（雅黑不是）。
+pub(crate) fn mono_font_family() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Consolas"
+    } else if cfg!(target_os = "macos") {
+        "Menlo"
+    } else {
+        "DejaVu Sans Mono"
+    }
+}
+
 /// 把一套色板翻译成 gpui-component 的语义 token。
 ///
 /// 没有列出的 token 会回落到该模式的默认中性色，所以这里只覆盖界面真正
@@ -110,9 +140,9 @@ fn config(name: &str, mode: ThemeMode, p: &Palette) -> ThemeConfig {
         name: name.into(),
         mode,
         // 设计稿：正文 13px / 辅助 11px / 标题 15px，基准字号 16 让 rem 阶梯对齐
-        font_family: Some("Noto Sans SC".into()),
+        font_family: Some(ui_font_family().into()),
         font_size: Some(16.0),
-        mono_font_family: Some("Consolas".into()),
+        mono_font_family: Some(mono_font_family().into()),
         mono_font_size: Some(12.0),
         // 设计稿：条目/卡片圆角 8，大面板 12
         radius: Some(8),
@@ -315,6 +345,33 @@ mod tests {
     }
 
     /// 主题必须真的落到全局状态上——否则界面又回到默认中性灰。
+    #[gpui_kit::test]
+    fn ui_font_is_a_system_font_not_a_design_tool_font(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install(cx, false);
+
+            let theme = cx.theme();
+            let family = theme.font_family.as_ref();
+            // 设计稿里的 Inter / Noto Sans SC 都不是 Windows 预装字体：写死它们，
+            // 发行包到用户机器上会退到系统兜底（中文常落宋体），观感直接崩。
+            // 这条用例守的是「选系统自带的那一套」这个决定本身。
+            if cfg!(target_os = "windows") {
+                assert_eq!(family, "Microsoft YaHei UI", "Windows 上应当用微软雅黑");
+            }
+            assert!(
+                !matches!(family, "Inter" | "Noto Sans SC"),
+                "界面字体不能是设计稿专用字体（用户机器上不一定有）: {family}"
+            );
+            // 时间码必须等宽，雅黑不是
+            assert_ne!(
+                theme.mono_font_family.as_ref(),
+                family,
+                "等宽字体不能跟正文同族"
+            );
+        });
+    }
+
     #[gpui_kit::test]
     fn install_applies_latte_palette(cx: &mut gpui_kit::TestAppContext) {
         cx.update(|cx| {

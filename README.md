@@ -1,4 +1,4 @@
-# Simple Media Player
+# <img src="assets/chroma.png" width="28" align="top" /> Simple Media Player
 
 一个用 Rust + [GPUI Kit](https://gpui-kit.com) 写的轻量桌面媒体播放器：单窗口、原生渲染、启动快，
 音频走 [rodio](https://github.com/RustAudio/rodio)，视频交给 mpv。
@@ -118,6 +118,9 @@ UI 测试把持久化目录重定向到临时目录（见 `persistence::set_conf
 | `settings.json` | 音量、窗口尺寸 |
 | `session.log` | 启动 / 退出 / panic / 播放失败原因留痕（用于区分「主动退出」与「被外部终止」） |
 
+设环境变量 `SMP_DATA_DIR=<目录>` 可以把整个配置目录挪走（便携模式 / 自动化）：
+截图脚本和拖放验收都靠它跑在临时目录里，免得写坏你正在用的播放列表。
+
 ## 架构
 
 ```
@@ -225,6 +228,32 @@ Windows 的点击热区就是 46 宽整块，图标 10px，悬停铺满底色、
 原因是视频模式的内容区整块被 mpv 叠加窗盖着，in-app toast 画在那里等于没画。
 通知层的默认位置（`TITLE_BAR_HEIGHT + 16`）会贴住窗口按钮下沿，宽度 382 在 1040 窗口里
 占 37%，所以 `theme::install` 里把 `margins.top` 改成「标题带 + 12」、宽度收到 320。
+
+### 字体
+
+界面字体取**系统自带**的那一套，不跟设计稿硬绑：
+
+| 平台 | 正文字体 | 等宽（时间码/序号） |
+|---|---|---|
+| Windows | `Microsoft YaHei UI` | `Consolas` |
+| macOS | `PingFang SC` | `Menlo` |
+| 其他 | `Noto Sans SC` | `DejaVu Sans Mono` |
+
+设计稿（Ardot）写的是 Inter / Noto Sans SC，但这两套 Windows 都不预装。之前写死
+`Noto Sans SC`，本机装过看着正常，发行包到别人机器上字体解析失败会退到系统兜底——
+中文常落到宋体，11px 下横细竖粗、笔画发糊。微软雅黑是 Vista 起自带的中文 UI 字体
+（`…UI` 是它的紧凑变体），资源管理器/设置页本身就是这套，中英混排最稳；
+用例 `ui_font_is_a_system_font_not_a_design_tool_font` 守着这个决定。
+
+### 应用图标
+
+`assets/chroma.ico` 由 `scripts/make-icon.py` 生成（品牌 Mauve 圆角方块 + 白色播放三角，
+和界面里那颗播放按钮同一个符号），多尺寸 16…256，改品牌色只改脚本。
+
+`crates/app/build.rs` 用 `embed-resource` 把它以 **ID = 1** 写进 exe 的 PE 资源，
+并附带 VERSIONINFO。ID 必须是 1：GPUI 的 Windows 后端注册窗口类时调的正是
+`LoadImageW(module, MAKEINTRESOURCE(1), IMAGE_ICON, …)`，拿不到就没有窗口图标，
+任务栏和 Alt+Tab 会显示系统占位图。找不到 `rc.exe`（没装 Windows SDK）时只告警、不失败。
 
 ### 与设计稿的两处刻意偏差
 

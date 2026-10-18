@@ -34,10 +34,17 @@ impl Default for Settings {
 
 /// 配置目录：Windows 上为 `%APPDATA%/simple-media-player`（与计划约定一致）。
 /// 其他平台回退 directories 标准路径。
+///
+/// 环境变量 `SMP_DATA_DIR` 可以整体顶掉它（便携模式 / 自动化）：
+/// 截图和拖放验证会起真实进程，若不隔离就会把用户正在用的播放列表改掉。
 pub fn config_dir() -> PathBuf {
     #[cfg(test)]
     if let Some(dir) = test_dir_override::current() {
         return dir;
+    }
+
+    if let Some(dir) = std::env::var_os("SMP_DATA_DIR") {
+        return PathBuf::from(dir);
     }
 
     #[cfg(target_os = "windows")]

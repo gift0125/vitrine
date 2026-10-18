@@ -66,8 +66,13 @@ const CAPTION_BUTTON_WIDTH: f32 = 46.0;
 const STATUS_PILL_DURATION: Duration = Duration::from_secs(4);
 /// 悬浮播放列表面板宽度（设计稿 320）。
 const PLAYLIST_WIDTH: f32 = 320.0;
-/// 时间码字体（设计稿用等宽）。
-const MONO_FONT: &str = "Consolas";
+/// 时间码字体（设计稿用等宽）：跟主题走，取平台原生的等宽族。
+///
+/// 写死 "Consolas" 在 macOS/Linux 上不存在，会退到非等宽字体，
+/// 时间码一跳动整行宽度就跟着抖。
+fn mono_font() -> &'static str {
+    crate::theme::mono_font_family()
+}
 /// 关闭按钮的悬停底色（Windows 原生的 #C42B1C）。
 const CLOSE_DANGER: u32 = 0xC42B1C;
 /// 标题栏控制图标（10×10 网格、1 单位描边 = 1 物理逻辑像素）。
@@ -1717,14 +1722,14 @@ impl PlayerView {
                     .justify_between()
                     .child(
                         div()
-                            .font_family(MONO_FONT)
+                            .font_family(mono_font())
                             .text_size(px(10.))
                             .text_color(overlay::fg())
                             .child(fmt_time(position)),
                     )
                     .child(
                         div()
-                            .font_family(MONO_FONT)
+                            .font_family(mono_font())
                             .text_size(px(10.))
                             .text_color(overlay::dim())
                             .child(format!("剩余 {}", fmt_time(remaining))),

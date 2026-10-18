@@ -372,6 +372,63 @@ GPUI 的拖放链路：系统投放 → `FileDropEvent::Entered { position, path
 
 ---
 
+### 🔤 字体与任务栏图标（2026-10-18 第四轮）
+
+用户问：「title 字体在 win 上默认是否用雅黑更好？在 win 的任务栏上显示时，没有 logo。」
+
+**1. 字体：设计稿的字体 Windows 不预装**
+
+`theme.rs` 里写死的是 `Noto Sans SC`（Ardot 设计稿用的）。本机装过这套字体，
+所以一直没暴露问题；但 Windows 出货不带它，发行包到用户机器上字体解析失败会退到
+系统兜底——中文常落到宋体，11px 下横细竖粗，和设计稿的观感完全不是一回事。
+
+改成按平台取**系统自带**的那一套：
+
+| 平台 | 正文 | 等宽 |
+|---|---|---|
+| Windows | `Microsoft YaHei UI` | `Consolas` |
+| macOS | `PingFang SC` | `Menlo` |
+| 其他 | `Noto Sans SC` | `DejaVu Sans Mono` |
+
+同时把 `player_view` 里写死的 `MONO_FONT = "Consolas"` 收进 `theme::mono_font_family()`——
+写死会让 macOS/Linux 退到非等宽字体，时间码一跳动整行宽度跟着抖。
+
+选型方法是三方截同一帧对比（`target/verify/font-compare3.png`）：Noto / Segoe UI 主族 /
+雅黑。Segoe 主族时 CJK 走系统回退，不同机器可能落到不同字体；雅黑主族则是确定的，
+中英混排都在同一套字面里。用例 `ui_font_is_a_system_font_not_a_design_tool_font` 守住
+「不许回退成设计稿专用字体」。
+
+**2. 任务栏没有 logo：PE 里没有 ID=1 的图标组**
+
+GPUI 的 Windows 后端注册窗口类时调的是
+`LoadImageW(module, MAKEINTRESOURCE(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED)`
+（`gpui-pre-windows` 的 `load_icon`）——**只认 ID = 1**。exe 里没有这条资源时它拿到空句柄，
+窗口类就没图标，任务栏/Alt+Tab 显示系统占位图。`WindowOptions.icon` 帮不上忙（x11 only）。
+
+做法：`assets/chroma.ico` 由 `scripts/make-icon.py` 生成（1024 超采样 → 16…256 多尺寸），
+`crates/app/build.rs` 用 `embed-resource` 把 `1 ICON …` + VERSIONINFO 编进 PE。
+找不到 `rc.exe`（没装 Windows SDK）时只 `cargo:warning` 不失败。
+
+踩到的坑：`fs::canonicalize` 返回的是 `\\?\C:\...` 扩展长度路径，直接塞进 `.rc`
+会被 rc 的字符串转义吃掉（`\\` 是转义序列），rc 报「找不到文件」而且不告诉你为什么。
+修法是去掉 `\\?\` 前缀并换成正斜杠。
+
+**验证**（三层，都不靠肉眼猜）：
+- PE 资源：`LoadLibraryExW(DATAFILE)` + `FindResourceW(1, RT_GROUP_ICON/RT_ICON/RT_VERSION)`
+  三个 ID 都存在（debug 与 release 都验过）。
+- 运行时：`GetClassLongPtrW(GCLP_HICON)` 非 0（`0x8DA0B95`），说明窗口类真的拿到了图标。
+- 观感：截任务栏，按 Mauve 色值定位到按钮，确认是「紫底 + 白三角」的 Chroma 图标。
+
+**3. 顺带：截图不再污染真实数据**
+
+`SMP_DATA_DIR` 环境变量可以把配置目录整体挪走（便携模式 / 自动化）。
+起因是这轮截图为了拍中文标题，直接改了 `%APPDATA%` 里的 `playlist.json`，
+把用户正在用的列表覆盖了——以后所有截图/验收都跑在 `target/verify/*` 的临时目录里。
+
+**测试** 15 + 18 全绿，clippy 0 告警。
+
+---
+
 ## 4. 里程碑与时间线
 
 | 里程碑 | 内容 | 累计工期 |
