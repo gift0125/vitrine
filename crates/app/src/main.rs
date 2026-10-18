@@ -7,6 +7,7 @@ mod assets;
 mod persistence;
 mod player_view;
 mod playlist;
+mod video_overlay;
 
 use gpui_kit::prelude::*;
 use gpui_kit::*;
