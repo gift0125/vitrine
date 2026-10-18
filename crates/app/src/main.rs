@@ -18,6 +18,7 @@ mod theme;
 #[cfg(test)]
 mod ui_tests;
 mod video_overlay;
+mod window_actions;
 
 use gpui_kit::prelude::*;
 use gpui_kit::*;

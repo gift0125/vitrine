@@ -154,6 +154,25 @@ GPUI 的 Windows 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`）
 3. GPUI 每帧用 `canvas` 回调报告视频区矩形，叠加窗口据此 `SetWindowPos` 跟随（缩放、全屏、影院模式都跟随）；
 4. 播放控制走 mpv 的 JSON IPC 命名管道。
 
+### 最大化 / 还原为什么自己实现
+
+`Window::zoom_window()` 的文档写的是 "Toggle zoom on the window"，但 Windows 后端的
+实现只有 `ShowWindowAsync(SW_MAXIMIZE)`（`gpui-pre-windows 0.3.9` 的 `zoom()`），
+**没有还原分支**——最大化之后再点那个按钮完全没反应。
+
+所以 `window_actions` 自己用 `IsZoomed` + `ShowWindowAsync(SW_MAXIMIZE / SW_RESTORE)` 切换：
+
+- 必须是 **Async**。同步的 `ShowWindow` 会在 GPUI 的事件派发内部重入 `WM_SIZE`，
+  而 GPUI 这一层不会因此重新布局——窗口真的变成 3840×2088，界面还画在 1040×680 上，
+  右边一大片空白、hitbox 全部错位，于是「再点一次」永远点不到按钮。
+- 代价是命令异步生效，调用后 `IsZoomed` 还是旧值，所以状态先乐观更新，
+  100ms 的 tick 里再校正（用户用 Aero Snap / Win+↑ / 双击标题栏改状态时也靠它发现）。
+- 双击标题栏本身不需要我们处理：标题带右侧的拖拽区映射成 `HTCAPTION`，
+  最大化/还原由 Windows 原生完成。
+
+顺带修掉一个持久化问题：最大化时窗口尺寸不再被当成「用户尺寸」写进设置
+（以前最大化后等 5 秒，下次启动就会按最大化尺寸开窗）。
+
 ### 视频上方为什么会「浮」着控件
 
 叠加窗口盖住整个窗口，所以视频模式的画面是**铺满整窗**的，标题带、胶囊、歌单要浮在画面上，
@@ -289,9 +308,10 @@ in-app toast 落在画面那块等于没画；标题带本来就在叠加窗之�
 所以还有两处看起来和设计稿不完全一致：
 
 1. **画面上的 chrome 是实心深色，不是毛玻璃**：设计稿的标题带/胶囊是「60% 黑 + 32px 模糊」。
-   真正的背景模糊需要看到下面的画面像素，而 GPUI 的 Windows 后端（DirectComposition +
-   `WS_EX_NOREDIRECTIONBITMAP`）不支持窗口级透明，只能退到实心 `overlay::canvas()`
-   （胶囊再叠一层 60% 的 `overlay::glass()`）。
+   当前画面由 mpv 画在**上面**那个叠加窗口里，而 GPUI 的 `WindowBackgroundAppearance::Blurred`
+   （Windows 后端映射到 `SetWindowCompositionAttribute` 的 acrylic）模糊的是窗口**背后**的内容，
+   看到的只会是桌面。要做真背景模糊得把视频窗放到主窗口**下面**（owned 窗口恒在 owner 之上，
+   得放弃 owner 关系自己管 z 序），成本远大于收益，暂不做。
 2. **歌单面板保持应用表面色（Latte 浅底）**：它压在画面上，用深色玻璃的话列表行的文字色
    得跟着换一套（`List` delegate 取的是主题 token），当前以可读性优先。
 

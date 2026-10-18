@@ -37,6 +37,7 @@ use crate::persistence::{self, Settings};
 use crate::playlist::PlaylistDelegate;
 use crate::theme::overlay;
 use crate::video_overlay::{self, Hole, Hwnd, VideoOverlay};
+use crate::window_actions;
 
 /// 进度条量程未知时的兜底（元数据解析失败）。
 const SEEK_FALLBACK_MAX: f32 = 600.0;
@@ -143,6 +144,18 @@ pub struct PlayerView {
     capsule_rect: VideoRectCell,
     /// GPUI 主窗口句柄（叠加窗口的 owner）
     main_hwnd: Hwnd,
+    /// 窗口是否最大化。
+    ///
+    /// 不用 `window.is_maximized()` 直接读：那个值本身是对的（`IsZoomed`），
+    /// 但**切换**不能走 `window.zoom_window()`（Windows 后端只最大化、不还原，
+    /// 见 `window_actions`）。自己缓存一份，tick 里比对，状态变化才重绘。
+    maximized: bool,
+    /// 最近一次「点了最大化/还原」的时刻。
+    ///
+    /// `set_zoomed` 是异步的（同步调用会在 GPUI 的事件派发里重入 `WM_SIZE`，
+    /// 界面不会跟着重新布局），所以紧接着读 `IsZoomed` 还是旧值。300ms 内不让
+    /// tick 反向纠正，图标就不会在点下去的一瞬间闪一下。
+    zoom_pending: Option<Instant>,
     /// 影院模式（隐藏歌单 + 系统全屏）
     cinema: bool,
     /// 悬浮播放列表面板是否展开（新版设计稿默认收起）
@@ -288,6 +301,7 @@ impl PlayerView {
 
         let video_rect: VideoRectCell = Rc::new(Cell::new(None));
         let capsule_rect: VideoRectCell = Rc::new(Cell::new(None));
+        let maximized = window.is_maximized();
 
         let this = Self {
             engine,
@@ -308,6 +322,8 @@ impl PlayerView {
             video_rect,
             capsule_rect,
             main_hwnd,
+            maximized,
+            zoom_pending: None,
             cinema: false,
             playlist_open: false,
             last_error: startup_errors.first().cloned(),
@@ -419,6 +435,22 @@ impl PlayerView {
             cx.notify();
         }
 
+        // 最大化状态：用户可能用系统的双击标题栏 / Aero Snap / 右键菜单改变它，
+        // 这些都不经过我们的按钮，所以每帧比对一次，变了才重绘（图标要换成「还原」）。
+        // 刚点过按钮的 300ms 内跳过——`set_zoomed` 是异步的，此刻还没生效。
+        const ZOOM_SETTLE: Duration = Duration::from_millis(300);
+        let pending = self
+            .zoom_pending
+            .is_some_and(|at| at.elapsed() < ZOOM_SETTLE);
+        if !pending {
+            self.zoom_pending = None;
+            let maximized = window_actions::is_zoomed(self.main_hwnd);
+            if maximized != self.maximized {
+                self.maximized = maximized;
+                cx.notify();
+            }
+        }
+
         // 影院模式只对视频成立：自动连播切到音频（或无视频可播）时必须退出全屏，
         // 否则影院按钮消失、用户被困在全屏里。
         if self.cinema && !self.video_active {
@@ -460,10 +492,11 @@ impl PlayerView {
         self.sync_overlay_rect(window);
 
         // 窗口尺寸节流落盘（变化后 ~5s 保存一次）
-        // 影院模式下 bounds 是全屏尺寸，不能当窗口尺寸存（否则下次启动开成全屏大小）。
+        // 影院模式下 bounds 是全屏尺寸、最大化时是最大化尺寸，都不能当窗口尺寸存
+        // （否则下次启动会开成全屏大小 / 贴着屏幕边）。
         let bounds = window.bounds();
         let size = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
-        if self.cinema || size == self.last_saved_size {
+        if self.cinema || self.maximized || size == self.last_saved_size {
             self.window_dirty_ticks = 0;
         } else {
             self.window_dirty_ticks += 1;
@@ -936,6 +969,25 @@ impl PlayerView {
         cx.notify();
     }
 
+    /// 最大化 / 还原。
+    ///
+    /// 不走 `window.zoom_window()`：Windows 后端那句只有 `ShowWindowAsync(SW_MAXIMIZE)`，
+    /// 没有还原分支，所以「最大化之后再点一次」什么都不会发生（用户就是这么发现的）。
+    /// 见 `crate::window_actions`。
+    fn toggle_maximize(&mut self, cx: &mut Context<Self>) {
+        let target = !self.maximized;
+        window_actions::set_zoomed(self.main_hwnd, target);
+        persistence::log_session(&format!(
+            "toggle_maximize: hwnd={} target={target}",
+            self.main_hwnd
+        ));
+        // 异步命令，此刻 IsZoomed 还是旧值：先乐观地更新，tick 里再校正
+        // （用户用 Aero Snap / Win+↑ / 双击标题栏改状态时只能靠 tick 发现）。
+        self.maximized = target;
+        self.zoom_pending = Some(Instant::now());
+        cx.notify();
+    }
+
     // ------------------------------------------------------------------
     // 播放列表操作（由 delegate / 按钮回调）
     // ------------------------------------------------------------------
@@ -1332,9 +1384,10 @@ impl PlayerView {
     }
 
     /// 顶部标题带：当前曲名 + 自绘窗口按钮（系统标题栏已在 main 里关掉）。
-    fn render_title_band(&self, window: &Window, cx: &Context<Self>) -> Div {
-        // 最大化时 Windows 会把"最大化"换成"还原"图标
-        let maximized = window.is_maximized();
+    fn render_title_band(&self, cx: &Context<Self>) -> Div {
+        // 自己缓存的最大化状态（切换不经过 GPUI，见 `toggle_maximize`）；
+        // 最大化时 Windows 会把「最大化」换成「还原」图标。
+        let maximized = self.maximized;
         let title = match self.current_track(cx) {
             Some(track) => match &track.artist {
                 Some(artist) if !artist.is_empty() => format!("{} · {}", track.title, artist),
@@ -1360,7 +1413,10 @@ impl PlayerView {
                     .flex()
                     .items_center()
                     .window_control_area(WindowControlArea::Drag)
-                    .on_double_click(|_, window, _| window.zoom_window())
+                    // 双击标题栏最大化/还原——同样不能走 `window.zoom_window()`
+                    .on_double_click(cx.listener(|this, _e, _window, cx| {
+                        this.toggle_maximize(cx);
+                    }))
                     .child(
                         div()
                             .text_size(px(11.))
@@ -1415,7 +1471,7 @@ impl PlayerView {
                         if maximized { "还原" } else { "最大化" },
                         false,
                         self.video_active,
-                        |_, window, _| window.zoom_window(),
+                        cx.listener(|this, _e, _window, cx| this.toggle_maximize(cx)),
                         cx,
                     ))
                     .child(caption_button(
@@ -2107,6 +2163,15 @@ impl PlayerView {
         self.video_active = on;
     }
 
+    /// 测试用：直接切「最大化」状态。
+    ///
+    /// 真实切换要 `ShowWindowAsync`（无头窗口没有原生句柄），这里只验
+    /// 「状态 → 按钮文案/图标」这一层——用户报的 bug 里，图标卡在「最大化」
+    /// 也是症状之一，所以按钮 label 必须跟着状态走。
+    pub(crate) fn test_set_maximized(&mut self, on: bool) {
+        self.maximized = on;
+    }
+
     /// 测试用：模拟一次用户可见提示，并立刻走 tick 里的分发逻辑。
     pub(crate) fn test_notify(
         &mut self,
@@ -2120,7 +2185,9 @@ impl PlayerView {
 }
 
 impl Render for PlayerView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    // `window` 目前没用上：最大化状态由 `self.maximized` 提供（切换不经过 GPUI），
+    // 其余需要 window 的动作都在事件回调里做。留着形参是因为 trait 要求。
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 拖放：GPUI 把系统的文件拖放转成内部拖拽（载荷类型是 ExternalPaths），
         // 松开时在鼠标下的元素上派发 MouseUp；把监听挂在根节点，整个窗口都是投放区。
         let drop_view = cx.weak_entity();
@@ -2153,7 +2220,7 @@ impl Render for PlayerView {
             .child(
                 v_flex()
                     .size_full()
-                    .child(self.render_title_band(window, cx))
+                    .child(self.render_title_band(cx))
                     .child(
                         h_flex()
                             .flex_1()
@@ -2225,6 +2292,8 @@ fn caption_button(
 
     div()
         .id(id)
+        // 注册进命中测试树：测试才能 `window.find("win-max").label()` 断言文案
+        .test_support()
         .w(px(CAPTION_BUTTON_WIDTH))
         // 高度写死成标题带高度，**不能用 `h_full()`**：外面那圈 `h_flex()` 没有显式高度
         // （高度由内容撑开），`height: 100%` 在不定高父级上会退化成 auto，

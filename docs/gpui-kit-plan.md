@@ -496,13 +496,27 @@ if msg == WM_LBUTTONDOWN {
 | 胶囊压在画面上 | 取样 (40, lh-60) 应为玻璃深色 | `(10,11,14)` |
 | 歌单悬浮 | 点列表键后取样面板内 | `(231,227,245)` 浅底，画面中心仍是画面 |
 | 最大化后仍然开洞 | 点最大化键后取样标题带 | 客户区 3840×2088，标题带仍 `(8,9,12)` |
+| 再点一次能还原 | 新几何下再点同一个按钮 | 客户区回到 1898×1189 |
 | 按住画面拖窗 | 真实鼠标拖 96px | 窗口位移 `(144,72)` |
 
 脚本还留了两个可复用的经验：逻辑尺寸要用**实测客户区**换算（`SetWindowPos` 设的是外框，
 1898÷1.5 = 1265 而不是 1280，按目标尺寸换算会整体偏几像素，点 28px 图标正好点进间隙）；
-GPUI 的命中测试认**真实光标**，`PostMessage` 的 lparam 不总被采信，交互验验收一律走
-`SetCursorPos` + `mouse_event`。还原最大化也别再点一次按钮（时序不稳，会被系统当成
-「拖最大化窗口」自动还原），直接 `ShowWindow(SW_RESTORE)` + `SetWindowPos` 定位。
+GPUI 的命中测试认**真实光标**，`PostMessage` 的 lparam 不总被采信，交互验收一律走
+`SetCursorPos` + `mouse_event`。
+
+第六轮又补了三条，都是「看起来像 bug、其实是测试环境」的坑：
+
+- **第一次点击只用来激活窗口**：脚本进程调 `SetForegroundWindow` 常被系统拒（只有前台
+  进程能抢焦点），于是第一次真实点击被消耗在激活上，事件到不了 GPUI（第一次点歌单没反应、
+  第二次点同一个按钮反而灵）。做法是先对着画面「预热」点一下（叠加窗当 `HTCAPTION` 处理，
+  没移动等于没发生），并打印 `GetForegroundWindow()` 确认。
+- **样片要够长**：仓库里的样片只有 5 秒，整套流程跑二十几秒，视频中途播完 → 叠加窗被隐藏，
+  后面的「按住画面拖窗」其实点在 GPUI 画布上，报假失败。脚本优先用现生成的 40 秒长片
+  （`mpv av://lavfi:testsrc2=... --o=target/verify-long.mp4`，不进仓库）。
+- **状态切换要等，不要 sleep**：`ShowWindowAsync` 排队 + DWM 最大化动画，固定 0.9s 偶尔
+  读到中间态（实测读到过 1898×2086）。改成轮询 `IsZoomed` + 客户区尺寸连续两次一致。
+- 再加一条：每次点击打印 `WindowFromPoint` 的窗口类——「点了没反应」时能立刻看出是
+  叠加窗的洞没挖对，还是事件根本没到 GPUI。
 
 **新增用例** `video_mode_floats_chrome_over_a_full_window_picture`：视频模式下舞台四边必须
 贴住窗口，胶囊/进度条落在舞台内部，展开歌单后舞台宽度一像素都不变——把「浮在上面」这件事
@@ -512,6 +526,59 @@ GPUI 的命中测试认**真实光标**，`PostMessage` 的 lparam 不总被采�
 所以 chrome 是实心深色而不是设计稿的毛玻璃；歌单面板仍用应用表面色（深底会让列表行文字不可读）。
 
 **测试** 15 + 19 全绿，clippy 0 告警。
+
+---
+
+### 🔁 最大化之后能点回来了（2026-10-18 第六轮）
+
+用户：「最大化之后，再点不能恢复原窗口大小。」（另问：GPUI 最新版支持窗口透明吗？）
+
+**根因：`zoom_window()` 在 Windows 上只最大化、不还原**
+
+```rust
+// gpui-pre-windows 0.3.9 / window.rs
+fn zoom(&self) {
+    ShowWindowAsync(self.0.hwnd, SW_MAXIMIZE);   // ← 没有还原分支
+}
+```
+
+而 `is_maximized()` 本身是对的（`!is_fullscreen() && IsZoomed(hwnd)`），
+所以图标会正确变成「还原」，点下去却毫无反应——这正是用户看到的现象。
+
+**自己实现，但第一版又踩了一个更深的坑**
+
+第一版：`IsZoomed` + 同步 `ShowWindow(SW_MAXIMIZE / SW_RESTORE)`。结果最大化之后
+「再点一次」依然点不到按钮。日志证明第二次点击根本没进回调，探针进一步发现：
+
+- 窗口真变成了 3840×2088（`GetClientRect` 这么报）；
+- 但界面还画在 1040×680 上，右边一大片空白，hitbox 全在旧位置。
+
+原因是**同步 `ShowWindow` 在 GPUI 的事件派发里重入 `WM_SIZE`**：GPUI 的 wndproc
+在鼠标回调中途被调用，这条尺寸变更没有走到「重新布局」那条路径，于是绘制/命中测试
+全停在旧尺寸。改成 `ShowWindowAsync`（命令投回消息队列，等当前事件派发结束后再处理）
+之后，布局正常跟上，点「还原」立刻回到 1898×1189。
+
+**代价与配套**
+
+- 异步 → 调用返回时 `IsZoomed` 还是旧值。所以 `maximized` 先乐观更新，
+  `zoom_pending` 记一笔时间，tick 在 300ms 内不做反向纠正（否则图标会闪一下）。
+- tick 每帧比对 `IsZoomed`：用户用 Aero Snap / Win+↑ / 右键菜单改状态时，
+  300ms 后图标自动跟上。
+- 双击标题栏不用管：拖拽区映射成 `HTCAPTION`，Windows 原生就做了最大化/还原
+  （实测确实不走我们的回调，日志里没有 toggle 记录）。
+- 顺带修了持久化：最大化时不再把最大化尺寸当成用户尺寸存下来。
+
+**测试** 15 + 20 全绿。新增 `maximize_button_reflects_window_state`（顺带给
+`caption_button` 加 `.test_support()`，否则 `window.find("win-max")` 找不到）。
+
+**关于「GPUI 最新版支持透明吗」**：不是版本问题。我们锁的这版（gpui-pre 0.3.6 /
+gpui-pre-windows 0.3.9）已经有 `WindowBackgroundAppearance::{Transparent, Blurred,
+MicaBackdrop, MicaAltBackdrop}`，非 Opaque 时渲染器会把后备缓冲清成 alpha 0，
+Windows 后端的 `Blurred` 走 `SetWindowCompositionAttribute(accent_state = 4)`
+（acrylic）。但它模糊的是窗口**背后**的内容，而视频画在**上面**那个叠加窗口里，
+所以对我们的场景无效。要让 chrome 真模糊视频，得把视频窗挪到主窗口下面
+（owned 窗口恒在 owner 之上，必须放弃 owner 关系自己管 z 序），属于重构级改动，
+这一轮没有做，也没必要为了 32px 的模糊去换。
 
 ---
 

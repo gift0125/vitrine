@@ -38,7 +38,14 @@ if not exe.is_absolute():
 # 验收产物落到 target/（不进仓库）；docs 里只保留两张正式截图
 out_dir = root / "target" / "verify-shots"
 out_dir.mkdir(parents=True, exist_ok=True)
-media = root / "test-media" / "gen-1080p.mp4"
+# 时长要够：整套流程要跑二十几秒，5 秒的样片会在中途播完 → 叠加窗被隐藏，
+# 后面的"按住画面拖窗"就变成"点在一块 GPUI 画布上"，假失败。
+# 仓库里的样片都只有 5 秒，所以这里优先用一段现生成的长片（不进仓库）：
+#   mpv av://lavfi:testsrc2=duration=40:size=1280x720:rate=24 \
+#       --o=target/verify-long.mp4 --ovc=libx264 --oac=libmp3lame --of=mp4
+media = root / "target" / "verify-long.mp4"
+if not media.exists():
+    media = root / "test-media" / "gen-1080p.mp4"
 
 user32 = ctypes.windll.user32
 user32.SetWindowPos.argtypes = [
@@ -50,6 +57,8 @@ user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
 user32.GetDpiForWindow.argtypes = [wintypes.HWND]
 user32.FindWindowW.restype = wintypes.HWND
+user32.WindowFromPoint.restype = wintypes.HWND
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
 
 # 数据目录隔离：不要碰用户真实的 playlist.json
@@ -108,10 +117,31 @@ cw0, ch0 = client_rect()
 lw, lh = cw0 / scale, ch0 / scale
 print(f"client = {cw0}x{ch0} 逻辑 = {lw:.1f}x{lh:.1f}  scale = {scale}")
 
+# 预热点击：应用刚从后台启动时，`SetForegroundWindow` 常常被系统拒绝
+# （只有前台进程才能抢焦点），于是第一次真实点击只用来「激活窗口」，
+# 事件到不了 GPUI（表现为"点了没反应"，第二次才灵）。
+# 先对着画面点一下把激活做掉——叠加窗会把它当成 HTCAPTION，没移动就等于没发生。
+user32.SetCursorPos(
+    client_origin()[0] + round(lw * 0.5 * scale),
+    client_origin()[1] + round(lh * 0.45 * scale),
+)
+time.sleep(0.2)
+user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+time.sleep(0.06)
+user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+time.sleep(0.5)
+fg = user32.GetForegroundWindow()
+print(f"前台窗口 = {fg}（主窗口 {hwnd}）→ {'OK' if fg == hwnd else '仍未获得焦点'}")
+
 
 def grab(path):
     cw, ch = client_rect()
     ox, oy = client_origin()
+    if cw < 8 or ch < 8:
+        # 客户区退化（窗口最小化 / 刚被搬走）时 ImageGrab 会给出空图并抛
+        # "cannot write empty image"，这里退成一张纯黑占位图，让取样判据自然报错。
+        print(f"  警告：客户区只有 {cw}x{ch}，截图退化")
+        return Image.new("RGB", (width, height), (0, 0, 0))
     img = ImageGrab.grab(bbox=(ox, oy, ox + cw, oy + ch))
     # 缩到实测逻辑尺寸：1 图素 = 1 逻辑像素
     want = (round(cw / scale), round(ch / scale))
@@ -128,7 +158,14 @@ def click(lx, ly):
     （这条踩过坑，记在项目备忘里）。这里窗口位置稳定，直接用真实输入。
     """
     ox, oy = client_origin()
-    user32.SetCursorPos(ox + round(lx * scale), oy + round(ly * scale))
+    sx, sy = ox + round(lx * scale), oy + round(ly * scale)
+    # 打一下这一点到底属于哪个窗口：叠加窗的洞没挖对时，点击会被 mpv 那一层吃掉，
+    # 表现为「点了没反应」，光看截图看不出来。
+    hit = user32.WindowFromPoint(wintypes.POINT(sx, sy))
+    buf = ctypes.create_unicode_buffer(128)
+    user32.GetClassNameW(hit, buf, 128)
+    print(f"  点击 逻辑({lx:.0f},{ly}) → 屏幕({sx},{sy}) 窗口={hit} 类='{buf.value}'")
+    user32.SetCursorPos(sx, sy)
     time.sleep(0.15)
     user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
     time.sleep(0.08)
@@ -141,6 +178,34 @@ def click(lx, ly):
 
 def sample(img, lx, ly):
     return img.getpixel((round(lx), round(ly)))
+
+
+def wait_zoomed(expected, timeout=2.5):
+    """等窗口真的进入/退出最大化。
+
+    不用固定 sleep：`ShowWindowAsync` 是排队的，最大化还有一段 DWM 动画，
+    0.9s 里偶尔能读到「宽度还没跟上」的中间态（实测读到过 1898×2086）。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if bool(user32.IsZoomed(hwnd)) == expected:
+            time.sleep(0.35)  # 等动画收尾
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def wait_client_settled(timeout=2.0):
+    """等客户区尺寸连续两次采样一致（避免读到动画中间态）。"""
+    last = client_rect()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        time.sleep(0.1)
+        now = client_rect()
+        if now == last:
+            return now
+        last = now
+    return last
 
 
 # ---- 1. 静止态：标题带 / 胶囊是否真的在画面之上 -------------------------
@@ -160,39 +225,46 @@ print(f"标题带下方 (.., 40) = {below_band}   ← 应为画面彩条")
 # 从右往左是 theme-toggle / cinema / toggle-playlist → 列表键圆心在 lw-122。
 # 走带行高 44，胶囊底 lh-24，下 padding 8 → 行中心 lh-54。
 click(lw - 122, lh - 54)
-time.sleep(0.5)
+time.sleep(0.6)
 img2 = grab(out_dir / "floating-02-playlist.png")
 panel_px = sample(img2, lw - 12 - 160, 120)
 print(f"歌单面板内 (.., 120) = {panel_px}   ← 应为面板底色（浅）")
 print(f"歌单展开后画面中心 = {sample(img2, lw / 2, lh / 2)}")
 
-# ---- 3. 最大化：区域不会跟着 SetWindowPos 自动缩放，必须重算 -------------
+# ---- 3. 最大化 / 再点一次还原 -----------------------------------------
 # 三个窗口按钮各 46 宽，从右往左是 close / max / min → 最大化键圆心在 lw-69。
+# 用户报的 bug 就是这里：最大化之后再点没反应（GPUI 的 `zoom_window()` 在
+# Windows 后端只有 SW_MAXIMIZE，没有还原分支），所以这一项必须走真实点击。
+before_max = (cw0, ch0)
 click(lw - 69, 17)
-time.sleep(0.9)
-cw1, ch1 = client_rect()
+wait_zoomed(True)
+cw1, ch1 = wait_client_settled()
 lw, lh = cw1 / scale, ch1 / scale
 img_max = grab(out_dir / "floating-03-maximized.png")
 max_band = sample(img_max, 8, 17)
 max_mid = sample(img_max, lw / 2, lh / 2)
 print(f"最大化后 client = {cw1}x{ch1}；标题带 (8,17) = {max_band}；画面中心 = {max_mid}")
 
-# 还原用 ShowWindow(SW_RESTORE) 而不是再点一次按钮：点按钮会走 GPUI 那层，
-# 时序不稳（上一步就出现过没还原成功、拖动时被系统当成"拖最大化窗口"还原）。
-user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-time.sleep(0.4)
-user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, phys_w, phys_h, SWP_SHOWWINDOW)
-time.sleep(0.8)
-cw0, ch0 = client_rect()
-lw, lh = cw0 / scale, ch0 / scale
-print(f"还原后 client = {cw0}x{ch0}")
+click(lw - 69, 17)
+wait_zoomed(False)
+cw2, ch2 = wait_client_settled()
+print(f"再点一次后 client = {cw2}x{ch2}（原始 {before_max[0]}x{before_max[1]}）")
+lw, lh = cw2 / scale, ch2 / scale
 
 # ---- 4. 按住画面拖动窗体 ----------------------------------------------
 before = window_rect()
 ox, oy = client_origin()
 start = (ox + round(lw * 0.5 * scale), oy + round(lh * 0.45 * scale))
+# 光标本来就在附近时先挪开再回来：`SetCursorPos` 到同一个点不产生 WM_MOUSEMOVE，
+# 叠加窗就不知道鼠标进来了，随后的 LEFTDOWN 可能被系统当成「在窗外按下」。
+user32.SetCursorPos(start[0] - 40, start[1])
+time.sleep(0.1)
 user32.SetCursorPos(*start)
-time.sleep(0.15)
+time.sleep(0.2)
+hit = user32.WindowFromPoint(wintypes.POINT(*start))
+buf = ctypes.create_unicode_buffer(128)
+user32.GetClassNameW(hit, buf, 128)
+print(f"拖拽起点 屏幕{start} 窗口={hit} 类='{buf.value}'")
 user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
 time.sleep(0.15)
 for step in range(1, 9):
@@ -224,6 +296,11 @@ if sum(max_band[:3]) > 200:
     ok = False
 else:
     print(f"OK: 最大化后标题带仍是挖出来的深色 {max_band}")
+if (cw2, ch2) != before_max:
+    print(f"FAIL: 再点一次没还原：{cw2}x{ch2} vs 原始 {before_max[0]}x{before_max[1]}")
+    ok = False
+else:
+    print(f"OK: 再点一次还原回 {cw2}x{ch2}")
 if dx == 0 and dy == 0:
     print("FAIL: 按住画面没有拖动窗口")
     ok = False

@@ -47,6 +47,9 @@
 - **拖放不弹提示**：拖进来这个动作本身就是意图，画面换了就是回执。只保留「没有可播放的媒体文件」这类真失败提示。
 - **验收取样要用实测客户区换算**：`SetWindowPos` 设的是外框，实测 1898×1189 物理 ÷1.5 = 1265×793 而非设的 1280×800；按目标尺寸换算整体偏几像素，点 28px 图标正好点进间隙（`scripts/verify_floating_chrome.py` 里记了这条）。
 - **洞露出来的是不透明画布，不是画面**：GPUI Windows 后端（DComp + `WS_EX_NOREDIRECTIONBITMAP`）不支持窗口级透明，所以设计稿的"60% 黑 + 模糊"退成实心深色；歌单面板保持 Latte 浅底（改深底会让 `List` 的行文字不可读，颜色取主题 token）。
+- **`Window::zoom_window()` 在 Windows 上只最大化、不还原**（`gpui-pre-windows 0.3.9` 的 `zoom()` 只有 `ShowWindowAsync(SW_MAXIMIZE)`）→ 自己写 `window_actions::{is_zoomed, set_zoomed}`。**必须用 `ShowWindowAsync`**：同步 `ShowWindow` 会在 GPUI 的事件派发里重入 `WM_SIZE`，窗口变大了但界面还画在旧尺寸、hitbox 全错位（表现为"再点一次最大化/还原永远点不到按钮"）。异步的代价是调用后 `IsZoomed` 仍是旧值 → 状态先乐观更新 + `zoom_pending` 300ms 内不让 tick 反向纠正。
+- **双击标题栏不用自己实现**：标题栏拖拽区映射成 `HTCAPTION`，Windows 原生就做最大化/还原，`on_double_click` 根本不会被调用（日志可证）。
+- **GPUI 有窗口透明/模糊能力，但对我们的视频场景无用**：`WindowBackgroundAppearance::{Transparent, Blurred, MicaBackdrop}` 在 gpui-pre 0.3.6 就有（`WindowOptions.window_background`，非 Opaque 时清 alpha 0，Windows 的 `Blurred` → `SetWindowCompositionAttribute` acrylic），但模糊的是窗口**背后**的内容，而 mpv 画在**上面**的叠加窗里。要真模糊视频得反转 z 序（放弃 ownership 自己管 z 序），属重构。
 
 
 ## 设计稿要点（详见 2026-10-17 / 2026-10-18 日志）

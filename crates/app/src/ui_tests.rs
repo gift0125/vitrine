@@ -556,6 +556,39 @@ fn dropping_files_adds_them_and_starts_playback(cx: &mut TestAppContext) {
     });
 }
 
+/// 最大化状态下，窗口按钮必须换成「还原」。
+///
+/// 回归的是用户报的那个 bug 的一半：切换只发生在 GPUI 之外的 Win32 调用里
+/// （`ShowWindowAsync`），如果图标文案还读 `window.is_maximized()` 或干脆写死，
+/// 用户看到的就是「最大化之后按钮还是最大化」。
+#[gpui_kit::test]
+fn maximize_button_reflects_window_state(cx: &mut TestAppContext) {
+    fresh_dir("zoom-label");
+    let (window, view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("win-max").label(),
+            Some("最大化"),
+            "普通状态下按钮应提示「最大化」"
+        );
+
+        view.update(cx, |view, _| view.test_set_maximized(true));
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("win-max").label(),
+            Some("还原"),
+            "最大化后按钮必须变成「还原」，否则用户不知道还能点回来"
+        );
+
+        view.update(cx, |view, _| view.test_set_maximized(false));
+        window.render_frame(cx);
+        assert_eq!(window.find("win-max").label(), Some("最大化"));
+    })
+    .unwrap();
+}
+
 // ----------------------------------------------------------------------
 // 提示：视频模式不能用 in-app toast（被 mpv 叠加窗盖住）
 // ----------------------------------------------------------------------
