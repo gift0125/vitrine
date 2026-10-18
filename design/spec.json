@@ -482,8 +482,8 @@
     "docs/capsule-compare.png 的「画布 L3」那一半取自已删除的视频帧，属历史对照，无法再重生成；L3 的现状以 HTML 原型为准。"
   ],
   "texture_layers": {
-    "status": "已定稿 L3（2026-10-18）。**画布上已无视频帧**（2026-10-18 晚删除），L3 的唯一定义处是 `preview/index.html` + 本段参数；HTML 原型默认档位 = L3。L4（液态玻璃）同日做进 HTML，是实验档、默认关闭。",
-    "note": "控制栏质感的层次，按依赖顺序叠加。L1 纯样式即可（GPUI 今天就能做）；L2 需要一次画面取色；L3 依赖架构改造；L4 在 L3 之上，额外要求「区域对位采样」（现在的 L3 是整块缩略图铺满胶囊，不对位就做不了折射）。HTML 原型里用 ?layers=enh,tint,realblur 逐层预览，或点工具条切档；L4 用 ?liquid=edge|full。",
+    "status": "已定稿 L3（2026-10-18），并在同日升级为 **L3 + L4 边缘折射**（液态玻璃默认档 edge）。**画布上已无视频帧**，这两层的唯一定义处是 `preview/index.html` + 本段参数。",
+    "note": "控制栏质感的层次，按依赖顺序叠加。L1 纯样式即可（GPUI 今天就能做）；L2 需要一次画面取色；L3 依赖架构改造；L4 在 L3 之上，额外要求「区域对位采样」（现在的 L3 是整块缩略图铺满胶囊，不对位就做不了折射），并且覆盖三块玻璃面（胶囊 / OSD / 歌单）。HTML 原型里用 ?layers=enh,tint,realblur 逐层预览，或点工具条切档；L4 用 ?liquid=edge|full，默认 edge。",
     "L1_directional_light": {
       "capsule_background": "linear-gradient(180deg, rgba(26,28,40,.60) 0%, rgba(11,12,16,.74) 100%)",
       "border": "1px rgba(255,255,255,.14)",
@@ -574,8 +574,13 @@
       }
     },
     "L4_liquid_glass": {
-      "status": "实验（2026-10-18 晚）。只在 HTML 原型里，Rust 侧未做。默认档仍是 L3。",
+      "status": "**默认档**（2026-10-18 定，`edge`）。只在 HTML 原型里，Rust 侧未做。",
       "what": "在 L3 之上加 2D 位移映射：边缘带把背景沿法线往外拉几 px，做出玻璃斜边的折射；full 档再加 Fresnel 贴边高光与 R/B 分离。对应 iOS 26 Liquid Glass / 鸿蒙「沉浸光感」。",
+      "surfaces": [
+        { "target": "控制胶囊", "radius": 14, "band": 14, "maxd": 6.5, "polarity": "dark" },
+        { "target": "视频信息 OSD", "radius": 12, "band": 14, "maxd": 6.5, "polarity": "dark" },
+        { "target": "播放列表", "radius": 14, "band": 18, "maxd": 7.0, "polarity": "light" }
+      ],
       "params": {
         "band": 14,
         "maxd": 6.5,
@@ -584,21 +589,27 @@
         "radius": 14,
         "dispersion": 0.07,
         "fresnel_span": 0.45,
-        "fresnel_strength": 0.48,
-        "inner_shade": 0.24
+        "fresnel": 0.48,
+        "fresnel_light": 0.22,
+        "inner_shade": 0.24,
+        "inner_shade_light": 0.10,
+        "light_veil_body": 0.87,
+        "light_veil_rim": 0.93
       },
       "math": "圆角矩形 SDF：q=abs(p-c)-(half-R)；d=length(max(q,0))+min(max(qx,qy),0)-R；法线直边取轴向、圆角取径向；t=clamp(-d/band,0,1)；m=maxd*(1-t)²；采样点 = p+n·m",
       "why_two_blurs": "体部必须和 L3 的 32 同档，否则一开液体玻璃整块变清，像换了材质；边圈用 7px 才有东西可弯——真实玻璃的边是斜的、看过去通透。位移量与「清亮」共用 (1-t)² 一条曲线，物理上是同一件事：斜边厚度。",
-      "layer_order": "z0 canvas（不透明折射层）→ z1 ::before（染色 + 自适应压暗）→ z2 内容 → z3 ::after（1px 顶亮底暗）。canvas 是不透明子节点，会整块盖掉元素自己的 background，所以压暗必须搬到 z1 —— 放在 .capsule 上等于没写。",
-      "canvas_is_replaced": "canvas 是替换元素：只给 inset:0 不管用，width:auto 会退回属性里的 1520×184，按 2 倍铺到胶囊外面。必须显式 width/height:100%，尺寸才等于 padding box（758×90）。",
-      "adaptive_scrim": "scrim = min(.72, .42 + .85·max(0, meanL-0.30))；meanL 取胶囊区域 30px 模糊底的相对亮度均值。只压暗不改前景色（改前景要动一堆子元素，收益一样）。",
+      "polarity": "暗底（胶囊 / OSD）要「自适应压暗」：scrim = min(.72, .42 + .85·max(0, meanL-.30))，另加 0.45·scrim 的平铺底，否则只有渐变的话顶部不压、11px 正文在亮画面上先糊。浅底（歌单）反过来「铺奶白」：veil = clamp(.72, .94, .87 + .40·max(0, .42-meanL))，且**边圈不减薄（0.93）**——一薄就把深色画面透出来，看着像没擦干净的一圈灰。",
+      "layer_order": "z0 canvas（不透明折射层）→ z1 ::before（染色 + 自适应压暗）→ z2 内容 → z3 ::after（1px 顶亮底暗）。canvas 是不透明子节点，会整块盖掉元素自己的 background，所以压暗必须搬到 z1 —— 放在面元素上等于没写。",
+      "canvas_is_replaced": "canvas 是替换元素：只给 inset:0 不管用，width:auto 会退回属性里的 intrinsic 尺寸，按 2 倍铺到面板外面。必须显式 width/height:100%，尺寸才等于 padding box。",
+      "geometry": "位置一律按「相对窗口的 getBoundingClientRect ÷ 当前缩放比」算。offsetLeft 那套只对居中的胶囊成立，面板是 right:24 对齐的会错；fit() 缩放时也要除。",
       "rejected": [
         "金属边框 / 内描边：刚从窗口上删掉描边，不能又加回来",
         "iOS 的 8px 位移 + 14px 带：压在视频上比压在壁纸上激进得多，11px 时间码先糊；先按 6.5 走",
+        "浅底玻璃把体部做透（veil < .7）：正文是深色 #4C4F69，暗画面上对比度会掉到 3.6:1，11px 站不住",
         "metaball 融合与气态消散：要 3D 光照和流体，收益远小于成本"
       ],
-      "verify": "?liquid=edge|full 切档（工具条也有）；?card=1 高频测试卡（竖线看水平位移）；?glassdbg=1 只看位移场（白=贴边 maxd → 黑=带内沿 0）",
-      "cost": "760×92 @2x ≈ 27 万像素，每像素 1~3 次双线性采样；只在胶囊位置/尺寸变化时重算一次，不是每帧",
+      "verify": "?liquid=edge|full（默认 edge，off 才关，工具条也有）；?card=1 高频测试卡（竖线看水平位移）；?glassdbg=1 只看位移场（白=贴边 maxd → 黑=带内沿 0）",
+      "cost": "三块面全开 ≈ 27 万像素 / 46ms（Chrome，2x buffer），只在胶囊位置变化或开合面板时算一次，不是每帧",
       "win_note": "sw render 出来的帧本来就是 BGRA 内存，CPU 做折射是顺路；上 GPU 反而要多一次 CPU→GPU→CPU 往返（GPUI img() 只吃 image::Frame 的 CPU 像素）"
     }
   }

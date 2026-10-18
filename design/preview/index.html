@@ -322,40 +322,67 @@ body{
      z3  ::after         —— 1px 顶亮/底暗
 */
 /* canvas 是**替换元素**：`inset:0` 顶不住它——width:auto 会退回属性里的
-   intrinsic 尺寸（1520×184），结果它按 2 倍大小铺到胶囊外面去。
-   必须显式给 100%，尺寸才等于胶囊的 padding box。 */
-.capsule > .glass{display:none;position:absolute;left:0;top:0;width:100%;height:100%;z-index:0;pointer-events:none}
-.mode-liquid .capsule > .glass{display:block}
-.mode-liquid .capsule > .progress,
-.mode-liquid .capsule > .controls{position:relative;z-index:2}
+   intrinsic 尺寸（1516×180），结果它按 2 倍大小铺到面板外面去。
+   必须显式给 100%，尺寸才等于面板的 padding box。 */
+.osd > .glass,.capsule > .glass,.playlist > .glass{
+  display:none;position:absolute;left:0;top:0;width:100%;height:100%;z-index:0;pointer-events:none}
+.mode-liquid .osd > .glass,
+.mode-liquid .capsule > .glass,
+.mode-liquid .playlist > .glass{display:block}
+/* 内容压在折射层之上：玻璃可以扭，字必须锐 */
+.mode-liquid .osd > *:not(.glass),
+.mode-liquid .capsule > *:not(.glass),
+.mode-liquid .playlist > *:not(.glass){position:relative;z-index:2}
 
-.mode-liquid .capsule{
+/* ---------- 暗底玻璃：控制胶囊 / 视频信息 ---------- */
+.mode-liquid .capsule,.mode-liquid .osd{
   /* canvas 还没就绪时的兜底底色；就绪后被 canvas 全覆盖 */
   background:rgba(11,12,16,.55);
   backdrop-filter:none;-webkit-backdrop-filter:none;
-  /* 不靠硬边框立形：形状交给 Fresnel + 下面这条内阴影，边框只留一丝 */
+  /* 不靠硬边框立形：形状交给 Fresnel + 下面那条内阴影，边框只留一丝 */
   border-color:rgba(255,255,255,.12);
   box-shadow:
     0 2px 8px rgba(0,0,0,.24),
     0 18px 48px rgba(0,0,0,.34);
 }
-/* 画面色 + 自适应压暗：--scrim 由 JS 按底亮度算（亮底压得狠，暗底几乎不压） */
-.mode-liquid .capsule::before{
+/* 画面色 + 自适应压暗：--scrim 由 JS 按底亮度算（亮底压得狠，暗底几乎不压）。
+   第二层是**平铺的薄压暗**：只有渐变的话顶部几乎不压，而 OSD 顶部也压着 11px 正文，
+   亮画面上会先糊在那里。0.45 这一档让顶底都有底，又不至于把画面糊死。 */
+.mode-liquid .capsule::before,.mode-liquid .osd::before{
   content:"";position:absolute;inset:0;border-radius:inherit;z-index:1;pointer-events:none;
-  background:linear-gradient(180deg,
-    rgba(var(--tint),.18) 0%,
-    rgba(var(--tint),.07) 50%,
-    rgba(11,12,16,var(--scrim,.30)) 100%);
+  background:
+    linear-gradient(180deg,
+      rgba(var(--tint),.18) 0%,
+      rgba(var(--tint),.07) 50%,
+      rgba(11,12,16,var(--scrim,.30)) 100%),
+    rgba(11,12,16, calc(var(--scrim, .30) * .45));
 }
 /* 1px 顶亮/底暗必须画在最上面：canvas 是子节点，会盖掉元素自己的 inset 阴影 */
-.mode-liquid .capsule::after{
+.mode-liquid .capsule::after,.mode-liquid .osd::after{
   content:"";position:absolute;inset:0;border-radius:inherit;z-index:3;pointer-events:none;
   box-shadow:inset 0 1px 0 rgba(255,255,255,.28), inset 0 -1px 0 rgba(0,0,0,.30);
 }
 
+/* ---------- 浅底玻璃：播放列表 ----------
+   浅底不能照搬"压暗"那套：正文是深色，底越暗越难读。所以反过来——
+   奶白底由 shader 按 (1-t)² 铺（体部 0.87 / 边缘收到 0.53，边圈更透），
+   边框与投影都收一档，免得浅面板被一圈亮线封住。 */
+.mode-liquid .playlist{
+  background:transparent;
+  backdrop-filter:none;-webkit-backdrop-filter:none;
+  border-color:rgba(188,192,204,.45);
+  box-shadow:
+    0 2px 8px rgba(0,0,0,.16),
+    0 18px 48px rgba(0,0,0,.26);
+}
+.mode-liquid .playlist::after{
+  content:"";position:absolute;inset:0;border-radius:inherit;z-index:3;pointer-events:none;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.55), inset 0 -1px 0 rgba(0,0,0,.10);
+}
+
 /* ?glassdbg=1：只留位移场，把染色和 1px 边都关掉，不然看不清场本身 */
-.glassdbg .capsule::before{background:none}
-.glassdbg .capsule::after{box-shadow:none}
+.glassdbg .capsule::before,.glassdbg .osd::before,.glassdbg .playlist::before{background:none}
+.glassdbg .capsule::after,.glassdbg .osd::after,.glassdbg .playlist::after{box-shadow:none}
 
 /* ============================================================
    模拟 Win 实现（mode = "noblur"）：拿不到区域级 backdrop blur，
@@ -432,8 +459,7 @@ body.bare .traffic,body.bare .title,body.bare .capsule,body.bare .mask-bottom{tr
 
       <!-- 控制栏 -->
       <div class="capsule">
-        <!-- 折射层：由 JS 逐像素算出来（无 shader、纯 Canvas），内容全在它上面 -->
-        <canvas class="glass" aria-hidden="true"></canvas>
+        <!-- 折射层 <canvas class="glass"> 由 JS 插到第一个子节点（三块玻璃面同一套） -->
         <!-- 进度区 -->
         <div class="progress">
           <div class="times">
@@ -557,8 +583,8 @@ body.bare .traffic,body.bare .title,body.bare .capsule,body.bare .mask-bottom{tr
       <button data-layers="noblur">Win 现状（无模糊）</button>
     </div>
     <div class="seg" id="segLiquid">
-      <button data-liquid="off" class="on">液态玻璃：关</button>
-      <button data-liquid="edge">+边缘折射</button>
+      <button data-liquid="off">液态玻璃：关</button>
+      <button data-liquid="edge" class="on">+边缘折射 · 默认</button>
       <button data-liquid="full">+高光/色散</button>
     </div>
     <span class="tintout">播放后 2.5s 不动鼠标 → 控制层淡出（按播放键试）</span>
@@ -717,14 +743,31 @@ segMode.addEventListener('click', e => {
 
 /* 参数：都写在这里，Rust 侧照抄这一组 */
 const GLASS = {
-  band: 14,     // 边缘带宽度（逻辑 px）：只有这圈会折射
-  maxd: 6.5,    // 最大位移（逻辑 px）：比 iOS 保守，因为我们压在视频上不是壁纸
   blur: 30,     // 体部模糊半径：**必须和 L3 的 backdrop-blur(32px) 同一档**，
                 // 否则一开液态玻璃整块变清，看着像换了种材质，而不是加了一层折射
   blurRim: 7,   // 边缘带的模糊半径：真实玻璃的边是斜的、看过去通透，
                 // 于是体部霜面 + 边圈清亮 —— 这才是"玻璃"，不是"更狠的模糊"
-  radius: 14    // 与 --cap-r 一致，用来算圆角矩形 SDF
+  fresnelSpan: 0.45,  // 高光只贴最外这段（t < span），否则整圈糊成一条白边
+  fresnel: 0.48,      // 暗底的高光强度
+  fresnelLight: 0.22, // 浅底弱一档：白上加白没意义，只留顶部一丝
+  innerShade: 0.24,   // 内侧一圈微暗：玻璃有厚度，不是一张纸
+  innerShadeLight: 0.10,
+  dispersion: 0.07,   // R/B 分离比例（只有 full 档用）
+  lightVeil: 0.87,    // 浅底玻璃体部的奶白不透明度
+  lightVeilRim: 0.93  // 贴边反而更实一点 = 更亮：浅底的边圈**不能**减薄，
+                      // 一减薄就把下面的深色画面透出来，看着像没擦干净的一圈灰
 };
+
+/* 三块玻璃面。polarity 决定"底子往哪边靠"：
+     dark  压在画面上，必须能压暗，否则 11px 小字在亮画面里站不住；
+     light 浅色面板（歌单），正文是深色，要奶白底——边缘反而更透，透视感靠那圈。
+   band / maxd 按面积给：歌单 320×633 比胶囊大一圈，带子和位移都放大一点，
+   否则这么大的面看着像一圈没擦干净的边。 */
+const SURFACES = [
+  { sel:'.capsule',  radius:14, band:14, maxd:6.5, polarity:'dark'  },
+  { sel:'.osd',      radius:12, band:14, maxd:6.5, polarity:'dark'  },
+  { sel:'.playlist', radius:14, band:18, maxd:7.0, polarity:'light' }
+];
 
 /* ?glassdbg=1 —— 只画位移量（0→黑 / maxd→白），用来确认折射场真的存在、
    方向对不对、圆角处的法线是否连续。调参时最有用的一个视图。 */
@@ -736,16 +779,26 @@ var glassBgReady = false;
 var glassBgSoft = null;          // { data, w, h }：体部用的 30px 模糊底
 var glassBgRim = null;           // { data, w, h }：边圈用的 7px 模糊底
 var glassBusy = false;
+var glassBgStamp = 0;            // 底图重烘一次就 +1，用来作废缓存
 
-const capEl = document.querySelector('.capsule');
-const glassCanvas = capEl.querySelector('.glass');
 const glassOut = document.getElementById('liquidOut');
+
+/* canvas 由 JS 插到每个面的第一个子节点：HTML 里手写三份容易漏，也保证 z0 在最底 */
+const surfaces = SURFACES.map(cfg => {
+  const el = document.querySelector(cfg.sel);
+  if(!el) return null;
+  const c = document.createElement('canvas');
+  c.className = 'glass';
+  c.setAttribute('aria-hidden', 'true');
+  el.prepend(c);
+  return Object.assign({ el, canvas: c }, cfg);
+}).filter(Boolean);
 
 /* 把静帧按 background-size:cover 的规则铺进 1280×800 再模糊。
    这一步是整套东西的前提：**对位采样**——拿到的像素和屏幕上那块位置一一对应。
    现在代码里的 L3 是"整块缩略图铺满胶囊"，不对位，所以做不了折射。
    出两份：soft 给体部（霜面），rim 给边缘带（清亮，才看得出被弯）。
-   真机上不必存两份像素：GL 里一次降采样出两级 mip 就行。 */
+   三块玻璃面共用这两份像素，真机上一次降采样出两级 mip 即可。 */
 function buildGlassBackdrop(img){
   const W = 1280, H = 800;
   const s = Math.max(W / img.width, H / img.height);
@@ -761,6 +814,8 @@ function buildGlassBackdrop(img){
   glassBgSoft = bake(GLASS.blur);
   glassBgRim = bake(GLASS.blurRim);
   glassBgReady = true;
+  glassBgStamp++;
+  for(const s of surfaces) s.sig = null;   // 底子换了，全部重画
   renderGlass();
 }
 
@@ -779,34 +834,45 @@ function glassSample(x, y, out, src){
   out[2] = d[i00+2] * w00 + d[i10+2] * w10 + d[i01+2] * w01 + d[i11+2] * w11;
 }
 
-function renderGlass(){
-  if(!glassMode || !glassBgReady || glassBusy) return;
-  glassBusy = true;
+/* 画一块玻璃面。返回 false = 这块没显示（面板没开），跳过 */
+function renderSurface(s){
+  const W = s.el.clientWidth, H = s.el.clientHeight;
+  if(!W || !H) return false;
 
-  // 尺寸用 padding box（= canvas 的 100%），再加回 1px 描边才是它的窗口坐标
-  const W = capEl.clientWidth, H = capEl.clientHeight;
-  const bw = (capEl.offsetWidth - W) / 2, bh = (capEl.offsetHeight - H) / 2;
-  // left:50% + translateX(-50%)：offsetLeft 是"50%"那个值，视觉左沿要减半宽
-  const x0 = capEl.offsetLeft - capEl.offsetWidth / 2 + bw;
-  const y0 = capEl.offsetTop + bh;
+  /* 位置一律按"相对窗口的坐标 ÷ 当前缩放比"算：
+     居中（胶囊）、贴边（面板）、窗口被 fit() 缩过，三种情况同一个公式。
+     offsetLeft 那套只对居中生效，面板是 right:24 对齐的，会错。 */
+  const wr = win.getBoundingClientRect();
+  const er = s.el.getBoundingClientRect();
+  const scale = wr.width / 1280 || 1;
+  const bx = (s.el.offsetWidth - W) / 2, by = (s.el.offsetHeight - H) / 2;  // 1px 描边
+  const x0 = (er.left - wr.left) / scale + bx;
+  const y0 = (er.top - wr.top) / scale + by;
 
   const st = Math.min(2, window.devicePixelRatio || 1);
+  /* 缓存：位置/尺寸/倍率/档位/底图都没变就不用重画。
+     开合一个面板会把三块面全刷一遍（≈130ms），实际只有变的那块需要算。 */
+  const sig = `${glassMode}|${W}x${H}|${Math.round(x0)},${Math.round(y0)}|${st}|${glassBgStamp}`;
+  if(s.sig === sig) return false;
+
   const cw = Math.round(W * st), ch = Math.round(H * st);
-  if(glassCanvas.width !== cw || glassCanvas.height !== ch){
-    glassCanvas.width = cw; glassCanvas.height = ch;
+  if(s.canvas.width !== cw || s.canvas.height !== ch){
+    s.canvas.width = cw; s.canvas.height = ch;
   }
-  const ctx = glassCanvas.getContext('2d');
+  const ctx = s.canvas.getContext('2d');
   const frame = ctx.createImageData(cw, ch);
   const out = frame.data;
 
-  const R = GLASS.radius, hw = W / 2, hh = H / 2;
+  const R = s.radius, hw = W / 2, hh = H / 2;
   const cx = x0 + hw, cy = y0 + hh;
   const full = glassMode === 'full';
+  const light = s.polarity === 'light';
+  const band = s.band, maxd = s.maxd;
   const _c = [0, 0, 0];
 
-  /* 自适应压暗：折射层是亮的还是暗的取决于底下的画面。
-     底越亮，越需要一层暗底把 11px 小字托住（鸿蒙那套叫"智能反色"，
-     我们先用"自适应压暗"，因为改前景色要动一堆子元素的色值，收益一样）。 */
+  /* 自适应：折射层是亮是暗取决于底下的画面。
+     暗底面 → 压暗（底越亮压得越狠，11px 时间码是这套材质里最脆的东西）；
+     浅底面 → 反过来铺奶白（底越暗铺得越实，正文是深色的）。 */
   let sum = 0, cnt = 0;
   for(let sy = 0; sy < H; sy += 4){
     for(let sx = 0; sx < W; sx += 4){
@@ -816,9 +882,9 @@ function renderGlass(){
     }
   }
   const meanL = cnt ? sum / cnt : 0;
-  // 底越亮越要压暗：11px 等宽时间码是这套材质里最脆的东西
   const scrim = Math.min(0.72, 0.42 + 0.85 * Math.max(0, meanL - 0.30));
-  capEl.style.setProperty('--scrim', scrim.toFixed(3));
+  const veil = Math.min(0.94, Math.max(0.72, GLASS.lightVeil + 0.40 * Math.max(0, 0.42 - meanL)));
+  if(!light) s.el.style.setProperty('--scrim', scrim.toFixed(3));
 
   for(let oy = 0; oy < ch; oy++){
     const wy = y0 + (oy + 0.5) / st;
@@ -828,32 +894,32 @@ function renderGlass(){
       // 圆角矩形 SDF（负=内部）
       const qx = Math.abs(wx - cx) - (hw - R);
       const qy = Math.abs(wy - cy) - (hh - R);
-      const bx = qx > 0 ? qx : 0, by = qy > 0 ? qy : 0;
-      const len = Math.sqrt(bx * bx + by * by);
+      const bx2 = qx > 0 ? qx : 0, by2 = qy > 0 ? qy : 0;
+      const len = Math.sqrt(bx2 * bx2 + by2 * by2);
       const d = len + Math.min(Math.max(qx, qy), 0) - R;
 
       const o = (oy * cw + ox) * 4;
       if(d > 0){ out[o + 3] = 0; continue; }   // 圆角外透明（父级也裁，双保险）
 
-      const t = Math.min(1, -d / GLASS.band);
+      const t = Math.min(1, -d / band);
       const u = 1 - t, u2 = u * u;             // u2：贴边 1 → 带内沿 0
 
       // 边缘法线：直边取轴向、圆角取径向
       let nx = 0, ny = 0;
       if(len > 1e-6){
-        nx = (wx > cx ? 1 : -1) * bx / len;
-        ny = (wy > cy ? 1 : -1) * by / len;
+        nx = (wx > cx ? 1 : -1) * bx2 / len;
+        ny = (wy > cy ? 1 : -1) * by2 / len;
       }
-      const m = GLASS.maxd * u2;
+      const m = maxd * u2;
 
       if(GLASSDBG){
-        const v = Math.round(255 * m / GLASS.maxd);
+        const v = Math.round(255 * m / maxd);
         out[o] = out[o + 1] = out[o + 2] = v; out[o + 3] = 255;
         continue;
       }
 
-      // 采样：体部=soft 不位移；边缘带=rim 位移 + 按 u2 向 soft 过渡。
-      // 位移与"清亮"用同一条衰减曲线 —— 物理上它们是同一件事：斜边的厚度。
+      // ① 采样：体部 = soft 不位移；边缘带 = rim 位移 + 按 u2 向 soft 过渡。
+      //    位移与"清亮"用同一条衰减曲线 —— 物理上它们是同一件事：斜边的厚度。
       glassSample(wx, wy, _px, glassBgSoft);
       let r = _px[0], g = _px[1], b = _px[2];
 
@@ -863,31 +929,58 @@ function renderGlass(){
 
         if(full){
           // 色散：R 比 B 偏得多一点，边缘才有一丝棱镜感（成本 ×2 次采样）
-          glassSample(wx + nx * m * 1.07, wy + ny * m * 1.07, _c, glassBgRim);
+          const dsp = GLASS.dispersion;
+          glassSample(wx + nx * m * (1 + dsp), wy + ny * m * (1 + dsp), _c, glassBgRim);
           r += (_c[0] - r) * u2;
-          glassSample(wx + nx * m * 0.93, wy + ny * m * 0.93, _c, glassBgRim);
+          glassSample(wx + nx * m * (1 - dsp), wy + ny * m * (1 - dsp), _c, glassBgRim);
           b += (_c[2] - b) * u2;
-
-          // Fresnel：只贴最外 ~5px（t<0.32），否则整圈糊成一条白边 —— 那就成了描边，
-          // 恰恰是我们刚从窗口上删掉的东西。光从上方来，顶边最亮。
-          const k = Math.max(0, 1 - t / 0.45), hl = k * k * 0.48 * (0.30 + 0.70 * Math.max(0, -ny));
-          r += (255 - r) * hl; g += (255 - g) * hl; b += (255 - b) * hl;
-
-          // 内侧一圈微暗：玻璃有厚度，不是一张纸
-          const sh = 1 - Math.pow(Math.max(0, 1 - t / 0.60), 3) * 0.24;
-          r *= sh; g *= sh; b *= sh;
         }
+      }
+
+      // ② 底子：暗底压暗（CSS 渐变）/ 浅底奶白（逐像素，因为边缘要更透）
+      if(light){
+        const v = veil - (veil - GLASS.lightVeilRim) * u2;
+        r += (239 - r) * v; g += (241 - g) * v; b += (245 - b) * v;
+      }
+
+      // ③ 边：Fresnel 高光 + 内侧厚度暗（只 full 档，光从上方来，顶边最亮）
+      if(full && u2 > 0.001){
+        const k = Math.max(0, 1 - t / GLASS.fresnelSpan);
+        const hl = k * k * (light ? GLASS.fresnelLight : GLASS.fresnel)
+                 * (0.30 + 0.70 * Math.max(0, -ny));
+        r += (255 - r) * hl; g += (255 - g) * hl; b += (255 - b) * hl;
+
+        const sh = 1 - Math.pow(Math.max(0, 1 - t / 0.60), 3)
+                 * (light ? GLASS.innerShadeLight : GLASS.innerShade);
+        r *= sh; g *= sh; b *= sh;
       }
       out[o] = r; out[o + 1] = g; out[o + 2] = b; out[o + 3] = 255;
     }
   }
   ctx.putImageData(frame, 0, 0);
+  s.sig = sig;
+  return { px: W * H, meanL };
+}
+
+function renderGlass(){
+  if(!glassMode || !glassBgReady || glassBusy) return;
+  glassBusy = true;
+  const t0 = (window.performance || Date).now();
+  let drawn = 0, px = 0;
+  for(const s of surfaces){
+    const res = renderSurface(s);
+    if(res){ drawn++; px += res.px; }
+  }
+  const ms = ((window.performance || Date).now()) - t0;
 
   if(glassOut){
+    const cost = drawn
+      ? `重算 ${drawn} 块 · ${Math.round(px / 1000)}k px · ${ms.toFixed(0)}ms`
+      : '命中缓存（没重算）';
     glassOut.textContent = GLASSDBG
-      ? `位移场视图：白=贴边 ${GLASS.maxd}px → 黑=带内沿 0`
-      : `折射 ${GLASS.maxd}px · 带 ${GLASS.band}px · 体部模糊 ${GLASS.blur}px / 边圈 ${GLASS.blurRim}px`
-        + `${full ? ' · +Fresnel+色散' : ''} ｜ 底均亮 ${meanL.toFixed(2)} → 压暗 ${scrim.toFixed(2)}`;
+      ? '位移场视图：白 = 贴边 maxd → 黑 = 带内沿 0'
+      : `折射 6.5px（歌单 7）· 带 14px（歌单 18）· 体部模糊 ${GLASS.blur} / 边圈 ${GLASS.blurRim}px`
+        + `${glassMode === 'full' ? ' · +Fresnel+色散' : ''} ｜ ${cost}`;
   }
   glassBusy = false;
 }
@@ -921,8 +1014,10 @@ function applyLiquid(mode){
     const b = e.target.closest('button'); if(!b) return;
     pick(b.dataset.liquid);
   });
+  /* 默认档 = 边缘折射（2026-10-18 定）：它比 L3 只多一圈弯折，成本和观感都稳；
+     full 档的高光与色散留作加强档。?liquid=off 仍是唯一的关法。 */
   const fromUrl = qs.get('liquid');
-  if(fromUrl !== null) pick(['edge','full'].includes(fromUrl) ? fromUrl : 'off');
+  pick(fromUrl === null ? 'edge' : (['edge','full'].includes(fromUrl) ? fromUrl : 'off'));
 })();
 
 /* ---------- 面板开关 ---------- */
@@ -1052,7 +1147,10 @@ if(qs.has('layers')){
   segMode.querySelectorAll('button').forEach(b => b.classList.toggle('on', (b.dataset.layers||'') === l));
 }
 if(qs.get('panel')){
-  (qs.get('panel') === 'osd' ? osd : playlist).classList.add('on');
+  // ?panel=osd|playlist|both，也认逗号列表——三块玻璃面一起出现时才好比较
+  const want = qs.get('panel').split(',');
+  if(want.includes('osd') || want.includes('both')) osd.classList.add('on');
+  if(want.includes('playlist') || want.includes('both')) playlist.classList.add('on');
   syncPanels();
 }
 /* ?idle=1 冻结在「闲置淡出」状态，方便截图/评审 */
