@@ -54,6 +54,14 @@ New-Item -ItemType Directory -Path $stage -Force | Out-Null
 Copy-Item $exe (Join-Path $stage "simple-media-player.exe")
 Copy-Item (Join-Path $root "README.md") (Join-Path $stage "README.md")
 
+# README 里引用的截图也要带上，否则发布包里的图全是坏链（相对路径 docs/screenshots）
+$shots = Join-Path $root "docs/screenshots"
+if (Test-Path $shots) {
+    $shotStage = Join-Path $stage "docs/screenshots"
+    New-Item -ItemType Directory -Path $shotStage -Force | Out-Null
+    Copy-Item (Join-Path $shots "chroma-*.png") $shotStage
+}
+
 # 可选：把 mpv 一起打进去（视频功能需要）
 if ($WithMpv) {
     $mpv = $null
@@ -93,11 +101,24 @@ $lines += ""
 $lines += "生成时间：$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 Set-Content -Path (Join-Path $stage "MANIFEST.txt") -Value $lines -Encoding UTF8
 
-if (Test-Path $zip) { Remove-Item $zip -Force }
-Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip
+# 旧压缩包删不掉不该让整个打包失败：某些环境把 Remove-Item 换成了"必须进回收站"的
+# 安全删除，删除失败会直接 throw（fail-closed）。这里退到 -Force 覆盖同名文件。
+if (Test-Path $zip) {
+    try {
+        Remove-Item $zip -Force -ErrorAction Stop
+    } catch {
+        Write-Host "    （旧压缩包没能删除，改为覆盖写入）"
+    }
+}
+Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $zip -Force
 $zipItem = Get-Item $zip
 
 Write-Host ""
 Write-Host "==> 完成"
 Write-Host "    目录: $stage"
 Write-Host ("    压缩包: {0} ({1:N1} MB)" -f $zip, ($zipItem.Length / 1MB))
+
+# 显式给成功退出码：`& script.ps1` 的 $LASTEXITCODE 只会保留**上一条原生命令**的码，
+# cargo 往 stderr 写东西时会留下非 0（实测 -1），让"打包成功"看起来像失败。
+# 失败路径都是 throw，不需要靠退出码区分。
+exit 0
