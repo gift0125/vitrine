@@ -183,7 +183,10 @@ impl VideoEngine {
             Some(path) => match std::fs::File::create(&path) {
                 Ok(file) => cmd.stderr(Stdio::from(file)),
                 Err(err) => {
-                    eprintln!("警告：无法创建 mpv 日志 {}: {err}", PathBuf::from(path).display());
+                    eprintln!(
+                        "警告：无法创建 mpv 日志 {}: {err}",
+                        PathBuf::from(path).display()
+                    );
                     cmd.stderr(Stdio::null())
                 }
             },
@@ -478,8 +481,14 @@ fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
     let Ok(mut st) = status.lock() else { return };
     match event {
         "property-change" => {
-            let name = value.get("name").and_then(|n| n.as_str()).unwrap_or_default();
-            let data = value.get("data").cloned().unwrap_or(serde_json::Value::Null);
+            let name = value
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default();
+            let data = value
+                .get("data")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             match name {
                 "time-pos" => {
                     if let Some(pos) = data.as_f64() {
@@ -513,7 +522,10 @@ fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
             st.finished = false;
         }
         "end-file" => {
-            let reason = value.get("reason").and_then(|r| r.as_str()).unwrap_or_default();
+            let reason = value
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .unwrap_or_default();
             st.finished = reason == "eof";
             // eof/stop/quit 是正常收尾；其余（典型是 error）说明文件加载或解码失败。
             if !st.finished && !matches!(reason, "stop" | "quit" | "redirect") {
@@ -621,7 +633,10 @@ mod tests {
         }
         for reason in ["stop", "quit", "redirect"] {
             let status = Arc::new(Mutex::new(VideoStatus::default()));
-            handle_line(&format!(r#"{{"event":"end-file","reason":"{reason}"}}"#), &status);
+            handle_line(
+                &format!(r#"{{"event":"end-file","reason":"{reason}"}}"#),
+                &status,
+            );
             let st = status.lock().unwrap();
             assert!(st.error.is_none(), "{reason} 不应视为错误");
         }

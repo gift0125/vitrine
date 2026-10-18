@@ -150,11 +150,7 @@ impl ListDelegate for PlaylistDelegate {
         // 当前曲目的视觉线索按设计稿来：行底色（Mauve 8%）+ 标题 Mauve + 序号位换成
         // 均衡器图标。**不做左侧强调条**——设计稿的列表行是纯平面，没有装饰条。
         let accent = theme.primary;
-        let title_color = if is_current {
-            accent
-        } else {
-            theme.foreground
-        };
+        let title_color = if is_current { accent } else { theme.foreground };
         let row_bg = if is_current {
             theme.list_active
         } else {
@@ -237,9 +233,7 @@ impl ListDelegate for PlaylistDelegate {
                                         .overflow_hidden()
                                         .whitespace_nowrap()
                                         .text_ellipsis()
-                                        .when(is_current, |el| {
-                                            el.font_weight(FontWeight::SEMIBOLD)
-                                        })
+                                        .when(is_current, |el| el.font_weight(FontWeight::SEMIBOLD))
                                         .child(track.title.clone()),
                                 )
                                 .child(

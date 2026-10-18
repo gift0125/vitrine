@@ -11,9 +11,7 @@ mod video;
 
 pub use audio::{AudioEngine, EngineError};
 pub use metadata::{is_supported_audio, load_track_meta, scan_dir_for_tracks};
-pub use video::{
-    find_mpv, is_video_file, SpawnOptions, VideoEngine, VideoError, VideoStatus,
-};
+pub use video::{find_mpv, is_video_file, SpawnOptions, VideoEngine, VideoError, VideoStatus};
 
 /// 曲目元数据
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
