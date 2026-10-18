@@ -183,6 +183,7 @@ impl ListDelegate for PlaylistDelegate {
         };
         let from_row = ix.row;
         let view_remove = self.view.clone();
+        let remove_label = SharedString::from(format!("从播放列表移除 {}", track.title));
 
         Some(
             ListItem::new(ix)
@@ -233,6 +234,8 @@ impl ListDelegate for PlaylistDelegate {
                         .ghost()
                         .xsmall()
                         .icon(IconName::Close)
+                        .tooltip("从播放列表移除")
+                        .accessibility_label(remove_label.clone())
                         .on_click(move |_, _, cx| {
                             let _ = view.update(cx, |view, cx| {
                                 view.remove_track(from_row, cx);

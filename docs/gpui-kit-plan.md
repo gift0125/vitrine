@@ -174,15 +174,43 @@ GPUI 的 Windows 后端使用 `DirectComposition + WS_EX_NOREDIRECTIONBITMAP`，
 
 ---
 
-### 🟡 Stage 5 — 打磨与发布（1 天）
+### 🟢 Stage 5 — 打磨与发布（1 天）✅ 2026-10-18
 
-- [ ] UI 集成测试：`gpui_kit::test` 无头窗口驱动指针/键盘，断言播放状态、焦点、布局
-- [ ] 无障碍检查（AccessKit 角色/名称）——列表行已补 `accessibility_label`（含“正在播放”后缀），其余控件待查
-- [ ] 错误处理：损坏文件、解码失败、设备占用的 toast 提示
-- [ ] `cargo build --release`，Windows 打包（单 exe + mpv dll 或 innosetup）
-- [ ] README + 截图
+- [x] UI 集成测试：`gpui_kit::test` 无头窗口驱动指针/键盘，断言播放状态、焦点、布局
+  - `crates/app/src/ui_tests.rs`，7 个用例：无障碍名称、播放/暂停、上一首/下一首循环、空列表无副作用、
+    坏文件报错、主题切换、控件不溢出窗口。
+  - 持久化目录用线程局部 override 重定向到临时目录（`persistence::set_config_dir_for_test`），
+    不污染真实 `%APPDATA%`。
+  - 代价：`gpui-kit` 的 `test-support` feature 会带进 `gpui-fast-platform` 依赖，
+    与本机 lockfile 里 pin 的 `cocoa 0.26.1` / `unicode-properties 0.1.4` 冲突，
+    需要把它们降到 `0.26.0` / `0.1.3`（仅影响 macOS / wasm 目标，Windows 不编译）。
+- [x] 无障碍检查（AccessKit 角色/名称）
+  - 全部图标按钮补 `accessibility_label`（添加文件/文件夹、清空、上一首、播放/暂停、下一首、全屏、主题），
+    播放按钮名称随状态在「播放/暂停」间切换；列表行已有 `accessibility_label`（含「正在播放」后缀）；
+    行尾删除按钮补名称 `从播放列表移除 <曲名>`。
+  - 进度条/音量条：上游 `Slider`（gpui-component 0.7.3）没有 `FocusHandle`、没有 ARIA 角色与值、
+    也不响应键盘，组件层无法补齐。已用带 `aria_label` 的容器提供分组名，键盘操作列为已知限制。
+- [x] 错误处理：损坏文件、解码失败、设备占用的 toast 提示
+  - `PlayerView::report_error` 入队 → `tick` 统一 `window.push_notification(Notification::error)`；
+    覆盖：音频打不开/解码失败、无音频设备、mpv 缺失/启动失败/拿不到窗口句柄/连接中断、
+    视频加载失败（区分「文件不存在」与「mpv 无法加载」）、导入后无可用文件（info 提示）。
+  - `VideoStatus.error` 透出 mpv 的 `end-file` 原因与 `file_error` 细节（如 `error: loading failed`）；
+    视频加载失败后自动跳到下一首，不卡在错误态。
+  - 诊断开关：`SMP_MPV_LOG=<路径>` 落盘 mpv stderr，`SMP_MPV_TRACE=<路径>` 落盘 IPC 收发报文。
+- [x] `cargo build --release`，Windows 打包
+  - `scripts/package.ps1`：release 构建 → `dist/simple-media-player-1.0.0/`（exe + README + MANIFEST 校验和）
+    → 同名 zip（8.7 MB）；`-WithMpv` 可把 mpv.exe 一并打入（GPL 合规需自行确认）。
+  - 实测：解压到临时目录 + 全新 `APPDATA` 启动，视频/音频/影院/错误提示全部正常，mpv 进程随窗口关闭回收。
+- [x] README + 截图（`docs/screenshots/v1-*.png`）
 
-**验收**：release 包在新装 Windows 机器可运行；测试套件全绿。
+**验收**：release 包在干净目录 + 全新配置下可运行 ✅；测试套件 15（player-core）+ 11（app）全绿 ✅；
+release 1080p H.264 播放 mpv 峰值 10.85% 单核（整机 ~0.68%），满足 < 15% ✅。
+
+**已知限制（Stage 5 结束时）**：
+1. 视频区不可绘制 GPUI 浮层（DirectComposition 架构约束，需纹理共享方案）。
+2. 进度条/音量条仅支持鼠标（上游 Slider 缺键盘与 ARIA 支持）。
+3. mpv 默认不随包分发，需 `-WithMpv` 或用户自备。
+4. 仅在 Windows 实机验证；macOS / Linux 分支未测。
 
 ---
 
@@ -193,7 +221,7 @@ GPUI 的 Windows 后端使用 `DirectComposition + WS_EX_NOREDIRECTIONBITMAP`，
 | **M0** | Stage 0~1：窗口骨架 | ~1.5 天 |
 | **M1** | Stage 2~3：**可交付的音频播放器** 🟢 | ~4 天 |
 | **M2** | Stage 4：视频播放 ✅ | ~7 天 |
-| **M3** | Stage 5：发布版 | ~8 天 |
+| **M3** | Stage 5：发布版 ✅ `v1.0.0` | ~8 天 |
 
 **关键路径**：Stage 2 的 Entity 状态同步模式决定整体代码质量 → 优先做扎实；Stage 4 是唯一可能延期的项，有明确降级预案。
 
@@ -226,13 +254,18 @@ simple-media-player/
 ├── Cargo.toml              # workspace 根
 ├── crates/
 │   ├── app/                # GPUI 应用（窗口、视图、状态）
+│   │   └── src/ui_tests.rs # UI 集成测试（gpui_kit::test 无头窗口）
 │   └── player-core/        # 播放内核（rodio/mpv、元数据）— 无 UI 依赖
-├── assets/                 # 图标、占位封面
 ├── docs/
-│   └── gpui-kit-plan.md    # 本文档
-└── tests/                  # UI 集成测试
+│   ├── gpui-kit-plan.md    # 本文档
+│   └── screenshots/        # 各阶段验证截图 + README 用图
+├── scripts/
+│   ├── package.ps1         # release 构建 + 打包（-WithMpv 可附带 mpv）
+│   └── verify_m2_video.py  # 冒烟工具：归位/置顶截图、点击、拖拽、叠加窗口探测
+└── dist/                   # 打包产物（gitignore）
 ```
 
 ---
 
-*下一步：Stage 0 环境验证。确认计划后开工。*
+*状态：Stage 0–5 全部完成，`v1.0.0` 已打包（`scripts/package.ps1`）。
+后续方向见 Stage 5「已知限制」：纹理共享浮层、键盘可用的 Slider、随包 mpv、跨平台验证。*

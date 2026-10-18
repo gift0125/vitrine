@@ -2,6 +2,9 @@
 Cargo.lock
 *.pdb
 
+# 本地打包产物
+/dist
+
 # 本地测试音视频素材（可随时重新生成，不提交）
 /test-audio
 /test-media

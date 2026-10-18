@@ -25,8 +25,11 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListEvent, ListState};
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, Sizable as _, Theme, ThemeMode};
+use gpui_kit::component::{
+    h_flex, v_flex, ActiveTheme as _, Icon, Sizable as _, Theme, ThemeMode, WindowExt as _,
+};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -86,6 +89,14 @@ pub struct PlayerView {
     main_hwnd: Hwnd,
     /// 影院模式（隐藏歌单 + 系统全屏）
     cinema: bool,
+
+    // ---- 用户可见错误 ----
+    /// 待弹出的错误提示（由 tick 统一推成 toast，保证有 window 可用）
+    pending_errors: Vec<SharedString>,
+    /// 待弹出的普通提示（例如导入结果）
+    pending_infos: Vec<SharedString>,
+    /// 最近一条错误（便于测试断言，也给未来的状态栏复用）
+    last_error: Option<SharedString>,
 }
 
 impl PlayerView {
@@ -157,10 +168,12 @@ impl PlayerView {
         }));
 
         // 引擎：无音频设备时降级为只读 UI（控件仍可交互但无声）
+        let mut startup_errors: Vec<SharedString> = Vec::new();
         let mut engine = match AudioEngine::new() {
             Ok(engine) => Some(engine),
             Err(err) => {
                 eprintln!("警告：音频引擎初始化失败，播放功能不可用: {err}");
+                startup_errors.push(format!("音频设备不可用：{err}").into());
                 None
             }
         };
@@ -210,6 +223,9 @@ impl PlayerView {
             video_rect,
             main_hwnd,
             cinema: false,
+            last_error: startup_errors.first().cloned(),
+            pending_errors: startup_errors,
+            pending_infos: Vec::new(),
         };
 
         // 100ms 轮询：进度同步 + 自动连播 + 叠加窗口跟随 + 窗口尺寸节流落盘
@@ -228,7 +244,33 @@ impl PlayerView {
     // 引擎状态同步
     // ------------------------------------------------------------------
 
+    /// 记录一条用户可见错误：留档到 `last_error`（测试与状态栏可读），
+    /// 并排队等下一次 tick 统一弹 toast（tick 里有 window 可用）。
+    fn report_error(&mut self, message: impl Into<SharedString>) {
+        let message = message.into();
+        eprintln!("{message}");
+        self.last_error = Some(message.clone());
+        self.pending_errors.push(message);
+    }
+
+    /// 记录一条普通提示（导入结果等），随下一次 tick 弹出。
+    fn report_info(&mut self, message: impl Into<SharedString>) {
+        self.pending_infos.push(message.into());
+    }
+
+    /// 把排队的提示推成右上角 toast（错误用 `Notification::error`，其余 info）。
+    fn flush_errors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for message in std::mem::take(&mut self.pending_errors) {
+            window.push_notification(Notification::error(message), cx);
+        }
+        for message in std::mem::take(&mut self.pending_infos) {
+            window.push_notification(Notification::info(message), cx);
+        }
+    }
+
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_errors(window, cx);
+
         // 影院模式只对视频成立：自动连播切到音频（或无视频可播）时必须退出全屏，
         // 否则影院按钮消失、用户被困在全屏里。
         if self.cinema && !self.video_active {
@@ -292,6 +334,42 @@ impl PlayerView {
 
     /// 视频模式下的状态同步（mpv 侧）。
     fn tick_video(&mut self, status: VideoStatus, window: &mut Window, cx: &mut Context<Self>) {
+        // 加载/解码失败：给出可见提示并推进到下一首，避免卡在错误状态
+        if let Some(reason) = self.video.engine.as_ref().and_then(|e| e.take_error()) {
+            let track = self.current_track(cx);
+            let title = track
+                .as_ref()
+                .map(|track| track.title.clone())
+                .unwrap_or_else(|| "当前文件".to_string());
+            // 区分「文件不在了」和「文件在但 mpv 解不了」——两种提示的处理方式完全不同
+            let missing = track
+                .as_ref()
+                .is_some_and(|track| !Path::new(&track.path).exists());
+            let message = if missing {
+                format!("无法播放「{title}」：文件不存在或已被移动")
+            } else {
+                format!("无法播放「{title}」：mpv 无法加载该文件（{reason}）")
+            };
+            self.report_error(message);
+
+            let count = self.playlist.read(cx).delegate().track_count();
+            match self.current {
+                Some(i) if i + 1 < count => self.play_track(i + 1, cx),
+                _ => {
+                    if let Some(engine) = &self.video.engine {
+                        engine.stop();
+                    }
+                    self.video_active = false;
+                    self.current = None;
+                    if let Some(overlay) = &mut self.video.overlay {
+                        overlay.hide();
+                    }
+                    cx.notify();
+                }
+            }
+            return;
+        }
+
         // 时长补齐：元数据缺失时以 mpv 报告的时长重建量程
         if status.duration > 0.5 && (status.duration as f32 - self.seek_max).abs() > 1.0 {
             self.rebuild_seek(status.duration as f32, cx);
@@ -317,6 +395,7 @@ impl PlayerView {
 
         if !status.connected && !status.idle {
             self.video_error = Some("视频内核连接中断（mpv 已退出）".into());
+            self.report_error("视频中断：mpv 进程已退出");
             self.video_active = false;
         }
 
@@ -451,13 +530,14 @@ impl PlayerView {
                     self.rebuild_seek(max, cx);
                 }
                 Err(err) => {
-                    eprintln!("播放失败 {}: {err}", track.path);
+                    self.report_error(format!("无法播放「{}」：{err}", track.title));
                     self.current = None;
                 }
             }
         } else {
-            // 无引擎（无音频设备）：仅更新高亮，便于 UI 验证
+            // 无引擎（无音频设备）：仅更新高亮，便于 UI 验证，但要让用户知道没声音
             self.current = Some(index);
+            self.report_error("音频设备不可用，无法播放音乐（视频不受影响）");
         }
     }
 
@@ -469,6 +549,7 @@ impl PlayerView {
         if self.main_hwnd == 0 {
             self.video_active = false;
             self.video_error = Some("无法获取主窗口句柄，视频渲染不可用".into());
+            self.report_error("视频不可用：无法获取主窗口句柄");
             return;
         }
 
@@ -478,6 +559,7 @@ impl PlayerView {
         let Some(overlay) = &self.video.overlay else {
             self.video_active = false;
             self.video_error = Some("无法创建视频叠加窗口".into());
+            self.report_error("视频不可用：无法创建叠加窗口");
             return;
         };
         let wid = overlay.hwnd();
@@ -492,6 +574,7 @@ impl PlayerView {
                 self.video_active = false;
                 self.video_error =
                     Some("未找到 mpv.exe（可用环境变量 SMP_MPV_PATH 指定路径）".into());
+                self.report_error("视频不可用：未找到 mpv.exe（设置 SMP_MPV_PATH 可指定路径）");
                 return;
             };
             match VideoEngine::spawn(SpawnOptions {
@@ -504,6 +587,7 @@ impl PlayerView {
                 Err(err) => {
                     self.video_active = false;
                     self.video_error = Some(format!("mpv 启动失败：{err}"));
+                    self.report_error(format!("视频不可用：mpv 启动失败（{err}）"));
                     return;
                 }
             }
@@ -748,7 +832,12 @@ impl PlayerView {
                 .await;
 
             let _ = this.update(cx, |view, cx| {
-                view.append_tracks(tracks, cx);
+                if tracks.is_empty() {
+                    view.report_info("未找到可播放的媒体文件");
+                } else {
+                    view.append_tracks(tracks, cx);
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -768,7 +857,12 @@ impl PlayerView {
                 .await;
 
             let _ = this.update(cx, |view, cx| {
-                view.append_tracks(tracks, cx);
+                if tracks.is_empty() {
+                    view.report_info("该文件夹内没有可播放的媒体文件");
+                } else {
+                    view.append_tracks(tracks, cx);
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -815,6 +909,7 @@ impl PlayerView {
                             .small()
                             .icon(IconName::Plus)
                             .tooltip("添加文件")
+                            .accessibility_label("添加文件")
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.add_files(cx);
                             })),
@@ -825,6 +920,7 @@ impl PlayerView {
                             .small()
                             .icon(IconName::FolderOpen)
                             .tooltip("添加文件夹")
+                            .accessibility_label("添加文件夹")
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.add_folder(cx);
                             })),
@@ -835,6 +931,7 @@ impl PlayerView {
                             .small()
                             .icon(IconName::Delete)
                             .tooltip("清空播放列表")
+                            .accessibility_label("清空播放列表")
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.clear_playlist(cx);
                             })),
@@ -998,10 +1095,17 @@ impl PlayerView {
                     .text_color(theme.muted_foreground)
                     .child(fmt_time(position)),
             )
+            // Slider 自身没有 id / 无障碍信息（上游未实现），用带 id 的容器承载，
+            // 既给读屏软件一个可命名的分组，也让 UI 测试能定位到进度条几何。
             .child(
-                Slider::new(&self.seek)
+                div()
+                    .id("seek-bar")
+                    .aria_label("播放进度")
                     .flex_1()
-                    .disabled(self.current.is_none()),
+                    .min_w_0()
+                    .flex()
+                    .test_support()
+                    .child(Slider::new(&self.seek).flex_1().disabled(self.current.is_none())),
             )
             .child(
                 div()
@@ -1046,7 +1150,16 @@ impl PlayerView {
                             .small()
                             .text_color(theme.muted_foreground),
                     )
-                    .child(Slider::new(&self.volume).flex_1()),
+                    .child(
+                        div()
+                            .id("volume-bar")
+                            .aria_label("音量")
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .test_support()
+                            .child(Slider::new(&self.volume).flex_1()),
+                    ),
             )
             // 中：上一首 / 播放暂停 / 下一首
             .child(
@@ -1060,6 +1173,7 @@ impl PlayerView {
                             .ghost()
                             .icon(IconName::SkipBack)
                             .tooltip("上一首")
+                            .accessibility_label("上一首")
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.skip(-1, cx);
                             })),
@@ -1070,6 +1184,7 @@ impl PlayerView {
                             .large()
                             .icon(play_icon)
                             .tooltip(if playing { "暂停" } else { "播放" })
+                            .accessibility_label(if playing { "暂停" } else { "播放" })
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.toggle_play(cx);
                             })),
@@ -1079,6 +1194,7 @@ impl PlayerView {
                             .ghost()
                             .icon(IconName::SkipForward)
                             .tooltip("下一首")
+                            .accessibility_label("下一首")
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.skip(1, cx);
                             })),
@@ -1101,6 +1217,7 @@ impl PlayerView {
                                     IconName::Maximize
                                 })
                                 .tooltip(if cinema { "退出全屏" } else { "全屏" })
+                                .accessibility_label(if cinema { "退出全屏" } else { "进入全屏" })
                                 .on_click(cx.listener(|this, _e, window, cx| {
                                     this.toggle_cinema(window, cx);
                                 })),
@@ -1111,6 +1228,11 @@ impl PlayerView {
                             .ghost()
                             .icon(if is_dark { IconName::Sun } else { IconName::Moon })
                             .tooltip("明暗主题切换")
+                            .accessibility_label(if is_dark {
+                                "切换到浅色主题"
+                            } else {
+                                "切换到深色主题"
+                            })
                             .on_click(cx.listener(|_this, _e, _w, cx| {
                                 let next = if cx.theme().mode.is_dark() {
                                     ThemeMode::Light
@@ -1133,6 +1255,34 @@ impl Drop for PlayerView {
             "player_view dropped (video_active={}, current={:?}, cinema={})",
             self.video_active, self.current, self.cinema
         ));
+    }
+}
+
+/// UI 集成测试用的状态快照。
+///
+/// 只在测试构建存在：字段都是私有状态，`ui_tests` 是兄弟模块，无法直接读字段，
+/// 用快照把「需要断言的事实」显式列出来，也避免为测试放开字段可见性。
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct ViewSnapshot {
+    pub current: Option<usize>,
+    pub seek_max: f32,
+    pub last_error: Option<String>,
+    pub playing: bool,
+    /// 是否成功打开了音频输出设备（无设备时播放路径会降级）
+    pub using_audio_device: bool,
+}
+
+#[cfg(test)]
+impl PlayerView {
+    pub(crate) fn snapshot(&self) -> ViewSnapshot {
+        ViewSnapshot {
+            current: self.current,
+            seek_max: self.seek_max,
+            last_error: self.last_error.as_ref().map(|s| s.to_string()),
+            playing: self.playback_state().is_playing(),
+            using_audio_device: self.engine.is_some(),
+        }
     }
 }
 

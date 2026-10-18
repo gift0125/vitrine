@@ -7,6 +7,8 @@ mod assets;
 mod persistence;
 mod player_view;
 mod playlist;
+#[cfg(test)]
+mod ui_tests;
 mod video_overlay;
 
 use gpui_kit::prelude::*;

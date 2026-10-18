@@ -1,7 +1,9 @@
 [package]
 name = "simple-media-player"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+description = "轻量跨平台媒体播放器（GPUI Kit + rodio/mpv）"
+license = "MIT"
 
 [dependencies]
 gpui-kit = { workspace = true }
@@ -11,3 +13,7 @@ serde_json = { workspace = true }
 rfd = "0.15"
 directories = "6"
 raw-window-handle = "0.6"
+
+[dev-dependencies]
+# UI 集成测试需要无头窗口驱动（`gpui_kit::test`），只在测试构建打开该 feature。
+gpui-kit = { workspace = true, features = ["test-support"] }

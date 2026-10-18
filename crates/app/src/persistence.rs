@@ -35,6 +35,11 @@ impl Default for Settings {
 /// 配置目录：Windows 上为 `%APPDATA%/simple-media-player`（与计划约定一致）。
 /// 其他平台回退 directories 标准路径。
 pub fn config_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = test_dir_override::current() {
+        return dir;
+    }
+
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("APPDATA")
@@ -48,6 +53,34 @@ pub fn config_dir() -> PathBuf {
             .map(|d| d.config_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."))
     }
+}
+
+/// 测试专用：把配置目录重定向到临时目录。
+///
+/// 用线程局部存储而不是环境变量：Rust 测试默认多线程并行，改环境变量会串味；
+/// `TestAppContext` 的每个用例都跑在自己的线程上，线程局部天然隔离。
+#[cfg(test)]
+mod test_dir_override {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub fn current() -> Option<PathBuf> {
+        DIR.with(|slot| slot.borrow().clone())
+    }
+
+    pub fn set(dir: impl Into<PathBuf>) {
+        DIR.with(|slot| *slot.borrow_mut() = Some(dir.into()));
+    }
+}
+
+/// 测试专用：后续所有持久化读写都落在这个目录里（不会碰到真实 `%APPDATA%`）。
+#[cfg(test)]
+pub fn set_config_dir_for_test(dir: impl Into<PathBuf>) {
+    test_dir_override::set(dir);
 }
 
 fn ensure_config_dir() -> std::io::Result<PathBuf> {

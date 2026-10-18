@@ -74,6 +74,8 @@ pub struct VideoStatus {
     pub idle: bool,
     /// 已自然播放结束（end-file reason=eof）
     pub finished: bool,
+    /// 加载/解码失败原因（end-file reason=error 等），由 UI 取走提示后清空
+    pub error: Option<String>,
     /// IPC 连接是否仍然有效
     pub connected: bool,
 }
@@ -173,9 +175,20 @@ impl VideoEngine {
             cmd.arg(extra);
         }
 
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        cmd.stdin(Stdio::null()).stdout(Stdio::null());
+        // 诊断开关：`SMP_MPV_LOG=<路径>` 时把 mpv 的 stderr 落盘（默认丢弃）。
+        // mpv 的失败原因（解码、VO 初始化、文件打不开）只在 stderr 里，没有它只能看到
+        // `end-file reason=error` 这种无法定位的信息。
+        match std::env::var_os("SMP_MPV_LOG") {
+            Some(path) => match std::fs::File::create(&path) {
+                Ok(file) => cmd.stderr(Stdio::from(file)),
+                Err(err) => {
+                    eprintln!("警告：无法创建 mpv 日志 {}: {err}", PathBuf::from(path).display());
+                    cmd.stderr(Stdio::null())
+                }
+            },
+            None => cmd.stderr(Stdio::null()),
+        };
 
         let mut child = cmd.spawn().map_err(|e| VideoError::Spawn(e.to_string()))?;
 
@@ -280,6 +293,12 @@ impl VideoEngine {
         self.status.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
+    /// 取走并清除「最近一次加载/解码失败」标记（UI 每轮轮询调用一次）。
+    pub fn take_error(&self) -> Option<String> {
+        let mut st = self.status.lock().ok()?;
+        st.error.take()
+    }
+
     /// IPC 是否仍然可用（管道未断开、进程未退出）。
     pub fn is_connected(&self) -> bool {
         !self.exited.load(Ordering::SeqCst) && self.status().connected
@@ -360,6 +379,7 @@ fn ipc_worker(
                 Ok(IpcMessage::Command(value)) => {
                     let mut line = value.to_string();
                     line.push('\n');
+                    trace(&format!("-> {}", line.trim_end()));
                     if reader.get_mut().write_all(line.as_bytes()).is_err() {
                         mark_disconnected(&status);
                         return;
@@ -417,8 +437,34 @@ fn mark_disconnected(status: &Arc<Mutex<VideoStatus>>) {
     }
 }
 
+/// IPC 报文追踪：设置 `SMP_MPV_TRACE=<路径>` 后把收发方向与内容逐行落盘。
+///
+/// 排查「mpv 说失败但没打日志」这类问题时，只有原始报文能说清楚：命令是否发出去、
+/// mpv 回的 `error` 字段是什么、事件顺序是否异常。
+fn trace(line: &str) {
+    use std::sync::OnceLock;
+
+    static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let sink = SINK.get_or_init(|| {
+        std::env::var_os("SMP_MPV_TRACE").and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(Mutex::new)
+        })
+    });
+    if let Some(sink) = sink {
+        if let Ok(mut file) = sink.lock() {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
 /// 解析单行 mpv 事件并更新状态。
 fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
+    trace(&format!("<- {line}"));
     if line.is_empty() {
         return;
     }
@@ -459,6 +505,7 @@ fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
         }
         "start-file" => {
             st.finished = false;
+            st.error = None;
             st.position = 0.0;
         }
         "file-loaded" => {
@@ -468,6 +515,18 @@ fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
         "end-file" => {
             let reason = value.get("reason").and_then(|r| r.as_str()).unwrap_or_default();
             st.finished = reason == "eof";
+            // eof/stop/quit 是正常收尾；其余（典型是 error）说明文件加载或解码失败。
+            if !st.finished && !matches!(reason, "stop" | "quit" | "redirect") {
+                let detail = value
+                    .get("file_error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                st.error = Some(if detail.is_empty() {
+                    if reason.is_empty() { "unknown" } else { reason }.to_string()
+                } else {
+                    format!("{reason}: {detail}")
+                });
+            }
         }
         _ => {}
     }
@@ -529,6 +588,57 @@ mod tests {
         assert!(!is_video_file(Path::new("a/b/song.flac")));
         assert!(!is_video_file(Path::new("a/b/song.mp3")));
         assert!(!is_video_file(Path::new("a/b/noext")));
+    }
+
+    /// `end-file` 的失败原因必须带细节暴露给 UI：只报 "error" 无法区分
+    /// 「文件不存在」「格式不支持」「打不开」。
+    #[test]
+    fn end_file_error_exposes_detail() {
+        let status = Arc::new(Mutex::new(VideoStatus::default()));
+        handle_line(
+            r#"{"event":"end-file","reason":"error","file_error":"loading failed"}"#,
+            &status,
+        );
+        let st = status.lock().unwrap().clone();
+        assert_eq!(st.error.as_deref(), Some("error: loading failed"));
+        assert!(!st.finished, "失败不应被当成正常播完");
+
+        // 没有 file_error 时至少保留 reason
+        let status = Arc::new(Mutex::new(VideoStatus::default()));
+        handle_line(r#"{"event":"end-file","reason":"error"}"#, &status);
+        assert_eq!(status.lock().unwrap().error.as_deref(), Some("error"));
+    }
+
+    /// eof / stop / quit / redirect 都是正常收尾，不能当成错误弹提示。
+    #[test]
+    fn normal_end_reasons_are_not_errors() {
+        let status = Arc::new(Mutex::new(VideoStatus::default()));
+        handle_line(r#"{"event":"end-file","reason":"eof"}"#, &status);
+        {
+            let st = status.lock().unwrap();
+            assert!(st.finished, "eof 应标记为自然结束");
+            assert!(st.error.is_none());
+        }
+        for reason in ["stop", "quit", "redirect"] {
+            let status = Arc::new(Mutex::new(VideoStatus::default()));
+            handle_line(&format!(r#"{{"event":"end-file","reason":"{reason}"}}"#), &status);
+            let st = status.lock().unwrap();
+            assert!(st.error.is_none(), "{reason} 不应视为错误");
+        }
+    }
+
+    /// 重新加载文件时清掉上一次的错误，否则 UI 会重复弹旧提示。
+    #[test]
+    fn start_file_clears_previous_error() {
+        let status = Arc::new(Mutex::new(VideoStatus::default()));
+        handle_line(r#"{"event":"end-file","reason":"error"}"#, &status);
+        assert!(status.lock().unwrap().error.is_some());
+
+        handle_line(r#"{"event":"start-file"}"#, &status);
+        let st = status.lock().unwrap();
+        assert!(st.error.is_none());
+        assert!(!st.finished);
+        assert_eq!(st.position, 0.0);
     }
 
     #[test]
