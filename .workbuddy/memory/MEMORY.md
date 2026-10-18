@@ -44,6 +44,12 @@
 - 发布验收要看**打包后的 exe**：`SMP_EXE=dist/simple-media-player-1.0.0/simple-media-player.exe python scripts/verify_floating_chrome.py`。release 是 GUI 子系统、无 stderr，但判定只读像素与窗口状态，不受影响；PE `Subsystem` 用读头的方式核（2=GUI）。
 - **`package.ps1` 曾"成功却退出码 1"**：cargo 进度写 stderr，脚本头 `$ErrorActionPreference = "Stop"` 把原生命令的 stderr 当 `NativeCommandError` 终止。构建期间临时 `Continue`、只认 `$LASTEXITCODE`，跑完还原。（同源坑：任何 `$ErrorActionPreference="Stop"` 的 .ps1 里调 cargo/git 都要这么包一层。）
 
+## 键盘（第十轮，2026-10-18）
+- `←`/`→` ±5 秒、`↑`/`↓` ±5% 音量，**都在 `App::intercept_keystrokes`**：`Slider`（gpui-component 0.7.3）无 `FocusHandle` 且不参与键盘，键盘焦点到不了它身上。
+- 方向键 key 名 = `left`/`right`/`up`/`down`（GPUI 命名键）；写错**不报错、静默失效** → 解析走 `ArrowKey::parse`，UI 测试用真实 `dispatch_keystroke` 守。
+- 音量改动画的是 `SliderState`（`volume_pct` 只是镜像，只改镜像 = 声音变了圆点不动）；`SliderState::set_value` **不发 `SliderEvent::Change`**，引擎与持久化要自己再调 `set_volume_pct`。顶到 0/100 直接 return，别按住时 30Hz 写 settings.json。
+- `AudioEngine::seek` 在 `Stopped` 返回 `false`（sink 空了没东西可 seek）→ 播完后方向键"没反应"。加 `AudioEngine::play_at(path, secs)` 重新起播到目标位置；视频例外（播完 tick 退出视频模式，用音频引擎重起 mp4 只会解码失败）→ 先判 `is_video_file` 直接返回。
+
 ## UI / 布局 / 样式（gpui-component 坑）
 - `ListItem::confirmed()` 无视觉；默认 `primary` 与正文色重合，不能用它表达"当前项" → 用 `list_active` / `list_active_border`。
 - **字体必须系统自带**：设计稿 Inter / Noto Sans SC 在 Win 不预装（写死退宋体）。见 `theme::ui_font_family()`（Win `Microsoft YaHei UI` / mac `PingFang SC` / 其他 `Noto Sans SC`）+ `mono_font_family()`；`ThemeConfig.font_family` 铺整棵树（`root.rs`）。

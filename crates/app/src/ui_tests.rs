@@ -21,7 +21,7 @@ use player_core::TrackMeta;
 use smallvec::SmallVec;
 
 use crate::persistence::{self, Settings};
-use crate::player_view::PlayerView;
+use crate::player_view::{seek_target, PlayerView};
 use crate::video_overlay::OverlayEvent;
 
 /// 每个用例一个独立临时目录，避免并行执行时互相踩。
@@ -831,6 +831,104 @@ fn title_band_spans_full_width(cx: &mut TestAppContext) {
                 bounds.size.width.as_f32()
             );
         }
+    })
+    .unwrap();
+}
+
+// ----------------------------------------------------------------------
+// 方向键：左右跳转、上下音量
+// ----------------------------------------------------------------------
+
+/// 方向键必须走真实键盘链路（`PlatformInput::KeyDown` → App 级 keystroke 拦截）。
+///
+/// 为什么不在滑块上挂键盘：gpui-component 0.7.3 的 `Slider` 没有 `FocusHandle`、
+/// 也不参与键盘（上游硬限制），焦点永远落不到它身上。所以这层拦截是**唯一**能让
+/// 方向键生效的地方，必须有测试盯着——写错 key 名不会报错，只会静默失效。
+#[gpui_kit::test]
+fn arrow_keys_seek_and_adjust_volume(cx: &mut TestAppContext) {
+    let dir = fresh_dir("arrows");
+    let wav = write_silent_wav(&dir, 30.0);
+    let (window, view) = open_view(cx, vec![track("长曲", &wav, 30.0)]);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+
+        // 1. 没有曲目：左右键不该被吃掉（留给将来的列表导航）
+        assert!(
+            !window.dispatch_keystroke(Keystroke::parse("left").unwrap(), cx),
+            "空列表时左右键应继续往下派发"
+        );
+
+        // 2. 上下 = 音量 ±5%，而且滑块的拇指要跟着走
+        let base = view.read(cx).snapshot().volume_pct;
+        assert_eq!(base, 70, "默认音量 70%");
+        assert!(
+            window.dispatch_keystroke(Keystroke::parse("up").unwrap(), cx),
+            "上键应被吃掉（否则会被别的控件当成滚动）"
+        );
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).snapshot().volume_pct, base + 5);
+        let slider = view.read(cx).test_volume_slider();
+        assert_eq!(
+            slider.read(cx).value().start(),
+            (base + 5) as f32,
+            "音量滑块的拇指必须跟着动：只改镜像字段的话声音变了、圆点不动，看着像没反应"
+        );
+
+        assert!(window.dispatch_keystroke(Keystroke::parse("down").unwrap(), cx));
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).snapshot().volume_pct, base, "下键应退回一档");
+
+        // 顶到 100 之后继续按不该越界（也不该反复写盘）
+        for _ in 0..10 {
+            window.dispatch_keystroke(Keystroke::parse("up").unwrap(), cx);
+        }
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).snapshot().volume_pct, 100, "音量上限是 100%");
+
+        // 3. 起播后左右 = ±5 秒
+        window.click("play-pause", cx);
+        window.render_frame(cx);
+        let started = view.read(cx).snapshot();
+        assert_eq!(started.current, Some(0), "点播放应选中第 0 首");
+        if !started.using_audio_device {
+            // 没有音频设备时引擎是 None，位置永远是 0——只能验「键被吃掉」
+            assert!(
+                window.dispatch_keystroke(Keystroke::parse("right").unwrap(), cx),
+                "有曲目时右键必须被吃掉"
+            );
+            return;
+        }
+
+        let before = started.position;
+        assert!(
+            window.dispatch_keystroke(Keystroke::parse("right").unwrap(), cx),
+            "有曲目时右键必须被吃掉"
+        );
+        let after = view.read(cx).snapshot().position;
+        assert!(
+            (after - (before + 5.0)).abs() < 1.5,
+            "右键应前进约 5 秒：{before} -> {after}"
+        );
+
+        // 落点夹在 [0, 时长] 之间：越界后播放器会自己回弹，用户看到的就是
+        // 「按右键进度反而往回退」。纯函数，直接验边界。
+        assert_eq!(seek_target(1.0, -5.0, 30.0), 0.0, "不能退到负数");
+        assert_eq!(seek_target(29.0, 5.0, 30.0), 30.0, "不能越过时长");
+
+        // 播完之后引擎是 Stopped，`seek` 在那一刻是空操作——方向键会变成
+        // 「按了没反应」。停止态按左键必须能重新起播到目标位置。
+        // （无头测试不跑 tick 的自动连播，这里直接把引擎按回停止态来模拟）
+        view.update(cx, |view, _| view.test_stop_engine());
+        assert!(window.dispatch_keystroke(Keystroke::parse("left").unwrap(), cx));
+        window.render_frame(cx);
+        let revived = view.read(cx).snapshot();
+        assert_eq!(
+            revived.last_error, None,
+            "停止态按左键不该报错：{:?}",
+            revived.last_error
+        );
+        assert!(revived.playing, "停止态按左键应重新起播，而不是纹丝不动");
     })
     .unwrap();
 }

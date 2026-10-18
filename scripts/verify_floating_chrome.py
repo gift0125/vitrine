@@ -26,6 +26,9 @@
    最右那一列，标题带中线必须比它下面的画面明显暗。
 8. **按住画面能拖动窗体** —— 拖动过程中画面必须跟着走（叠加窗由 tick 追上），
    松手后外框依旧对齐。
+9. **方向键接通播放器** —— 左右 ±5 秒（`seek`）、上下 ±5% 音量
+   （`set_property volume`）。判据取 mpv 的 IPC trace：只看界面动没动不够，
+   那可能只是 tick 的乐观更新；命令真的发出去才算接通。
 
 每一步都打印取样像素与窗口几何，判据在最后统一汇总。
 """
@@ -73,6 +76,11 @@ user32 = ctypes.windll.user32
 # Esc 退出全屏：应用侧是 App 级 keystroke 拦截，按 VK 码投递 WM_KEYDOWN 就能触发
 # （GPUI 的 `parse_normal_key` 只认 wparam 里的虚拟键码，不需要真实键盘状态）。
 VK_ESCAPE = 0x1B
+# 方向键：左右 ±5 秒、上下 ±5% 音量，走同一个拦截（`PlayerView::intercept_keystrokes`）
+VK_LEFT = 0x25
+VK_UP = 0x26
+VK_RIGHT = 0x27
+VK_DOWN = 0x28
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 # 双击：叠加窗认这一组消息（真实双击就是它们，见 `double_click`）
@@ -108,7 +116,11 @@ user32.AdjustWindowRectExForDpi.argtypes = [
 data_dir = root / "target" / "verify-data"
 shutil.rmtree(data_dir, ignore_errors=True)
 data_dir.mkdir(parents=True, exist_ok=True)
-env = dict(os.environ, SMP_DATA_DIR=str(data_dir))
+# 方向键有没有真的落到播放器上，只能看 mpv 的 IPC trace：进度条/音量圆点就算不动，
+# 也可能只是 tick 的乐观更新，反过来也一样（声音变了、界面没动）。
+mpv_trace = root / "target" / "verify-mpv-trace.log"
+mpv_trace.unlink(missing_ok=True)
+env = dict(os.environ, SMP_DATA_DIR=str(data_dir), SMP_MPV_TRACE=str(mpv_trace))
 
 # 上一轮没收干净的进程会让 `FindWindowW` 拿到一个已经死掉的句柄
 subprocess.run(["taskkill", "/F", "/IM", "simple-media-player.exe"], capture_output=True)
@@ -224,6 +236,28 @@ def wait_settled(timeout=3.0):
     wait_region(lw - 2, 17, True, timeout)
     wait_region(lw - 123, lh - 55, True, timeout)
     time.sleep(0.15)
+
+
+def press_key(vk):
+    """往主窗口投递一次真实按键（按下 + 抬起）。
+
+    GPUI 在 `WM_KEYDOWN` 时就组 `Keystroke` 并跑 App 级拦截，所以 wparam 里的
+    虚拟键码是唯一要紧的东西；`lparam` 按「重复次数 1 + 扫描码」随便填能过。
+    """
+    user32.PostMessageW(hwnd, WM_KEYDOWN, vk, 0x00010001)
+    time.sleep(0.06)
+    user32.PostMessageW(hwnd, WM_KEYUP, vk, 0xC0010001)
+
+
+def trace_hits(needle):
+    """mpv IPC trace 里包含 `needle` 的行数（文件没生成时算 0）。"""
+    if not mpv_trace.exists():
+        return 0
+    return sum(
+        1
+        for line in mpv_trace.read_text(encoding="utf-8", errors="replace").splitlines()
+        if needle in line
+    )
 
 
 # 抢前台：脚本所在进程不在前台时，`SetForegroundWindow` 会被系统拒绝（只有前台
@@ -712,6 +746,26 @@ print(f"全屏态点「最大化」→ 回窗口 {max_exits}；client = {cw3}x{c
 
 grab(root / "target" / "floating-06-restored.png")
 
+# ---- 6. 方向键：左右 ±5 秒、上下 ±5% 音量 -------------------------------
+#
+# 判据落在 mpv 的 IPC trace 上：界面上的进度条/音量圆点就算没动，也可能只是
+# tick 的乐观更新；反过来"声音变了界面没动"同样是 bug。只有 `seek` /
+# `set_property volume` 这条命令真的发出去了才算接通。
+seeks_before = trace_hits('"seek"')
+vols_before = trace_hits('"volume"')
+press_key(VK_RIGHT)
+time.sleep(0.9)
+seeks_after = trace_hits('"seek"')
+press_key(VK_UP)
+time.sleep(0.7)
+vols_after = trace_hits('"volume"')
+seek_keys_ok = seeks_after > seeks_before
+volume_keys_ok = vols_after > vols_before
+print(
+    f"方向键 → seek 命令 {seeks_before}→{seeks_after} 条，"
+    f"volume 命令 {vols_before}→{vols_after} 条"
+)
+
 proc.terminate()
 try:
     proc.wait(timeout=5)
@@ -825,4 +879,14 @@ if not drag_aligned:
     ok = False
 else:
     print("OK: 拖动后外框依旧对齐")
+if not seek_keys_ok:
+    print("FAIL: 右键没把 seek 发给 mpv（方向键没接通）")
+    ok = False
+else:
+    print("OK: 左右键真的把 seek 发给了 mpv")
+if not volume_keys_ok:
+    print("FAIL: 上键没把 volume 发给 mpv（方向键没接通）")
+    ok = False
+else:
+    print("OK: 上下键真的把 volume 发给了 mpv")
 print("ALL OK" if ok else "SOME CHECKS FAILED")

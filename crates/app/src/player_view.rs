@@ -96,6 +96,18 @@ const ICON_FORWARD_10: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewB
 /// 窗口尺寸变化后多久落盘一次（tick 计数，50 ≈ 5s）。
 const WINDOW_SAVE_TICKS: usize = 50;
 
+/// 方向键的跳转步长（秒）：左右各 5 秒。
+///
+/// 走带上的 ±10 秒按钮是「粗调」，方向键留给「微调」——这和 mpv / IINA 的习惯一致，
+/// 连按几次能落到比按钮更细的位置上。
+const KEY_SEEK_STEP: f64 = 5.0;
+
+/// 方向键的音量步长（百分点）：上下各 5%。
+///
+/// 100/5 = 20 档，从静音按到满音量最多 20 下，比 1% 那种按到手酸、比 10% 那种
+/// 一按就跳过头都更合适。
+const KEY_VOLUME_STEP: i32 = 5;
+
 /// 订阅向量的固定下标。
 const SUB_SEEK: usize = 1;
 
@@ -108,6 +120,43 @@ type VideoRectCell = Rc<Cell<Option<(f32, f32, f32, f32)>>>;
 struct VideoRuntime {
     overlay: Option<VideoOverlay>,
     engine: Option<VideoEngine>,
+}
+
+/// 方向键的四个方向。
+///
+/// 单独抽出来是因为它要在两处用：`intercept_keystrokes` 里判「这个键要不要吃」、
+/// 以及 `handle_arrow` 里决定动作。散着写就得比较四遍字符串，错一个字母是静默失效
+/// （`Keystroke.key` 是小写命名键，写错只会匹配不上，不会报错）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArrowKey {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl ArrowKey {
+    fn parse(key: &str) -> Option<Self> {
+        Some(match key {
+            "left" => Self::Left,
+            "right" => Self::Right,
+            "up" => Self::Up,
+            "down" => Self::Down,
+            _ => return None,
+        })
+    }
+
+    /// 左右是「有片子才有意义」的跳转；上下改的是全局音量，没有曲目时也该生效。
+    fn needs_track(self) -> bool {
+        matches!(self, Self::Left | Self::Right)
+    }
+}
+
+/// 相对跳转的落点：夹到 `[0, 时长]` 之间。
+///
+/// 越界后播放器自己会回弹，用户在进度条上看到的就是「按了右键、进度却往回退」。
+pub(crate) fn seek_target(position: f64, delta: f64, max: f64) -> f64 {
+    (position + delta).clamp(0.0, max)
 }
 
 pub struct PlayerView {
@@ -418,7 +467,27 @@ impl PlayerView {
                             false
                         }
                     }
-                    _ => false,
+                    // 方向键：左右 ±5 秒、上下 ±5% 音量。
+                    //
+                    // 为什么不在走带/音量的 Slider 上挂 on_key_down：gpui-component 0.7.3
+                    // 的 `Slider` 没有 `FocusHandle`、也不参与键盘（上游硬限制），
+                    // 焦点永远落不到它身上，键只能在这一层接。
+                    key => match ArrowKey::parse(key) {
+                        Some(arrow) => {
+                            let ready = weak
+                                .read_with(cx, |view, _| {
+                                    !arrow.needs_track() || view.current.is_some()
+                                })
+                                .unwrap_or(false);
+                            if ready {
+                                let _ = weak
+                                    .update(cx, |view, cx| view.handle_arrow(arrow, window, cx));
+                            }
+                            // 没有曲目时不吞左右键：将来把方向键留给列表导航还来得及。
+                            ready
+                        }
+                        None => false,
+                    },
                 };
                 if handled {
                     cx.stop_propagation();
@@ -1154,8 +1223,12 @@ impl PlayerView {
         }
     }
 
-    /// 相对跳转（±10 秒按钮）：夹到 [0, 时长] 之间，避免越界后播放器自己回弹。
-    fn seek_rel(&mut self, delta: f64) {
+    /// 相对跳转（±10 秒按钮 / 方向键）：夹到 [0, 时长] 之间，避免越界后播放器自己回弹。
+    ///
+    /// 播到末尾之后引擎已经 `Stopped`，`seek` 在那时是空操作——必须先重新起播，
+    /// 否则用户越到结尾再按「后退」就是「按了没反应」（方向键会被连续按，这种死区
+    /// 尤其刺眼）。
+    fn seek_rel(&mut self, delta: f64, cx: &mut Context<Self>) {
         if self.current.is_none() {
             return;
         }
@@ -1171,8 +1244,67 @@ impl PlayerView {
                 .map(|e| e.position_secs())
                 .unwrap_or(0.0)
         };
-        let target = (position + delta).clamp(0.0, self.seek_max as f64);
+        let target = seek_target(position, delta, self.seek_max as f64);
+
+        // 音频播完（state = Stopped）：从目标位置重新起播。
+        let stopped = !self.video_active
+            && self
+                .engine
+                .as_ref()
+                .is_some_and(|e| e.state() == PlaybackState::Stopped);
+        if stopped {
+            let track = self
+                .current
+                .and_then(|index| self.playlist.read(cx).delegate().track(index).cloned());
+            // 视频播完时 tick 会 `stop()` + 退出视频模式，这一刻用音频引擎重起一个 mp4
+            // 只会解码失败、弹一条假错误。视频的「播完再往回跳」不在这一版里做。
+            if track
+                .as_ref()
+                .is_some_and(|track| is_video_file(Path::new(&track.path)))
+            {
+                return;
+            }
+            if let (Some(track), Some(engine)) = (track, &mut self.engine) {
+                if let Err(err) = engine.play_at(&track.path, target) {
+                    self.report_error(format!("无法播放「{}」：{err}", track.title));
+                }
+                cx.notify();
+            }
+            return;
+        }
+
         self.seek_to(target);
+    }
+
+    /// 方向键：左右 ∓5 秒、上下 ±5% 音量。
+    ///
+    /// 音量走 `SliderState` 而不是只改 `volume_pct`：滑块的拇指位置是它自己那份状态，
+    /// 只改镜像字段的话声音变了、界面上的圆点不动——看起来像没反应。
+    /// `set_value` 不会发 `SliderEvent::Change`，所以引擎与持久化仍要自己调一次。
+    fn handle_arrow(&mut self, arrow: ArrowKey, window: &mut Window, cx: &mut Context<Self>) {
+        match arrow {
+            ArrowKey::Left => self.seek_rel(-KEY_SEEK_STEP, cx),
+            ArrowKey::Right => self.seek_rel(KEY_SEEK_STEP, cx),
+            ArrowKey::Up | ArrowKey::Down => {
+                let delta = if arrow == ArrowKey::Up {
+                    KEY_VOLUME_STEP
+                } else {
+                    -KEY_VOLUME_STEP
+                };
+                let next = (self.volume_pct + delta).clamp(0, 100);
+                // 已经顶到 0 / 100：不重复写盘（按住不放会以 30Hz 打 settings.json）
+                if next == self.volume_pct {
+                    return;
+                }
+                self.volume
+                    .update(cx, |state, cx| state.set_value(next as f32, window, cx));
+                self.set_volume_pct(next, cx);
+                return;
+            }
+        }
+        // 进度条下一帧由 tick 同步（`user_seeking` 为 false 时每 100ms 一次），
+        // 这里只把视图标脏，让新位置尽快画出来。
+        cx.notify();
     }
 
     /// 展开/收起悬浮播放列表（新版设计稿默认收起，省下整块画面）。
@@ -2371,7 +2503,7 @@ impl PlayerView {
             .tooltip(label)
             .accessibility_label(label)
             .on_click(cx.listener(move |this, _e, _w, cx| {
-                this.seek_rel(if forward { 10.0 } else { -10.0 });
+                this.seek_rel(if forward { 10.0 } else { -10.0 }, cx);
                 cx.notify();
             }))
             .child(
@@ -2431,6 +2563,10 @@ pub(crate) struct ViewSnapshot {
     pub pill: Option<String>,
     /// 排队待弹的普通提示条数（>0 表示下一次 tick 会弹 toast/胶囊）
     pub pending_info: usize,
+    /// 当前音量（百分点）——方向键上下要改它
+    pub volume_pct: i32,
+    /// 当前播放位置（秒）——方向键左右要改它
+    pub position: f64,
 }
 
 #[cfg(test)]
@@ -2446,6 +2582,19 @@ impl PlayerView {
                 .status_pill_live()
                 .map(|(message, _, _)| message.to_string()),
             pending_info: self.pending_infos.len(),
+            volume_pct: self.volume_pct,
+            position: if self.video_active {
+                self.video
+                    .engine
+                    .as_ref()
+                    .map(|e| e.status().position)
+                    .unwrap_or(0.0)
+            } else {
+                self.engine
+                    .as_ref()
+                    .map(|e| e.position_secs())
+                    .unwrap_or(0.0)
+            },
         }
     }
 
@@ -2517,6 +2666,27 @@ impl PlayerView {
     /// 测试用：点「最大化」按钮（全屏时它的语义是回到窗口）。
     pub(crate) fn test_toggle_maximize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.toggle_maximize(window, cx);
+    }
+
+    /// 测试用：当前音量（百分点，镜像自音量滑块）。
+    pub(crate) fn test_volume_pct(&self) -> i32 {
+        self.volume_pct
+    }
+
+    /// 测试用：音量滑块自己那份状态——拇指位置靠它，光改 `volume_pct` 界面不会动。
+    ///
+    /// 返回实体而不是值：调用方在 `view.read(cx)` 里拿不到第二份 `cx` 去 `read` 它。
+    pub(crate) fn test_volume_slider(&self) -> Entity<SliderState> {
+        self.volume.clone()
+    }
+
+    /// 测试用：把音频引擎按回停止态，模拟「播完了」。
+    ///
+    /// 真实流程里是 tick 发现 `track_finished()` 才 `stop()`，无头测试没有那个定时器。
+    pub(crate) fn test_stop_engine(&mut self) {
+        if let Some(engine) = &mut self.engine {
+            engine.stop();
+        }
     }
 }
 

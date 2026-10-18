@@ -988,6 +988,63 @@ python scripts/verify_floating_chrome.py   # → ALL OK（14 项）
 - 影院模式下 chrome（标题带 + 胶囊）一直可见，没有做"IINA 那样鼠标静止 2 秒自动隐藏"；
 - 全屏只有"铺满所在显示器"一种，不做"无边框覆盖多屏"。
 
+### ⌨ 第十轮：方向键接通播放器（2026-10-18）
+
+需求：`←`/`→` 前进后退、`↑`/`↓` 调音量。此前**一个都没接**——`intercept_keystrokes`
+里只有 `escape` 和 `f11`。
+
+#### 1. 只能在这一层接
+
+gpui-component 0.7.3 的 `Slider` 没有 `FocusHandle`、也不参与键盘（上游硬限制），
+焦点永远落不到进度条/音量条身上。所以没有"给 Slider 挂 `on_key_down`"这条路，
+`PlayerView` 的 App 级拦截是唯一入口。
+
+key 名是 GPUI 的命名键（`platform/keystroke.rs` 的 `is_named_key`）：`left` /
+`right` / `up` / `down`。**写错不会报错**，只会静默匹配不上，所以解析单独抽了
+`ArrowKey::parse`，并在 `ui_tests` 里用真实 `dispatch_keystroke` 盯着。
+
+#### 2. 步长
+
+| 键 | 动作 | 理由 |
+|---|---|---|
+| `←` / `→` | ±5 秒 | 走带上的 ±10 秒按钮是粗调，方向键微调（mpv / IINA 同款） |
+| `↑` / `↓` | ±5% 音量 | 20 档；1% 要按到手酸，10% 一按就过头 |
+
+#### 3. 三个必须一起改的地方
+
+- **音量要写 `SliderState`**：`volume_pct` 只是镜像，拇指在 `SliderState` 里。
+  只改镜像 = 声音变了、圆点不动。而 `set_value` 不发 `SliderEvent::Change`，
+  所以引擎 + 持久化还得自己调一次 `set_volume_pct`。
+- **顶到 0/100 就别再写盘**：按住不放会以 ~30Hz 打 `settings.json`。
+- **播完后 `seek` 是空操作**：`AudioEngine::seek` 在 `Stopped` 直接返回 `false`
+  （sink 空了，没有可 seek 的东西），用户连按右键到结尾再按左键就是"没反应"。
+  这条路径改走新增的 `AudioEngine::play_at(path, secs)`（起播 + `try_seek`）。
+  视频例外：播完 tick 会 `stop()` + 退出视频模式，此刻用音频引擎重起 mp4 只会解码
+  失败，所以先判 `is_video_file` 直接返回——视频的"播完往回跳"这一版没做。
+
+#### 4. 验收
+
+`scripts/verify_floating_chrome.py` 新增第 9 项，判据落 **mpv 的 IPC trace**
+（`SMP_MPV_TRACE`）：界面动没动不算数（可能只是 tick 的乐观更新），必须看到
+`{"command":["seek",…]}` 和 `{"command":["set_property","volume",…]}` 真的发出去。
+
+真机实测（40s 彩条片，投递 `WM_KEYDOWN`）：
+
+```text
+seek 目标（秒）： [8.92, 14.04, 19.29, 14.96]      ← 右键×3 后左键×1
+volume 命令：    [75.0, 80.0, 85.0, 80.0]          ← 默认 70 起
+settings.volume = 0.8
+```
+
+验收脚本 `ALL OK` 扩到 16 项；测试 `30（app）+ 17（core）` 全过，新增
+`arrow_keys_seek_and_adjust_volume`（UI）与 `play_at_starts_near_requested_position`
+（core，真音频设备）。
+
+#### 已知限制
+
+- 视频播完不能靠方向键倒回去（见上一节第 3 条）；
+- 方向键不分长短按：没有"按住加速"（连续按即可，等价于 mpv 的连击）。
+
 
 ---
 

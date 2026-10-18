@@ -88,6 +88,21 @@ impl AudioEngine {
             .is_ok()
     }
 
+    /// 从指定秒数开始播放。
+    ///
+    /// 播到末尾后引擎是 `Stopped`，此时 [`Self::seek`] 是空操作（sink 已经空了，
+    /// 没有可 seek 的东西）。用户按「后退」却什么都没发生，看起来就是功能坏了；
+    /// 这条路径负责重新起播并落到目标位置。
+    pub fn play_at(&mut self, path: &str, secs: f64) -> Result<(), EngineError> {
+        self.play(path)?;
+        if secs > 0.0 {
+            // 刚 append 的源可能还没被解码线程接管，`try_seek` 会短暂失败；
+            // 失败也不致命（等价于从头播），不能把整次播放判成错误。
+            let _ = self.sink.try_seek(Duration::from_secs_f64(secs));
+        }
+        Ok(())
+    }
+
     /// 音量，0.0 ~ 1.0，立即生效于当前曲目。
     pub fn set_volume(&mut self, volume: f32) {
         let volume = volume.clamp(0.0, 1.0);
@@ -183,6 +198,25 @@ mod tests {
             (1.9..=2.6).contains(&pos),
             "seek 到 2s 后位置应在 1.9~2.6，实际 {pos}"
         );
+    }
+
+    #[test]
+    fn play_at_starts_near_requested_position() {
+        let Some(mut engine) = engine_or_skip() else {
+            return;
+        };
+        let wav = write_test_wav(8.0);
+
+        engine
+            .play_at(wav.to_str().unwrap(), 4.0)
+            .expect("play_at wav");
+        std::thread::sleep(Duration::from_millis(300));
+        let pos = engine.position_secs();
+        assert!(
+            (3.8..=4.9).contains(&pos),
+            "play_at(4.0) 应从 4s 附近开始，实际 {pos}"
+        );
+        assert_eq!(engine.state(), PlaybackState::Playing);
     }
 
     #[test]
