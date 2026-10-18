@@ -20,6 +20,11 @@
 - 别给叠加窗加 `WS_EX_TRANSPARENT`：整窗不再被合成（帧在、看不见）。
 - `Window::zoom_window()` 在 Win 只最大化不还原（gpui-pre 0.3.9 只发 `SW_MAXIMIZE`）→ 自写 `window_actions::{is_zoomed,set_zoomed}`，**必须 `ShowWindowAsync`**（同步 `ShowWindow` 在事件派发里重入 `WM_SIZE` → 界面仍画旧尺寸、hitbox 全错位）。异步代价：`IsZoomed` 仍旧值 → 状态乐观更新 + `zoom_pending` 300ms 不反向纠正。
 - 拖动/双击**自己实现**：`WM_NCLBUTTONDOWN/HTCAPTION` 只跟上头一两步（GPUI wndproc 吃掉 `WM_MOUSEMOVE`），`WM_NCLBUTTONDBLCLK` 会丢 `WS_MAXIMIZE`；双击需窗口类 `CS_DBLCLKS`。标题栏拖拽区映射 HTCAPTION 后，**`on_double_click` 根本不被调用**（日志可证）。
+- **`WM_LBUTTONDBLCLK` 压根不会来**（`WS_EX_NOACTIVATE` + 从未激活的窗口，带 `CS_DBLCLKS` 也没用）→ 自己判双击：`GetDoubleClickTime` + `SM_CXDOUBLECLK(36)/SM_CYDOUBLECLK(37)`，坐标务必用 `GetCursorPos` 的**屏幕坐标**（用 lparam 的客户区坐标会在窗口移动/最大化瞬间判失败）。命中后清空，三连击 = 一次双击 + 一次单击。
+- **`SetWindowPos` 不能在 `Context::update` 里调**：它同步派发 `WM_SIZE` → 立刻重布局，而 App 正被本轮更新可变借用 → `handle.update` 失败、布局停在旧尺寸、hitbox 全错位（与同步 `ShowWindow` 同一个病）。丢进 `cx.spawn_in(window, async move {…}).detach()` 的前台任务即可（借用已释放）。
+- **mpv 的 `dwidth/dheight` 会先报 0.75 倍的假值**（1280×720 的片子先报 960×540），隔一帧才是真值 → 按"同一尺寸连报两次"才动窗口（`fit_seen`），否则肉眼两次跳变。窗口尺寸取 `dwidth/dheight`（显示尺寸）而非 `width/height`（编码尺寸，anamorphic 会拉扁）。
+- 视频模式的窗口尺寸**不落盘**（那份尺寸是按画面算的，存下来会让音频模式下次启动跟着某部片子的比例走）。
+- z 序：`ShowWindow` 会把叠加窗提到最前、别的进程也能提主窗 → 每帧 `GetWindow(main, GW_HWNDNEXT) == overlay` 查一次，不对才 `SetWindowPos`（查是用户态调用，比每 100ms 打一次 SetWindowPos 便宜）。
 - 叠加窗 `WS_EX_NOACTIVATE` → 点画面**不激活/不前置**主窗，且"后台时第一次点击"会被系统当激活吃掉（表现为双击要按两次）→ wndproc 里 `WM_LBUTTONDOWN` / `WM_LBUTTONDBLCLK` 先 `SetForegroundWindow(main)` 再干活。
 - `cx.on_app_quit` 只在显式 `App::quit()` 时触发，关窗口不走 → 清理靠 Drop（退出留痕 `persistence::log_session` → `%APPDATA%/simple-media-player/session.log`）。
 - 进程"自行退出"分三档：日志有 `player_view dropped`+`event loop returned`=优雅；只有 `start`=被硬杀（宿主清进程树）；应用本身无自杀路径。
@@ -60,6 +65,7 @@
 - `cargo update -p X --precise` 在咬死依赖图上死循环 → 直接删 `Cargo.lock` 对应 `[[package]]` 块让 cargo 重解（`test-support` → `gpui-fast-macos` 要 cocoa 0.26.0 就是一例）。
 - `scripts/shot.py`：必须先 `SetProcessDpiAwareness(2)`（否则按 96dpi 虚拟化 → 只截到左上角，"歌单和控制栏消失"）；`SetWindowPos` 设外框（1560×1020 外框 ≈ 1538×964 客户区），按目标客户区用 `AdjustWindowRectExForDpi` 反推；DWM 动画期间抢截会留黑边，需轮询等位置稳定。
 - 验收取样要用**实测客户区**换算：实测 1898×1189 物理 ÷1.5 = 1265×793 而非设的 1280×800，按设定尺寸换算会点进间隙。
+- **改完窗口尺寸后的取样必须等 mpv 重配 VO**：叠加窗几何先到位，画面还按旧尺寸画 → 截到"右边一条露桌面"，看着像"没铺满/被洗白"（曾据此误判成玻璃问题）。做法：`wait_aligned()` 后按 0.15s 重试取样，最多 3s。另外注意样片 `verify-long.mp4` 的彩条本身有接近纯白的条，`colorful()` 判据要挑高饱和的取样点。
 - 脚本一律跑隔离配置目录：`SMP_DATA_DIR` 顶掉 `%APPDATA%\simple-media-player`（曾直接改真实 playlist.json 覆盖用户在用的列表，踩过两次）。
 - 诊断开关（保留）：`SMP_MPV_LOG` 存 mpv stderr、`SMP_MPV_TRACE` 存 JSON IPC 双向报文。mpv 对路径重复分隔符不宽容（`C://` → `end-file reason=error file_error="loading failed"`），且 `--msg-level=all=error` 下 stderr 是空的，只有 IPC 报文能看出真相。
 
@@ -72,6 +78,11 @@
 - 视频模式标题带也要铺 `overlay::glass()`（画面顶到边时曲名读不出来）。
 - 验收两层：`scripts/verify_floating_chrome.py`（真机：出帧/区域/对齐/玻璃透色/歌单 PtInRegion/拖动/双击）+ `ui_tests::chrome_region_covers_capsule_and_panel`（区域矩形 vs 布局）。
 - 代价：无区域级 backdrop blur（acrylic 只能整窗）、无 Aero Snap、缩放动画可能闪一帧。歌单面板保持 Latte 浅底（改深底会让 `List` 行文字不可读）。
+
+## 窗体大小 = 内容大小（第八轮，2026-10-18）
+- 起播按 mpv `dwidth/dheight` 把窗口调成画面尺寸：`plan_fit`（纯函数：1:1 → 缩进工作区 → 放大到最小窗口，中心锚点 + 夹回 `rcWork`）→ `fit_to_video`。执行必须走 `cx.spawn_in`（见上文 `SetWindowPos` 那条）。
+- `fit_done: Option<(w,h)>` 每部片子只调一次（`start_video` 清空）；`fit_seen` 做"同尺寸连报两次"去抖；最大化/影院/全屏时不动窗口，`fit_done` 留空、退出后下一帧补上。
+- 最大化状态下按住画面也能拖（只在最小化时无视）；`set_rect` 改为每帧 `ensure_below` 查一次 z 序。
 
 ## 设计稿要点
 - 色板严格取 Catppuccin Latte 官方值；Mauve #8839EF 唯一强调色。**v2 起两套色板**：应用表面 Latte/Mocha，叠加层深色玻璃（`theme::overlay`）。
