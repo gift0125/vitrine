@@ -660,7 +660,11 @@ const segMode = document.getElementById('segMode');
 segMode.addEventListener('click', e => {
   const b = e.target.closest('button'); if(!b) return;
   segMode.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
-  applyLayers(b.dataset.layers || '');
+  const spec = b.dataset.layers || '';
+  applyLayers(spec);
+  /* 「Win 现状（无模糊）」是在演另一套实现：那边根本没有折射，液态玻璃要跟着关掉，
+     否则这个对照档会显示成玻璃，误导人。离开 noblur 时恢复到默认档。 */
+  if(window.pickLiquid) window.pickLiquid(spec.includes('noblur') ? 'off' : 'edge');
 });
 
 /* ---------- L2：从画面取色做"染色" ----------
@@ -1015,7 +1019,9 @@ function applyLiquid(mode){
     pick(b.dataset.liquid);
   });
   /* 默认档 = 边缘折射（2026-10-18 定）：它比 L3 只多一圈弯折，成本和观感都稳；
-     full 档的高光与色散留作加强档。?liquid=off 仍是唯一的关法。 */
+     full 档的高光与色散留作加强档。?liquid=off 仍是唯一的关法。
+     pick 挂到 window 上，给「Win 现状（无模糊）」那档联动关掉用。 */
+  window.pickLiquid = pick;
   const fromUrl = qs.get('liquid');
   pick(fromUrl === null ? 'edge' : (['edge','full'].includes(fromUrl) ? fromUrl : 'off'));
 })();
@@ -1145,6 +1151,8 @@ if(qs.has('layers')){
   const l = qs.get('layers');
   applyLayers(l);
   segMode.querySelectorAll('button').forEach(b => b.classList.toggle('on', (b.dataset.layers||'') === l));
+  /* 演「Win 现状（无模糊）」时那边根本没有折射，液态玻璃跟着关（显式给了 liquid 就听用户的） */
+  if(!qs.has('liquid') && l.includes('noblur') && window.pickLiquid) window.pickLiquid('off');
 }
 if(qs.get('panel')){
   // ?panel=osd|playlist|both，也认逗号列表——三块玻璃面一起出现时才好比较
