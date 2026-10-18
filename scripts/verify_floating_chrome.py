@@ -256,7 +256,16 @@ def double_click(lx, ly):
 
 
 def sample(img, lx, ly):
-    return img.getpixel((round(lx), round(ly)))
+    """取一个像素；越界时返回黑色而不是抛异常。
+
+    拖动途中截图偶尔会拿到被屏幕边缘裁掉一小块的图（`ImageGrab` 对越界的 bbox
+    是裁剪语义），那时按原坐标取样会 IndexError 把整个脚本打断——判定层需要的
+    是"这个点没取到彩条"这种结论，不是 traceback。
+    """
+    x, y = round(lx), round(ly)
+    if x < 0 or y < 0 or x >= img.width or y >= img.height:
+        return (0, 0, 0)
+    return img.getpixel((x, y))
 
 
 def colorful(px):
@@ -343,6 +352,35 @@ while time.time() < deadline:
 img_fit.save(out_dir / "floating-00-fit.png")
 print(f"  画面右缘像素 = {fit_edge}   ← 应为彩条（有黑边就不是）")
 print(f"  视频窗是否已跟上新几何 = {fit_aligned}")
+
+# ---- 0.5 圆角 ----------------------------------------------------------
+# 视频模式两块窗口都设了 `DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND`。
+# 像素判据不稳（角外是桌面，颜色不可控），这里查**属性值**证明请求发出去了，
+# 再打一行角上的实测像素供人眼复核。2 = ROUND / 1 = DONOTROUND。
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+
+
+def corner_pref(handle):
+    value = ctypes.c_uint(0)
+    ctypes.windll.dwmapi.DwmGetWindowAttribute(
+        wintypes.HWND(handle),
+        ctypes.c_uint(DWMWA_WINDOW_CORNER_PREFERENCE),
+        ctypes.byref(value),
+        ctypes.sizeof(value),
+    )
+    return value.value
+
+
+corner_main = corner_pref(hwnd)
+corner_overlay = corner_pref(overlay)
+rounded_ok = corner_main == 2 and corner_overlay == 2
+wx, wy, _, _ = frame_rect()
+corner_px = ImageGrab.grab(bbox=(wx, wy, wx + 4, wy + 4)).getpixel((1, 1))
+inner_px = ImageGrab.grab(bbox=(wx + 8, wy + 8, wx + 12, wy + 12)).getpixel((1, 1))
+print(
+    f"  圆角：主窗={corner_main} 视频窗={corner_overlay}（2=ROUND）"
+    f"  角上像素={corner_px} 往里 8px={inner_px}"
+)
 
 # 后面几步（点击 / 拖动 / 双击）需要稳定的几何，先按脚本自己的尺寸把窗口摆好：
 # 按**目标客户区**反推外框。`AdjustWindowRectExForDpi` 在这类自绘标题栏
@@ -512,6 +550,15 @@ def wait_maximized(bigger, base, timeout=4.0):
 # 走的是叠加窗自己的 `WM_LBUTTONDBLCLK` → `window_actions::set_zoomed`。
 # 和歌单一样按**结果**重试：合成鼠标事件偶发被系统吞掉，那不是应用的问题，
 # 但重试仍不对就必须报失败。
+#
+# 先把窗口摆回**确定的位置**：上一步的拖动会让它停在任意地方（实测出现过
+# 拖到屏幕左上角外侧、坐标变负数），那时按客户区原点算出来的双击点会落到别的
+# 窗口上，判定就成了假失败。
+_, _, outer_w, outer_h = frame_rect()
+user32.SetWindowPos(hwnd, HWND_TOPMOST, 60, 60, outer_w, outer_h, SWP_SHOWWINDOW)
+time.sleep(0.6)
+wait_aligned()
+
 base_client = client_rect()
 zoomed, zoom_style = False, False
 for attempt in range(1, 3):
@@ -565,6 +612,13 @@ elif not colorful(fit_edge):
     ok = False
 else:
     print(f"OK: 起播即把窗口调成画面尺寸 {fit_client}（1:1），画面铺满不留黑边")
+if not rounded_ok:
+    print(
+        f"FAIL: 视频模式没设圆角（主窗={corner_main} 视频窗={corner_overlay}，期望都是 2）"
+    )
+    ok = False
+else:
+    print(f"OK: 视频模式两块窗口都设了圆角（角上像素 {corner_px}，不是画面本体）")
 if not colorful(mid):
     print(f"FAIL: 画面中心不是彩条（{mid}），画面区没从窗口区域里减掉")
     ok = False

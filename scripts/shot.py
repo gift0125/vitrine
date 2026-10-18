@@ -2,13 +2,16 @@
 
 用法：python scripts/shot.py <输出png> [--dark] [--w 1040] [--h 680]
                               [--click "x,y"]... [--wait 2.0] [--keep]
-                              [-- <透传给应用的参数>]
+                              [--margin 16] [-- <透传给应用的参数>]
 
 --click 可以给多次，按顺序投递点击（例如先展开播放列表、再点某一集）。
 `--` 之后的参数原样传给应用（例如 `-- --play D:\\movie.mp4` 直接起播）。
 
 --w/--h 是**逻辑**尺寸（与设计稿 1280×800 同一坐标系）；脚本按屏幕缩放比换算成
 物理像素，截完再缩回逻辑尺寸，这样高 DPI 下也是 1:1 的清晰图。
+
+--margin 在客户区外留一圈（逻辑像素）：圆角、DWM 阴影这些都在客户区之外，只截客户区
+看不到。留了 margin 之后窗口会被放到 (margin, margin)，免得 bbox 越过屏幕边缘被裁。
 """
 
 import ctypes
@@ -44,6 +47,9 @@ keep = "--keep" in args
 width = int(args[args.index("--w") + 1]) if "--w" in args else 1040
 height = int(args[args.index("--h") + 1]) if "--h" in args else 680
 wait = float(args[args.index("--wait") + 1]) if "--wait" in args else 1.5
+# 截图时在客户区外留一圈（逻辑像素）：圆角、DWM 阴影这些都在客户区**之外**，
+# 只截客户区就看不到它们。
+margin = int(args[args.index("--margin") + 1]) if "--margin" in args else 0
 clicks = []
 for i, a in enumerate(args):
     if a == "--click":
@@ -90,6 +96,7 @@ if not hwnd:
 
 scale = user32.GetDpiForWindow(hwnd) / 96.0
 phys_w, phys_h = round(width * scale), round(height * scale)
+margin_px = round(margin * scale)
 
 # SetWindowPos 设的是**窗口**尺寸，客户区会少掉边框和标题栏（实测 1560 的外框
 # 只给出 1538 的客户区），截完再拉伸就会让 1px 的边距对不上。这里先按目标客户区
@@ -105,7 +112,7 @@ if HAS_ADJUST_DPI:
         outer_w = frame.right - frame.left
         outer_h = frame.bottom - frame.top
 
-user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, outer_w, outer_h, SWP_SHOWWINDOW)
+user32.SetWindowPos(hwnd, HWND_TOPMOST, margin_px, margin_px, outer_w, outer_h, SWP_SHOWWINDOW)
 user32.SetForegroundWindow(hwnd)
 
 
@@ -172,10 +179,16 @@ rect = wintypes.RECT()
 user32.GetClientRect(hwnd, ctypes.byref(rect))
 pt = wintypes.POINT(0, 0)
 user32.ClientToScreen(hwnd, ctypes.byref(pt))
-box = (pt.x, pt.y, pt.x + rect.right, pt.y + rect.bottom)
+box = (
+    pt.x - margin_px,
+    pt.y - margin_px,
+    pt.x + rect.right + margin_px,
+    pt.y + rect.bottom + margin_px,
+)
 img = ImageGrab.grab(bbox=box)
-if img.size != (width, height):
-    img = img.resize((width, height), Image.LANCZOS)
+want = (width + margin * 2, height + margin * 2)
+if img.size != want:
+    img = img.resize(want, Image.LANCZOS)
 out.parent.mkdir(parents=True, exist_ok=True)
 img.save(out)
 print(f"saved {out} {img.size} scale={scale} client={rect.right}x{rect.bottom}")

@@ -569,6 +569,9 @@ mod win {
             // 让 Explorer 把拖到画面上的文件转成 WM_DROPFILES
             DragAcceptFiles(hwnd, 1);
         }
+        // 画面也要圆角：窗口最上面两个角是主窗口的标题带、最下面两个角就是这块画面，
+        // 只圆主窗口会留下两个方角（半径必须一致，所以两边都用 DWM 的圆角）。
+        crate::window_actions::set_rounded(hwnd, true);
         Some(hwnd)
     }
 

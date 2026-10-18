@@ -1,4 +1,4 @@
-//! 主窗口的窗口动作：最大化 / 还原 / 按画面尺寸调整窗口。
+//! 主窗口的窗口动作：最大化 / 还原 / 按画面尺寸调整窗口 / 圆角。
 //!
 //! ## 为什么不用 `Window::zoom_window()`
 //!
@@ -35,6 +35,20 @@ pub fn is_zoomed(hwnd: Hwnd) -> bool {
 /// 异步：命令投回消息队列，当前事件派发结束后才生效。`hwnd` 为 0 时什么都不做。
 pub fn set_zoomed(hwnd: Hwnd, zoomed: bool) {
     imp::set_zoomed(hwnd, zoomed)
+}
+
+/// 给窗口加/去圆角（Windows 11 的 DWM 圆角，带抗锯齿）。
+///
+/// 视频播放时**两块窗口都要圆**：画面上下的两个角来自视频叠加窗，标题带的两个角
+/// 来自主窗口——只圆一块会在角上露出一个方角。
+///
+/// 为什么不用 `SetWindowRgn` 自己切圆角：区域是 1 bit 的，边缘必然是锯齿；DWM 这条
+/// 属性是系统按 DPI 算好半径再抗锯齿，也是 Windows 11 上所有应用的样子。
+///
+/// Windows 10 没有这条属性（`DwmSetWindowAttribute` 返回 `E_INVALIDARG`），调用会被
+/// 静默忽略、窗口保持直角——这是预期行为，别为它记日志。
+pub fn set_rounded(hwnd: Hwnd, rounded: bool) {
+    imp::set_rounded(hwnd, rounded)
 }
 
 /// 客户区的最小尺寸（逻辑像素）：和 `main.rs` 的 `window_min_size` 保持一致。
@@ -157,6 +171,13 @@ mod imp {
     const SWP_NOZORDER: u32 = 0x0004;
     const SWP_NOACTIVATE: u32 = 0x0010;
 
+    /// `DWMWA_WINDOW_CORNER_PREFERENCE` 与它的取值（Win11 SDK 的头文件值）。
+    ///
+    /// 旧 SDK 里没有这两个名字，所以写死数字而不是引 `windows` crate。
+    const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+    const DWMWCP_DONOTROUND: u32 = 1;
+    const DWMWCP_ROUND: u32 = 2;
+
     #[repr(C)]
     #[derive(Default, Clone, Copy)]
     struct Rect {
@@ -195,6 +216,16 @@ mod imp {
         ) -> i32;
     }
 
+    #[link(name = "dwmapi")]
+    extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: Hwnd,
+            attribute: u32,
+            value: *const std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
     pub fn is_zoomed(hwnd: Hwnd) -> bool {
         hwnd != 0 && unsafe { IsZoomed(hwnd) } != 0
     }
@@ -206,6 +237,26 @@ mod imp {
         let cmd = if zoomed { SW_MAXIMIZE } else { SW_RESTORE };
         unsafe {
             ShowWindowAsync(hwnd, cmd);
+        }
+    }
+
+    pub fn set_rounded(hwnd: Hwnd, rounded: bool) {
+        if hwnd == 0 {
+            return;
+        }
+        let value: u32 = if rounded {
+            DWMWCP_ROUND
+        } else {
+            DWMWCP_DONOTROUND
+        };
+        unsafe {
+            // 失败只可能是「系统不认识这条属性」（Win10），窗口保持直角即可
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                (&value as *const u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            );
         }
     }
 
@@ -284,6 +335,8 @@ mod imp {
     }
 
     pub fn set_zoomed(_hwnd: Hwnd, _zoomed: bool) {}
+
+    pub fn set_rounded(_hwnd: Hwnd, _rounded: bool) {}
 
     pub fn fit_to_video(_hwnd: Hwnd, _video: (u32, u32)) -> bool {
         false

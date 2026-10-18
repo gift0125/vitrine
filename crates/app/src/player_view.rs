@@ -156,6 +156,8 @@ pub struct PlayerView {
     /// 当前已应用的窗口区域（用内容做键，避免每帧都打 SetWindowRgn——
     /// 那会让整窗重绘，画面跟着闪）。第二项是 scale 的位模式（跨屏换 DPI 要重算）。
     chrome_region: Option<(Vec<ChromeRect>, u32)>,
+    /// 主窗口当前是不是圆角状态（视频模式才圆，见 `sync_overlay_rect`）。
+    corners_rounded: bool,
     /// 是否已经把窗口表面的底色改成透明（见 `Render` 里的说明）
     surface_transparent: bool,
     /// GPUI 主窗口句柄（叠加窗口的 z 序基准）
@@ -340,6 +342,7 @@ impl PlayerView {
             video_rect,
             capsule_rect,
             chrome_region: None,
+            corners_rounded: false,
             surface_transparent: false,
             main_hwnd,
             maximized,
@@ -662,6 +665,13 @@ impl PlayerView {
     /// 视频窗在**下面**（见 `video_overlay` 模块头），所以这里只管位置和 z 序：
     /// 内容区不再需要开洞，主窗口的 chrome 半透明，画面自己会从玻璃底下透出来。
     fn sync_overlay_rect(&mut self, window: &Window) {
+        // 圆角：视频播放时整窗变成圆角（画面上下两角来自视频叠加窗，标题带两角来自
+        // 主窗口，见 `window_actions::set_rounded`）；回到音频模式恢复直角。
+        // 只在状态变化时调——改变窗口属性会触发一次重绘，别每帧都打。
+        if self.corners_rounded != self.video_active {
+            self.corners_rounded = self.video_active;
+            window_actions::set_rounded(self.main_hwnd, self.video_active);
+        }
         if !self.video_active {
             if let Some(overlay) = &mut self.video.overlay {
                 overlay.hide();
