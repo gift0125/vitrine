@@ -1113,6 +1113,79 @@ settings.volume = 0.8
 - 字幕/音轨只能循环，不能选具体轨（要做需要 `track-list` + 一个弹出列表，属下一轮）。
 
 
+### 🧩 第十二轮：视频内核换成进程内 libmpv（2026-10-18）
+
+分叉点来自一个对照：IINA 把 `libmpv.2.dylib`（+44 个依赖 dylib）打进 `IINA.app/Contents/Frameworks/`，
+`mpv_create()` 进程内调用、视频走 render API。同一份 mpv，IINA 选择**库**，我们此前选择**进程**。
+于是先算清三条路，再动手：
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| **A（本轮采用）** | 进程内 libmpv，**保留** `--wid` 叠加窗 | 净增约 100 行；窗口合成本身的债原样留着 |
+| B | A 之上换 SW render API → RGBA 帧 → GPUI `img()` | 可删掉 `video_overlay.rs` 965 行；但每帧换 `ImageId`，Win atlas 逐帧新 tile + ~8MB/帧上传，1080p 勉强、4K 不行 |
+| C | D3D11 共享纹理 + DirectComposition | 要 fork `gpui-pre-windows`，开放式工程 |
+
+选 A 的理由不在于"更好"，而在于 A 之后仍能升级到 B/C，反过来不行。
+
+#### 落地形态
+
+- `crates/player-core/src/libmpv.rs`（新，约 470 行）：**运行时加载**（`libloading 0.8` + 手写 ~20 个符号）
+  而不是构建期链接。构建机不需要 DLL，缺库时给一条可见错误（`VideoError::LibmpvNotFound`），
+  而不是进程在加载阶段被系统拒绝。DLL 来源是 `zhongfly/mpv-winbuild` 的 `mpv-dev` 包 —— 官方
+  `mpv.exe` 是**静态链接**的，拆不出 DLL。
+- `crates/player-core/src/video.rs`：删掉命名管道 + JSON 报文 + 子进程管理（约 400 行），换成
+  「`libmpv` 客户端 → 事件线程 → `EngineEvent` → `apply_event` 纯函数 → `VideoStatus`」。
+  `VideoStatus` 字段保持与旧实现一致，`player_view.rs` 的状态机一行没改。
+- 对外 API 只改了一处：`SpawnOptions { libmpv: PathBuf, wid, volume, extra_args }`（原来是 `mpv_path`）。
+- `scripts/fetch-libmpv.ps1`（新）：从 GitHub release 拉 `mpv-dev-x86_64-*.7z`（32MB）并用系统自带
+  `tar.exe` 解出 DLL；`-CopyToExe` 顺手拷到 `target/debug`、`target/release`。
+- `scripts/package.ps1 -WithLibmpv`（原 `-WithMpv`）：把 DLL 放进 exe 同目录（运行时加载**必须**能
+  在 exe 旁边找到它），并带上许可文件。
+
+#### 踩到的坑（都记进 `MEMORY.md` / `libmpv-migration.md`）
+
+| 现象 | 真因 |
+|---|---|
+| `sid`/`aid` 永远不更新 | `observe_property` 的格式必须匹配属性**真实类型**；按 `INT64` 观察字符串属性会让 mpv 整条拒绝该观察 |
+| `--wid` 报错 / 花屏 | `wid` 得用 `mpv_set_option` + `MPV_FORMAT_INT64`，当字符串传时 HWND 高位置 1 会解析成负数 |
+| 字符串属性读一次涨一点内存 | `MPV_FORMAT_STRING` 的结果由 mpv 分配，必须 `mpv_free` |
+| 退出时偶发卡死 | 顺序：set quit → `mpv_wakeup` → join 事件线程 → `mpv_terminate_destroy`；`mpv_wait_event` 用 0.05s 超时而不是 -1 死等 |
+
+#### 验收脚本跟着改的三处
+
+换成进程内解码后，"起播到出首帧"从 ~1s 变成 3~4s（要先初始化 hwdec/d3d11va），脚本里那些
+固定 `sleep` 全部变成了竞态。三处都改成**轮询到结果**：
+
+1. **窗口尺寸**：`wait_client_size(1280×720)` —— 原来只等"尺寸稳定"，会在起播前就返回旧尺寸；
+2. **方向键 / 字幕音轨**：`wait_trace(needle, n)` —— 命令真的写进 trace 才算数；
+3. **信息卡开合**：`wait_darker()` / `wait_region_clear()`。
+
+另外两个是**判据本身**的洞：
+
+- 音轨、字幕两个按钮只隔 40 逻辑像素，连点两次落在 `SM_CXDOUBLECLK`(36) 与双击时限(500ms)
+  里会被判成双击，第二次点击不当单击处理 → 只发出 1 条 `cycle`。拉开到 0.8s；
+- `wait_settled()` 以前只等"顶栏两端/胶囊在区域里"。窗口刚被改尺寸时应用还没按新的视频区
+  重算区域，`GetWindowRgn` 短暂返回**整个窗口**，于是"任意点都在区域里"——歌单明明没展开也被
+  判通过。现在先等**画面中心成为洞**，再用区域判断面板。
+
+#### 结果
+
+- `cargo test`：22（core，含真 DLL 的端到端用例）+ 33（app）全绿；
+- `scripts/verify_floating_chrome.py`：**18 项 ALL OK**（debug 与打包后的 exe 都跑）；
+- 发布包：`dist/simple-media-player-1.0.0.zip` **55.7 MB**（exe 25.6 MB + `libmpv-2.dll` 116.3 MB，
+  压缩后）。DLL 比原来的 `mpv.exe`（110.4 MB）还大 5.9 MB——进程模型不再需要 `mpv.exe`，
+  但同一份 mpv 的代码量没变。
+- 顺手修掉一个**测试自身的竞态**：`find_libmpv` 的 env override 用例原来 `set_var` 改进程环境，
+  和并行跑的真 DLL 用例互相污染（偶发失败）。改成 `find_libmpv_in(exe_dir, overrides, current_exe, PATH)`
+  传参，不再有共享状态。
+
+#### 已知限制
+
+- mpv 崩了就是整个应用一起死（进程隔离消失）。IINA 也接受这个取舍；
+- 叠加窗、窗口区域减法、`keep_below` 这套窗口合成的债**原样保留**——A 只换引擎，不换渲染路径；
+- 想彻底删掉那 965 行 `video_overlay.rs`，只能上 B（SW render API），而 B 卡在逐帧上传。
+
+
 ---
 
 ## 4. 里程碑与时间线

@@ -30,7 +30,7 @@
 | 画面拖动窗体 | 按住画面拖拽即移动窗口（全屏时不拖）；双击标题栏仍是与系统一致的最大化/还原 |
 | 明暗主题 | 右上角一键切换，配色全部走主题 token |
 | 状态持久化 | 播放列表、上次曲目、音量、窗口尺寸自动保存 |
-| 错误提示 | 文件损坏、格式不支持、mpv 缺失等都有提示：音频模式走右上角 toast，视频模式走标题带胶囊 |
+| 错误提示 | 文件损坏、格式不支持、libmpv 缺失等都有提示：音频模式走右上角 toast，视频模式走标题带胶囊 |
 | 无障碍 | 所有图标按钮都有可读名称（`aria_label`） |
 
 ![视频播放：窗口按画面尺寸开好（1280×720 1:1），标题带 / 胶囊压在画面上](docs/screenshots/chroma-video.png)
@@ -46,12 +46,15 @@
 ## 环境要求
 
 - **Windows 10 / 11**（当前只验证了 Windows；GPUI Kit 本身跨平台，代码里 macOS/Linux 分支未测试）
-- **mpv**（仅视频播放需要）：任选一种方式
-  - 安装到 PATH
-  - 放到 `C:\Program Files\mpv\mpv.exe`
-  - 用环境变量指定：`set SMP_MPV_PATH=D:\tools\mpv.exe`
+- **libmpv-2.dll**（仅视频播放需要，进程内加载）。任选一种方式：
+  - 用带视频支持的发布包（`scripts/package.ps1 -WithLibmpv` 已把 DLL 放在 exe 同目录）
+  - 源码构建后跑 `scripts/fetch-libmpv.ps1 -CopyToExe`（自动下载 mpv-dev 并拷到 `target/debug`、`target/release`）
+  - 自己放置：DLL 与 exe 同目录、或放进 PATH、或 `set SMP_LIBMPV_PATH=D:\tools\libmpv-2.dll`
 
-音频功能不依赖 mpv；mpv 缺失时视频区会显示明确提示，不影响其他功能。
+音频功能不依赖 libmpv；DLL 缺失时视频区会显示明确提示，不影响其他功能。
+
+> 注意：官方 `mpv.exe` 是**静态链接**的，拆不出 DLL。能进程内调用的只有 mpv-dev 构建里的
+> `libmpv-2.dll`，`scripts/fetch-libmpv.ps1` 取的就是它（mpv 仓库的 Windows 构建）。
 
 ## 快速开始
 
@@ -64,13 +67,15 @@
 # 3. 点列表项开始播放（列表默认收起，随时可再点列表按钮开合）
 ```
 
-带 mpv 的发布包（解压即用，无需另外安装 mpv）：
+带 libmpv 的发布包（解压即用，无需另外准备 DLL）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts/package.ps1 -WithMpv
+powershell -ExecutionPolicy Bypass -File scripts/package.ps1 -WithLibmpv
 ```
 
-> mpv 采用 GPL 许可，随包分发前请自行确认许可合规性。默认打包（不加 `-WithMpv`）不包含 mpv。
+> mpv / libmpv 采用 GPL（或 LGPL，取决于构建变体）许可，随包分发前请自行确认许可合规性；
+> 不想带 GPL 组件时用 `scripts/fetch-libmpv.ps1 -Lgpl` 取 LGPL 变体。
+> 默认打包（不加 `-WithLibmpv`）不含 DLL。
 
 ## 从源码构建
 
@@ -98,8 +103,8 @@ cargo test --workspace
 
 双轨测试：
 
-- **`crates/player-core`**：纯逻辑与内核。包含真实 mpv 的 IPC 端到端用例（起播 → 进度推进 → 暂停冻结 → 恢复/seek/音量 → 关闭），
-  以及 1080p 素材驱动的解码路径。
+- **`crates/player-core`**：纯逻辑与内核。包含真实 `libmpv-2.dll` 的端到端用例（起播 → 进度推进 → 暂停冻结 → 恢复/seek/音量 → 销毁），
+  DLL 不存在时自动跳过而不是失败。
 - **`crates/app/src/ui_tests.rs`**：`gpui_kit::test` 无头窗口 UI 集成测试。用原生指针事件点真实按钮，
   断言播放状态、进度条量程、无障碍名称、主题切换与控件不溢出窗口。
 
@@ -109,9 +114,9 @@ UI 测试把持久化目录重定向到临时目录（见 `persistence::set_conf
 
 | 现象 | 排查方式 |
 |---|---|
-| 视频区提示找不到 mpv | 设置 `SMP_MPV_PATH` 指向 `mpv.exe`，或安装 mpv 后重启应用 |
-| 视频打不开、日志只有一句 toast | 设 `SMP_MPV_LOG=%TEMP%\mpv.log` 后重试，mpv 的真实报错在里面 |
-| 想确认命令/事件是否正常 | 设 `SMP_MPV_TRACE=%TEMP%\ipc.log`，逐行记录 IPC 收发 |
+| 视频区提示找不到 libmpv-2.dll | 跑 `scripts/fetch-libmpv.ps1 -CopyToExe`，或设 `SMP_LIBMPV_PATH` 指向 DLL |
+| 视频打不开、日志只有一句 toast | 设 `SMP_MPV_LOG=%TEMP%\mpv.log` 后重试，libmpv 的真实报错在里面 |
+| 想确认命令/事件是否正常 | 设 `SMP_MPV_TRACE=%TEMP%\mpv.log`，逐行记录发给 libmpv 的命令与事件 |
 | 应用是否被外部结束 | 看 `%APPDATA%\simple-media-player\session.log`：有 `event loop returned` 是正常退出，只有 `start` 说明被强杀 |
 | 播放失败但界面上只闪了一下提示 | 同一条错误也写进了 `session.log`（`error: 无法播放「…」…`），可以直接翻日志 |
 

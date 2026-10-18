@@ -76,10 +76,20 @@ out_dir.mkdir(parents=True, exist_ok=True)
 #       --o=target/verify-long.mp4 --ovc=libx264 --oac=libmp3lame --of=mp4
 media = root / "target" / "verify-long.mp4"
 if not media.exists():
-    mpv = root / "dist" / "simple-media-player-1.0.0" / "mpv.exe"
+    # 注意：这里的 mpv.exe **只是用来合成测试素材**的工具，和播放内核无关
+    # （应用现在进程内加载 libmpv-2.dll，不再起 mpv 子进程）。找不到就退到仓库里
+    # 的样片，验收里"等画面稳定"的余量会变小。
+    candidates = [
+        os.environ.get("SMP_MPV_PATH"),
+        r"C:\ProgramData\chocolatey\lib\mpvio.install\tools\mpv.exe",
+        r"C:\Program Files\mpv\mpv.exe",
+        str(root / "mpv.exe"),
+        "mpv",
+    ]
+    mpv = next((c for c in candidates if c and (c == "mpv" or Path(c).exists())), "mpv")
     subprocess.run(
         [
-            str(mpv) if mpv.exists() else "mpv",
+            mpv,
             "av://lavfi:testsrc2=duration=120:size=1280x720:rate=24",
             f"--o={media}",
             "--ovc=libx264",
@@ -172,10 +182,22 @@ data_dir.mkdir(parents=True, exist_ok=True)
 mpv_trace = root / "target" / "verify-mpv-trace.log"
 mpv_trace.unlink(missing_ok=True)
 env = dict(os.environ, SMP_DATA_DIR=str(data_dir), SMP_MPV_TRACE=str(mpv_trace))
+# 视频内核是进程内 libmpv，DLL 必须能被 exe 找到。打包目录里自带一份；直接对
+# target/debug 或 target/release 跑时可能还没拷，这里退到 target/mpv-dev（fetch-libmpv.ps1
+# 的默认落地位置），免得"缺 DLL"被误判成"视频功能坏了"。
+if not (exe.parent / "libmpv-2.dll").is_file():
+    for guess in (root / "target" / "mpv-dev" / "libmpv-2.dll",
+                  root / "target" / "release" / "libmpv-2.dll",
+                  root / "target" / "debug" / "libmpv-2.dll"):
+        if guess.is_file():
+            env.setdefault("SMP_LIBMPV_PATH", str(guess))
+            print(f"note: exe 目录没有 libmpv-2.dll，用 SMP_LIBMPV_PATH={guess}")
+            break
+    else:
+        print("warn: 找不到 libmpv-2.dll，视频相关项会失败（跑 scripts/fetch-libmpv.ps1）")
 
 # 上一轮没收干净的进程会让 `FindWindowW` 拿到一个已经死掉的句柄
 subprocess.run(["taskkill", "/F", "/IM", "simple-media-player.exe"], capture_output=True)
-subprocess.run(["taskkill", "/F", "/IM", "mpv.exe"], capture_output=True)
 time.sleep(0.6)
 
 width, height = 1200, 760
@@ -281,8 +303,15 @@ def wait_region(lx, ly, want, timeout=3.0):
 
 
 def wait_settled(timeout=3.0):
-    """等一切跟上新的窗口几何：外框对齐 + 顶栏两端/胶囊都回到区域里。"""
+    """等一切跟上新的窗口几何：外框对齐 + 顶栏两端/胶囊都回到区域里。
+
+    关键是那条 `False`：**画面中心必须是洞**。窗口刚被改过尺寸时，应用还没按
+    新的视频区重算区域，`GetWindowRgn` 会短暂返回"整个窗口"——这时
+    `region_contains(任意点)` 恒为 True，后面所有"面板/胶囊在不在区域里"的
+    判断都会假通过（歌单明明没展开也判通过了，实测踩过）。
+    """
     wait_aligned(timeout)
+    wait_region(lw * 0.5, lh * 0.45, False, timeout)
     wait_region(2, 17, True, timeout)
     wait_region(lw - 2, 17, True, timeout)
     wait_region(*playlist_button(), True, timeout)
@@ -301,7 +330,7 @@ def press_key(vk):
 
 
 def trace_hits(needle):
-    """mpv IPC trace 里包含 `needle` 的行数（文件没生成时算 0）。"""
+    """mpv trace 里包含 `needle` 的行数（文件没生成时算 0）。"""
     if not mpv_trace.exists():
         return 0
     return sum(
@@ -309,6 +338,49 @@ def trace_hits(needle):
         for line in mpv_trace.read_text(encoding="utf-8", errors="replace").splitlines()
         if needle in line
     )
+
+
+def wait_trace(needle, count, timeout=3.0):
+    """等 trace 里 `needle` 的行数达到 `count`，返回实际条数。
+
+    点击到"命令真的发出去"之间隔着：PostMessage → GPUI 命中测试 → 事件处理 →
+    tick。进程内 libmpv 起播要初始化 hwdec（实测 3~4 秒首帧），这段时间 UI 线程
+    的事件处理会变慢，固定 sleep 0.6s 取样会时不时漏掉刚发出去的命令。
+    """
+    deadline = time.time() + timeout
+    hits = trace_hits(needle)
+    while time.time() < deadline:
+        hits = trace_hits(needle)
+        if hits >= count:
+            return hits
+        time.sleep(0.1)
+    return hits
+
+
+def wait_darker(pt, base, timeout=2.5, gap=80):
+    """等 `pt` 比 `base` 明显更暗（深玻璃卡片画上去了），返回最后一次采样。
+
+    判据同判定段：玻璃卡三通道之和比画面低一大截，用亮度差比用具体颜色稳
+    （换素材不会飘）。
+    """
+    deadline = time.time() + timeout
+    px = sample(grab(), *pt)
+    while time.time() < deadline:
+        px = sample(grab(), *pt)
+        if sum(px[:3]) + gap < sum(base[:3]):
+            return px
+        time.sleep(0.1)
+    return px
+
+
+def wait_region_clear(lx, ly, timeout=2.5):
+    """等某个点**离开**主窗口区域（卡片收起后那块交还给画面）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not region_contains(lx, ly):
+            return True
+        time.sleep(0.1)
+    return not region_contains(lx, ly)
 
 
 # 抢前台：脚本所在进程不在前台时，`SetForegroundWindow` 会被系统拒绝（只有前台
@@ -466,7 +538,28 @@ def wait_aligned(timeout=2.0):
 # 判据用**像素级**的：客户区应等于画面像素（1:1，不做缩放），比例应等于画面比例。
 # 样片都是 16:9，这里按文件名给出期望像素；换样片时改这张表。
 EXPECTED_PIXELS = {"verify-long.mp4": (1280, 720), "gen-1080p.mp4": (1920, 1080)}
-fit_client = wait_client_settled()
+expect = EXPECTED_PIXELS.get(media.name)
+
+
+def wait_client_size(target, timeout=15.0, tol=2):
+    """等客户区变成目标尺寸。
+
+    起播后窗口要按画面调一次尺寸，而这一步依赖"解码出首帧后报出的 dwidth/dheight"；
+    进程内 libmpv 还要先初始化 hwdec（d3d11va），实测要 3~4 秒才报出真实尺寸。
+    只等"尺寸稳定"会在起播前就返回那个旧的默认尺寸，看起来像"没调窗口"。
+    """
+    deadline = time.time() + timeout
+    last = client_rect()
+    while time.time() < deadline:
+        last = client_rect()
+        if abs(last[0] - target[0]) <= tol and abs(last[1] - target[1]) <= tol:
+            return last
+        time.sleep(0.1)
+    print(f"  等待超时：{timeout:.0f}s 内没等到 {target[0]}x{target[1]}（当前 {last[0]}x{last[1]}）")
+    return wait_client_settled()
+
+
+fit_client = wait_client_size(expect) if expect else wait_client_settled()
 fit_w, fit_h = fit_client[0] / scale, fit_client[1] / scale
 print(
     f"起播后客户区 = {fit_client[0]}x{fit_client[1]} 物理"
@@ -587,20 +680,32 @@ print(f"胶囊内左侧 (40,{lh - 54:.0f}) = {caps_a}")
 print(f"胶囊内右侧 ({lw * 0.55:.0f},{lh - 54:.0f}) = {caps_b}   ← 两处色差 {spread}（>25 才算透出画面）")
 
 
-def toggle_playlist(want_open, tries=4):
+def panel_open():
+    """歌单面板是否展开。**只能**在 `wait_settled()` 之后问：
+
+    区域还没按视频区算出来时整窗都在区域里，这个判断会假通过。
+    """
+    return region_contains(lw - 172, 120)
+
+
+def toggle_playlist(want_open, tries=5):
     """把歌单切到目标状态，最多试 `tries` 次。
 
     单次真实点击偶尔会被系统吞掉（`mouse_event` 的 down/up 与 GPUI 的
-    激活/命中是两套时序），这不是应用的问题；这里按**结果**重试，
-    最后一次仍不对就如实报失败。
+    激活/命中是两套时序），这不是应用的问题；这里按**结果**重试。
+    每次先看当前状态再决定要不要点——盲目连点会在两次点击都成功时互相抵消。
     """
     px, py = playlist_button()
     for _ in range(tries):
-        click(px, py)
-        time.sleep(0.6)
-        if region_contains(lw - 172, 120) == want_open:
+        if panel_open() == want_open:
             return True
-    return False
+        click(px, py)
+        deadline = time.time() + 1.0
+        while time.time() < deadline:
+            if panel_open() == want_open:
+                return True
+            time.sleep(0.1)
+    return panel_open() == want_open
 
 
 def refresh_geometry():
@@ -804,11 +909,9 @@ grab(root / "target" / "floating-06-restored.png")
 seeks_before = trace_hits('"seek"')
 vols_before = trace_hits('"volume"')
 press_key(VK_RIGHT)
-time.sleep(0.9)
-seeks_after = trace_hits('"seek"')
+seeks_after = wait_trace('"seek"', seeks_before + 1)
 press_key(VK_UP)
-time.sleep(0.7)
-vols_after = trace_hits('"volume"')
+vols_after = wait_trace('"volume"', vols_before + 1)
 seek_keys_ok = seeks_after > seeks_before
 volume_keys_ok = vols_after > vols_before
 print(
@@ -824,9 +927,12 @@ print(
 # 超时提示"没有其他字幕轨可切"，那是取值的表现，不是接线问题）。
 cycles_before = trace_hits('"cycle"')
 click(*right_group_button(3))  # 音轨
+wait_trace('"cycle"', cycles_before + 1)
+# 两个按钮只隔 40 逻辑像素，连点两次落在 `SM_CXDOUBLECLK`(36) 与 `GetDoubleClickTime`
+# (500ms) 里会被判成双击，第二次点击就不当单击处理了 → 只发出 1 条 cycle。
+time.sleep(0.8)
 click(*right_group_button(4))  # 字幕
-time.sleep(0.6)
-cycles_after = trace_hits('"cycle"')
+cycles_after = wait_trace('"cycle"', cycles_before + 2)
 cycle_ok = cycles_after >= cycles_before + 2
 print(f"字幕/音轨 → cycle 命令 {cycles_before}→{cycles_after} 条")
 
@@ -848,20 +954,18 @@ wait_region(*info_pt, True)
 
 info_before = sample(grab(out_dir / "verify-info-0-before.png"), *card_probe)
 click(*info_pt)
-time.sleep(0.45)
-info_img = grab(out_dir / "verify-info-1-open.png")
-info_open_px = sample(info_img, *card_probe)
+# 轮询到卡片画上去为止（固定 sleep 会拍到"点击还没被处理"的那一帧）
+info_open_px = wait_darker(card_probe, info_before)
+grab(out_dir / "verify-info-1-open.png")
 # 两个角点都要归主窗口：左上角的文字区 + 右下角的空白玻璃
 info_in_region = region_contains(CARD_LEFT + 10, CARD_TOP + 10) and region_contains(
     CARD_LEFT + INFO_WIDTH - 10, CARD_TOP + INFO_HEIGHT - 10
 )
 click(*info_pt)
-time.sleep(0.45)
+# 收起同理：等那块真的从区域里退出去，别按 0.45s 猜
+info_hole_gone = wait_region_clear(CARD_LEFT + 10, CARD_TOP + 10)
 info_closed_px = sample(grab(out_dir / "verify-info-2-closed.png"), *card_probe)
-# 收起之后那块要回到"画面"（不属于主窗口区域）。这比看像素稳：素材换成暗画面
-# 时，"收起后应该变亮"会误判，而区域里有没有这块是结构性事实。
-info_closed_region = region_contains(CARD_LEFT + 10, CARD_TOP + 10)
-info_hole_gone = not info_closed_region
+info_closed_region = not info_hole_gone
 print(
     f"信息卡 {card_probe} 采样：之前 {info_before} → 展开 {info_open_px} → "
     f"收起 {info_closed_px}；区域 展开={info_in_region} 收起={info_closed_region}"

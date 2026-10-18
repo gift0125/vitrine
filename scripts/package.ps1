@@ -7,14 +7,15 @@
     产出 dist/simple-media-player-<版本>/ 目录与同名 .zip：
       - simple-media-player.exe（release）
       - README.md
-      - 可选：mpv.exe（-WithMpv，注意 mpv 为 GPL 许可，随包分发需自行确认合规）
+      - 可选：libmpv-2.dll（-WithLibmpv，GPL/LGPL 许可，随包分发需自行确认合规）
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts/package.ps1
-    powershell -ExecutionPolicy Bypass -File scripts/package.ps1 -WithMpv
+    powershell -ExecutionPolicy Bypass -File scripts/package.ps1 -WithLibmpv
 #>
 param(
-    [switch]$WithMpv,
+    [Alias("WithMpv")]
+    [switch]$WithLibmpv,
     [string]$OutDir = "dist",
     [switch]$SkipBuild
 )
@@ -62,30 +63,39 @@ if (Test-Path $shots) {
     Copy-Item (Join-Path $shots "chroma-*.png") $shotStage
 }
 
-# 可选：把 mpv 一起打进去（视频功能需要）
-if ($WithMpv) {
-    $mpv = $null
-    if ($env:SMP_MPV_PATH -and (Test-Path $env:SMP_MPV_PATH)) {
-        $mpv = Get-Item $env:SMP_MPV_PATH
-    } else {
-        $candidates = @(
-            "C:\ProgramData\chocolatey\lib\mpvio.install\tools\mpv.exe",
-            "C:\Program Files\mpv\mpv.exe",
-            (Join-Path $root "mpv.exe")
-        )
-        foreach ($candidate in $candidates) {
-            if (Test-Path $candidate) { $mpv = Get-Item $candidate; break }
-        }
+# 可选：把 libmpv-2.dll 一起打进去（视频功能需要；进程内加载，DLL 必须和 exe 同目录）
+# 注意：官方 mpv.exe 是静态链接的，拆不出 DLL —— 这里要的是 mpv-dev 构建里的
+# libmpv-2.dll（scripts/fetch-libmpv.ps1 可自动下载到 target/mpv-dev）。
+if ($WithLibmpv) {
+    $dll = $null
+    $probe = @()
+    if ($env:SMP_LIBMPV_PATH) { $probe += $env:SMP_LIBMPV_PATH }
+    if ($env:SMP_MPV_PATH) { $probe += (Join-Path (Split-Path -Parent $env:SMP_MPV_PATH) "libmpv-2.dll") }
+    $probe += @(
+        (Join-Path $root "target/mpv-dev/libmpv-2.dll"),
+        (Join-Path $root "target/release/libmpv-2.dll"),
+        "C:\ProgramData\chocolatey\lib\mpvio.install\tools\libmpv-2.dll",
+        "C:\Program Files\mpv\libmpv-2.dll",
+        (Join-Path $root "libmpv-2.dll")
+    )
+    foreach ($candidate in $probe) {
+        if ($candidate -and (Test-Path $candidate)) { $dll = Get-Item $candidate; break }
     }
-    if (-not $mpv) { throw "未找到 mpv.exe：设置 SMP_MPV_PATH 或用 -WithMpv 前先安装 mpv" }
+    if (-not $dll) {
+        throw "未找到 libmpv-2.dll：先跑 scripts/fetch-libmpv.ps1，或用 SMP_LIBMPV_PATH 指定"
+    }
 
-    Write-Host "==> 附带 mpv: $($mpv.FullName) ($([math]::Round($mpv.Length / 1MB, 1)) MB)"
-    Copy-Item $mpv.FullName (Join-Path $stage "mpv.exe")
+    Write-Host "==> 附带 libmpv: $($dll.FullName) ($([math]::Round($dll.Length / 1MB, 1)) MB)"
+    Copy-Item $dll.FullName (Join-Path $stage "libmpv-2.dll")
 
-    $license = Join-Path $mpv.DirectoryName "LICENSE*"
-    if (Test-Path $license) {
-        New-Item -ItemType Directory -Path (Join-Path $stage "licenses") -Force | Out-Null
-        Copy-Item $license (Join-Path $stage "licenses") -Force
+    # mpv 是 GPL/LGPL 双许可，随包分发时把许可文件一并带上
+    foreach ($dir in @($dll.DirectoryName, (Join-Path $root "target/mpv-dev"))) {
+        $license = Join-Path $dir "LICENSE*"
+        if (Test-Path $license) {
+            New-Item -ItemType Directory -Path (Join-Path $stage "licenses") -Force | Out-Null
+            Copy-Item $license (Join-Path $stage "licenses") -Force
+            break
+        }
     }
 }
 
