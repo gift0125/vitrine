@@ -3,9 +3,9 @@
   "meta": {
     "design_file": "https://ardot.tencent.com/file/737444551354649",
     "file_id": 737444551354649,
-    "exported_at": "2026-10-18T21:16+08:00",
+    "exported_at": "2026-10-18T22:42+08:00",
     "frame_scale": 2,
-    "note": "frames/*.png 已裁到窗口实际内容：2560×1600 = 2x × 1280×800，无投影留白。窗口四角为透明圆角（radius 10）。量坐标可直接除以 2。"
+    "note": "帧已裁到窗口实际内容：**图像 = 设计尺寸 ×2**（音乐模式 800×1560、设置 1920×1360/1440、首屏 1120×880），无投影留白。窗口四角为透明圆角（radius 10），窗口本身不画描边（见 window_edge）。量坐标直接除以 2。视频播放态（1280×800）不在 frames 里——见 known_gaps 第一条。"
   },
   "tokens": {
     "light": {
@@ -152,6 +152,39 @@
       "window_controls": "右上 最小化+关闭 92x32，x462 y6（首屏 560 宽时）"
     }
   },
+  "window_edge": {
+    "stroke": null,
+    "why": "窗口自身不画任何 1px 内描边。一圈亮线会把画面「封」在框里，去掉之后画面直通边缘、由投影把窗口托起来，悬浮感才成立（iina 同款口径：圆角与阴影都交给系统，不自绘边框）。",
+    "shadow": {
+      "main_video": [
+        "0 24 48 rgba(0,0,0,.50)",
+        "0 8 24 rgba(0,0,0,.35)"
+      ],
+      "light_windows": "0 20 44 rgba(76,79,105,.20)（设置窗 y14/r44 @16%，音乐模式 y12/r40 @14%）",
+      "win_music_mode": "0 10 28 rgba(0,0,0,.16)"
+    },
+    "note": "画布上现存 10 个窗口帧的 strokes 均已清空（原 16 个，视频态 6 帧已删）；代码侧根节点本来就没有 border。浅底窗口靠投影和比底色更亮的窗口本体分辨，别为了「看得清」把描边加回来。"
+  },
+  "chrome_auto_hide": {
+    "idle_ms": 2500,
+    "fade": "代码：CHROME_FADE_STEP 0.25 / 100ms tick；HTML 预览用 .22s 过渡近似，不要照搬曲线",
+    "applies_to": [
+      "title_band",
+      "capsule",
+      "bottom_vignette",
+      "window_controls"
+    ],
+    "keeps_visible": [
+      "暂停中",
+      "歌单 / 信息卡 / 拖放提示 / 状态胶囊打开",
+      "正在拖进度"
+    ],
+    "hit_test": "淡到 alpha ≤ 0.01 时 chrome_rects() 返回空 Vec：整块区域让给视频叠加窗，不会留下看不见却能点的按钮。反向代价是淡出期间画面不能再双击全屏，所以底部遮罩自己补了 on_double_click。",
+    "why_not_animation": "不用 with_animation：那个动画只在有帧驱动时推进，而这里的帧是 tick 拉起来的。",
+    "preview": "design/preview/index.html?idle=1 冻结该状态；?bare=1 去掉页面留白和工具条，截图区域正好是窗口本身",
+    "trace": "SMP_CHROME_TRACE=1 打 [chrome] alpha/target/idle（500ms 限流）",
+    "doc": "docs/chrome-fade.png"
+  },
   "title_band": {
     "height": 34,
     "note": "mac 自绘 34；Win 主窗自绘 40（与设置窗标题带一致）。窗口控件图标在深色画面上用 #E6E9EF，搬到浅底必须改 #4C4F69。"
@@ -171,9 +204,9 @@
         "bottom": 8
       },
       "background": "L3 染色玻璃：linear-gradient(180deg, rgba(50,103,134,.24) 0%, rgba(50,103,134,.06) 48%, rgba(11,12,16,.48) 100%) + backdrop blur(56px) saturate(175%) brightness(1.05)",
-    "stroke": "1px rgba(255,255,255,.18)",
-    "effects": "inset 0 1px 0 rgba(255,255,255,.20) / inset 0 -1px 0 rgba(0,0,0,.26) / 0 2px 8px rgba(0,0,0,.24) / 0 18px 48px rgba(0,0,0,.34)",
-    "texture_layer": "L3（见 texture_layers.L3_real_blur；定稿）",
+      "stroke": "1px rgba(255,255,255,.18)",
+      "effects": "inset 0 1px 0 rgba(255,255,255,.20) / inset 0 -1px 0 rgba(0,0,0,.26) / 0 2px 8px rgba(0,0,0,.24) / 0 18px 48px rgba(0,0,0,.34)",
+      "texture_layer": "L3（见 texture_layers.L3_real_blur；定稿）",
       "note": "760 居中于 1280；窄窗用 max-width:100% 防溢出。"
     },
     "progress_row": {
@@ -312,16 +345,6 @@
   },
   "frames": [
     {
-      "file": "frames/mac-main-player.png",
-      "node": "2:7",
-      "platform": "mac",
-      "size": [
-        1280,
-        800
-      ],
-      "desc": "主播放窗（音乐）"
-    },
-    {
       "file": "frames/mac-music-mode.png",
       "node": "2:103",
       "platform": "mac",
@@ -372,36 +395,6 @@
       "desc": "首屏 · 拖入中（投放区 512x212 @24,204）"
     },
     {
-      "file": "frames/mac-playlist-expanded.png",
-      "node": "21:162",
-      "platform": "mac",
-      "size": [
-        1280,
-        800
-      ],
-      "desc": "主窗 · 播放列表展开"
-    },
-    {
-      "file": "frames/mac-osd-video-info.png",
-      "node": "21:928",
-      "platform": "mac",
-      "size": [
-        1280,
-        800
-      ],
-      "desc": "主窗 · 视频信息 OSD"
-    },
-    {
-      "file": "frames/win-main-player.png",
-      "node": "2:258",
-      "platform": "win",
-      "size": [
-        1280,
-        800
-      ],
-      "desc": "主播放窗（音乐）"
-    },
-    {
       "file": "frames/win-music-mode.png",
       "node": "2:369",
       "platform": "win",
@@ -450,26 +443,6 @@
         440
       ],
       "desc": "首屏 · 拖入中"
-    },
-    {
-      "file": "frames/win-playlist-expanded.png",
-      "node": "21:317",
-      "platform": "win",
-      "size": [
-        1280,
-        800
-      ],
-      "desc": "主窗 · 播放列表展开（面板 y=48）"
-    },
-    {
-      "file": "frames/win-osd-video-info.png",
-      "node": "21:1108",
-      "platform": "win",
-      "size": [
-        1280,
-        800
-      ],
-      "desc": "主窗 · 视频信息 OSD"
     }
   ],
   "icons": [
@@ -500,13 +473,16 @@
     }
   ],
   "known_gaps": [
+    "**视频播放态不在画布上**：主窗 / 播放列表展开 / 视频信息 OSD（原 `2:7` `21:162` `21:928` `2:258` `21:317` `21:1108`，共 668 个节点）已于 2026-10-18 从画布删除，改由 `preview/index.html` 独家承载——它能表达真模糊、闲置淡出和交互，静态帧不能，且改一次质感要同步 6 个帧太贵。结构快照在 `design/archive/video-frames-2026-10-18.jsonl`，要重建照着它来。画布上原位换成了「占位 · 视频播放态」说明板。",
     "静态导出画不出真模糊：L3 的 backdrop blur 在 PNG 里只体现为一块均匀染色玻璃。要看真效果请开 design/preview/index.html（默认即 L3）。",
     "设置窗同时存在旧版 2:406（960x680 无标题带），以 21:807 为准。",
     "OSD 行文案取自设计稿示例（HEVC Main 10 / 42.8 Mb/s / BT.2020·HDR10 / AAC 5.1），代码里应取 mpv 实际值；video-bitrate 不可用时显示 —，不要补假数。",
-    "L2/L3 的染色在画布上是用素材当前一帧手工算出的固定色（rgb(50,103,134)）。代码里必须运行时取样，换片要重算。"
+    "L2/L3 的染色在画布上是用素材当前一帧手工算出的固定色（rgb(50,103,134)）。代码里必须运行时取样，换片要重算。",
+    "画布上没有「闲置淡出后」的独立帧：那是一个瞬时状态，静态帧表达不出过渡。对照图见 docs/chrome-fade.png，交互看 index.html?idle=1。",
+    "docs/capsule-compare.png 的「画布 L3」那一半取自已删除的视频帧，属历史对照，无法再重生成；L3 的现状以 HTML 原型为准。"
   ],
   "texture_layers": {
-    "status": "已定稿 L3（2026-10-18）。画布 6 个视频帧的控制栏 + 底部遮罩均按 L3 落地；HTML 原型默认档位 = L3。",
+    "status": "已定稿 L3（2026-10-18）。**画布上已无视频帧**（2026-10-18 晚删除），L3 的唯一定义处是 `preview/index.html` + 本段参数；HTML 原型默认档位 = L3。",
     "note": "控制栏质感的三个层次，按依赖顺序叠加。L1 纯样式即可（GPUI 今天就能做）；L2 需要一次画面取色；L3 依赖架构改造。HTML 原型里用 ?layers=enh,tint,realblur 逐层预览，或点工具条切档。",
     "L1_directional_light": {
       "capsule_background": "linear-gradient(180deg, rgba(26,28,40,.60) 0%, rgba(11,12,16,.74) 100%)",
@@ -572,8 +548,23 @@
       "cost": "高：架构级",
       "canvas_canonical": {
         "tint_rgb": "50,103,134",
-        "stops": ["rgba(50,103,134,.24) @0", "rgba(50,103,134,.06) @0.48", "rgba(11,12,16,.48) @1"],
-        "gradientTransform": [[0, 1, 0], [-1, 0, 1]],
+        "stops": [
+          "rgba(50,103,134,.24) @0",
+          "rgba(50,103,134,.06) @0.48",
+          "rgba(11,12,16,.48) @1"
+        ],
+        "gradientTransform": [
+          [
+            0,
+            1,
+            0
+          ],
+          [
+            -1,
+            0,
+            1
+          ]
+        ],
         "note": "画布上控制栏 = GRADIENT_LINEAR + strokes 白 18% + effects BACKGROUND_BLUR 56 / DROP_SHADOW 0,18,48 @34%"
       },
       "bottom_vignette_canvas": {

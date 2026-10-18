@@ -11,34 +11,38 @@
 |---|---|
 | 尺寸 / 间距 / 颜色 / 圆角 / 字号 | `spec.json`（唯一数值来源，别从图里量） |
 | 某个界面长什么样 | `frames/*.png`（2x，透明背景，**已裁到窗口内容**，图像尺寸 = 设计尺寸 ×2） |
+| **视频播放态**（主窗 / 歌单展开 / 视频信息） | **`preview/index.html`** —— 画布上已不再有这几帧，见下面「为什么视频态不在画布上」 |
 | 应用图标 | `icons/chroma-{256,128,64,32,16}.png`（设计稿导出）；实际构建用的 `assets/chroma.ico` 见 `../docs/app-icon.png` |
-| 一眼看全貌 | `../docs/design-overview.png`（16 帧缩略图） |
-| 控制栏质感到什么程度 | `../docs/capsule-compare.png`（画布 L3 vs 真模糊）、`../docs/texture-layers.png`（L0→L3 四层，自上而下） |
+| 一眼看全貌 | `../docs/design-overview.png`（10 帧缩略图） |
+| 控制栏质感到什么程度 | `../docs/capsule-compare.png`（历史：画布 L3 vs 真模糊）、`../docs/texture-layers.png`（L0→L3 四层，自上而下） |
+| 控制层什么时候会消失 | `../docs/chrome-fade.png`（常态 / 闲置 2.5s 对照） |
 
-`spec.json` 的结构：`tokens`（浅/深色板 + 玻璃浮层 + OSC）→ `logo` → `windows`（双平台窗口尺寸）→ `control_bar` → `playlist_panel` → `first_run` → `osd_video_info` → `frames`/`icons`（清单与节点 id）→ `known_gaps`（已知偏差，**先看这个再量图**）。
+`spec.json` 的结构：`tokens`（浅/深色板 + 玻璃浮层 + OSC）→ `logo` → `windows`（双平台窗口尺寸）→ `window_edge`（有没有描边、投影怎么给）→ `chrome_auto_hide`（闲置淡出）→ `control_bar` → `playlist_panel` → `first_run` → `osd_video_info` → `frames`/`icons`（清单与节点 id）→ `known_gaps`（已知偏差，**先看这个再量图**）。
 
-## 帧清单（16）
+## 帧清单（10）
 
 | 文件 | 平台 | 设计尺寸 | 说明 |
 |---|---|---|---|
-| `frames/mac-main-player.png` | mac | 1280×800 | 主播放窗（音乐） |
 | `frames/mac-music-mode.png` | mac | 400×780 | 音乐模式 mini |
 | `frames/mac-settings.png` | mac | 960×680 | 设置窗（无标题带） |
 | `frames/mac-firstrun-recent.png` | mac | 560×440 | 首屏 · 最近打开 |
 | `frames/mac-firstrun-empty.png` | mac | 560×440 | 首屏 · 空状态 |
 | `frames/mac-firstrun-drop.png` | mac | 560×440 | 首屏 · 拖入中 |
-| `frames/mac-playlist-expanded.png` | mac | 1280×800 | 播放列表展开 |
-| `frames/mac-osd-video-info.png` | mac | 1280×800 | 视频信息 OSD |
-| `frames/win-main-player.png` | win | 1280×800 | 主播放窗（音乐） |
 | `frames/win-music-mode.png` | win | 400×780 | 音乐模式 mini |
 | `frames/win-settings.png` | win | 960×720 | 设置窗（680 + 40 标题带） |
 | `frames/win-firstrun-recent.png` | win | 560×440 | 首屏 · 最近打开 |
 | `frames/win-firstrun-empty.png` | win | 560×440 | 首屏 · 空状态 |
 | `frames/win-firstrun-drop.png` | win | 560×440 | 首屏 · 拖入中 |
-| `frames/win-playlist-expanded.png` | win | 1280×800 | 播放列表展开（面板 y=48） |
-| `frames/win-osd-video-info.png` | win | 1280×800 | 视频信息 OSD |
 
 图标：`icons/chroma-256/128/64/32/16.png`（尺寸即文件名；16px 是圆角方块变体）。
+
+### 为什么视频态不在画布上
+
+2026-10-18 删掉了 6 个视频帧（主窗 / 歌单展开 / 视频信息 ×2 平台，共 668 个节点），它们和 HTML 原型是同一件事的两份拷贝，而且改一次质感要同步 6 个帧（上一轮 L3 就漏改过 2 个 OSD 帧）。
+
+现在**视频播放态只有 HTML 原型一份**：真模糊、闲置淡出、交互都只有它能表达，静态帧本来也画不出来。画布上原位换了一块「占位 · 视频播放态」说明板指过去。
+
+需要重建的话，结构快照在 `archive/video-frames-2026-10-18.jsonl`（逐节点 JSON，含完整子树）。副作用：`spec.json → texture_layers` 的 L3 参数现在是唯一文字定义处，`docs/capsule-compare.png` 变成历史对照（它的「画布」那一半取自已删的帧，无法重生成）。
 
 ## 控制栏质感：已定稿 L3
 
@@ -48,19 +52,42 @@
 |---|---|---|
 | **L1 方向光** | 顶部高光 + 底部暗线 + 双段投影 + 画面底部 vignette + hover 响应 + 等宽数字 | 纯样式，**现在就能做** |
 | **L2 画面染色** | 从画面底部取样，**只取色相**（S 固定 46%、L 固定 36%）给玻璃染色 | 低：切歌/seek 后截一帧算一次并缓存 |
-| **L3 真模糊** | `backdrop blur(56px) saturate(175%) brightness(1.05)`，底色降到 `.48` | 高：依赖 libmpv render API 进自己的合成树 |
+| **L3 真模糊** | `backdrop blur(56px) saturate(175%) brightness(1.05)`，底色降到 `.48` | 高：依赖 libmpv render API 进自己的合成树（**已落地**，见下） |
 
-画布上 **6 个视频帧**（主窗 / 播放列表展开 / 视频信息 OSD，mac + Win）都已按 L3 落地：控制栏是染色的渐变玻璃 + 白 18% 描边 + `BACKGROUND_BLUR 56`，窗口底部另加一层 240 高的暗角遮罩（`#0B0C10` 0 → 55%），保证 11px 小字在亮画面上仍有对比。音乐模式 / 设置 / 首屏没有视频底，不适用。
+L3 已定稿：控制栏是染色的渐变玻璃 + 白 18% 描边 + `BACKGROUND_BLUR 56`，窗口底部另加一层 240 高的暗角遮罩（`#0B0C10` 0 → 55%），保证 11px 小字在亮画面上仍有对比。**这套现在只在 HTML 原型里**（画布的视频帧已删），参数以 `spec.json → texture_layers.L3_real_blur` 为准。音乐模式 / 设置 / 首屏没有视频底，不适用。
+
+> 代码侧已按 L3 实现（2026-10-18 第十五轮，`--wid` 叠加窗换成 mpv 软件渲染 → GPUI 纹理）：模糊底是**同一帧降到 48×20 再拉伸**（GPU 双线性 ≈ 大半径 box blur），不是逐像素的高斯核；底色仍是 72% 平铺 + L1 渐变。观感接近 HTML 原型，大块纯色边界会略软一点。
+
+（注意区分两种「描边」：胶囊**内部**那圈白 14–18% 是玻璃的厚度感，保留；**窗口外缘**那圈已经删掉，见下节。）
+
+## 窗口边缘：不画描边
+
+窗口自身**不画任何 1px 内描边**，画布现存 10 个帧的 `strokes` 已全部清空（`spec.json` → `window_edge.stroke = null`）。
+
+理由：一圈亮线会把画面「封」在框里，看着像一张贴在背景上的图；去掉之后画面直通窗口边缘，只靠投影把窗口**托起来**，悬浮感才成立。这和 iina 的口径一致——macOS 上它是 `fullSizeContentView` + `titlebarAppearsTransparent`，圆角和窗口阴影都交给系统，自己一条边框都不画。
+
+代价是浅底窗口（`#EFF1F5`）压在接近白的台面上时边缘会偏软。这是**呈现问题不是设计问题**：实际桌面壁纸不会那么浅，`docs/design-overview.png` 因此用 `#F5F6FA` 当台面。**不要为了「看得清」把描边加回来**——真觉得糊就给投影加一层贴近边缘的 contact shadow。
+
+## 控制层闲置淡出
+
+视频**在播**、并且 2.5s 没有鼠标/键盘输入时，标题带（含窗口按钮）、控制胶囊、底部暗角遮罩**一起淡出**，画面整块让出来（`spec.json` → `chrome_auto_hide`）。
+
+- **不淡的情况**：暂停中、歌单/信息卡/拖放提示/状态胶囊开着、正在拖进度条——那会儿用户正在读东西。
+- 不只是"画成透明"：淡到 `alpha ≤ 0.01` 时窗口区域也跟着放开（`chrome_rects()` 返回空），否则会留下**看不见但点得到**的按钮，同时画面少一块能双击全屏的地方。
+- 对照图 `../docs/chrome-fade.png`；交互看 `preview/index.html?idle=1`（冻结该状态）。
 
 ## HTML 原型
 
 `preview/index.html` —— 单文件、**无外部依赖**（视频静帧 `assets/video-still.jpg` 与应用图标都已 base64 内联，326KB），
 可以直接双击打开，也可以单独发给别人。**默认档位就是 L3。**
 
+> 它现在**也是视频播放态的唯一来源**：主窗、播放列表展开、视频信息 OSD 这三态在画布上已经没有了（原因见上文「为什么视频态不在画布上」）。改这三态的任何东西只改这里，不用再同步画布。
+
 - 交互：进度条点击/拖拽改时间、音量条拖拽、播放/暂停切换、ⓘ 与列表键开合面板。
 - 底部工具条是**逐层叠加**的质感档位，也可用 URL 参数固定：
   `?layers=`（L0 设计稿原样）· `?layers=enh`（L1 方向光）· `?layers=enh,tint`（L2 画面染色）· `?layers=enh,tint,realblur`（L3 真模糊，默认）· `?layers=noblur`（Win 现状）
   另有 `&panel=osd|playlist`。三层的具体数值见 `spec.json` 的 `texture_layers`。
+- 截图参数：`?idle=1` 冻结在闲置淡出态、`?bare=1` 去掉页面留白和底部工具条（截图区域正好是 1280×800 的窗口本身，不用再按坐标裁；顺带关掉过渡，避免截到半透明中间态）。
 - 列表 10 条与设计稿 `21:170` **逐字一致**（标题 / 元信息 / 当前播放行的三柱图标 / 底部「10 个文件 · 3:42:18」）。HTML 里的列表数据在脚本开头的 `items` 数组，改数据只改那里。
 - 换底图：改 `assets/video-still.jpg` 后要重新内联进 HTML（相对路径在预览面板里会被 403）。
 
@@ -68,20 +95,26 @@
 
 - **数值**以 `spec.json` 为准（含 `texture_layers` 三层的精确参数）；HTML 里能读到同名参数，但不要从 CSS 里抄。
 - **视觉**用 HTML 当对照：实现完截个图，和 `?layers=...` 的对应档位比。
-- HTML 里这些**没有对应实现**，别照搬：`backdrop-filter`（GPUI 无）、CSS 过渡曲线、字体度量、以及所有动态行为（自动隐藏、拖拽吸附）。
+- HTML 里这些**没有对应实现**，别照搬：`backdrop-filter`（GPUI 无）、CSS 过渡曲线（闲置淡出在代码里是 `0.25/100ms` tick 步进，不是 `.22s` ease）、字体度量、以及拖拽吸附。
 
 ## 更新流程
 
 1. 在**设计画布会话**里说「重新导出 design/」——会重跑导出并更新 `spec.json`。
-2. 检查 `git diff design/`（图片会全部显示为二进制变更，属正常）。
-3. 若 `spec.json` 里 `meta.exported_at` 变了但数值没变，说明只是重导出，可以不改代码。
+2. 导出物**不要直接落到 `frames/`**：`export_nodes` 的留白随阴影半径变、而且阴影像素会被算进内容边界。先下一份原始图，再跑
+   `python scripts/normalize-frames.py <原始图目录>`（按 `spec.json` 的节点 id 找文件，用 `alpha≥250` 定位窗口矩形、按设计尺寸×2 裁、透明区 RGB 清零），
+   最后 `python scripts/make-overview.py` 重拼总览图。
+3. 检查 `git diff design/`（图片会全部显示为二进制变更，属正常）。
+4. 若 `spec.json` 里 `meta.exported_at` 变了但数值没变，说明只是重导出，可以不改代码。
 
 **不要**在开发会话里试图读取 Ardot 链接：那组设计工具不在开发会话里，这是宿主按会话注入的，没有配置开关。
 
 ## 已知偏差（量图前必读）
 
-- 帧已裁到窗口内容：**图像 = 设计尺寸 ×2**，可直接除 2 量坐标；窗口四角是透明圆角（radius 10），不是描边。
+- 帧已裁到窗口内容：**图像 = 设计尺寸 ×2**，可直接除 2 量坐标；窗口四角是透明圆角（radius 10），**窗口外缘没有描边**，边缘只有投影渐隐（见「窗口边缘」）。
+- **`frames/` 里没有 1280×800 的帧了**（视频播放态已删）。画布上对应位置是一块「占位 · 视频播放态」说明板，看到它别当成界面。
+- 闲置淡出没有独立的设计帧：它是一个瞬时状态，静态帧表达不出过渡。看 `../docs/chrome-fade.png` 或 `preview/index.html?idle=1`。
 - 静态导出画不出真模糊。L3 在 PNG 里只表现为一块**均匀染色玻璃**（染色的色相是从当前素材那一帧算出来的固定值 `rgb(50,103,134)`）。看真效果开 `preview/index.html`；进代码后必须运行时取样，换片重算。
+- `../docs/capsule-compare.png` 是历史对照图：它的「画布 L3」那一半取自已删除的视频帧，**无法重生成**，别拿它当现状。
 - 背景是**透明**的；某些查看器会把透明区的 RGB 残余显示成绿色（预览工具里见过），实际 alpha=0，不是设计元素。
 - Win 设置窗以 `21:807`（960×720，含标题带）为准；画布上还留着一个旧版 `2:406`（960×680 无标题带），**不要用**。
 - OSD 里的分辨率/码率/色彩是设计稿示例值，代码应取 mpv 实际值；`video-bitrate` 不可用时显示 `—`，不要补假数。
