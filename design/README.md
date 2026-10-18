@@ -11,7 +11,7 @@
 |---|---|
 | 尺寸 / 间距 / 颜色 / 圆角 / 字号 | `spec.json`（唯一数值来源，别从图里量） |
 | 某个界面长什么样 | `frames/*.png`（2x，透明背景，**已裁到窗口内容**，图像尺寸 = 设计尺寸 ×2） |
-| 应用图标 | `icons/chroma-{256,128,64,32,16}.png` |
+| 应用图标 | `icons/chroma-{256,128,64,32,16}.png`（设计稿导出）；实际构建用的 `assets/chroma.ico` 见 `../docs/app-icon.png` |
 | 一眼看全貌 | `../docs/design-overview.png`（16 帧缩略图） |
 | 控制栏质感到什么程度 | `../docs/capsule-compare.png`（画布 L3 vs 真模糊）、`../docs/texture-layers.png`（L0→L3 四层，自上而下） |
 

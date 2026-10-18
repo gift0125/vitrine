@@ -46,3 +46,11 @@
 - 右组 6 键 = 字幕 / 音轨 / **设置（齿轮）** / 画中画 / 播放列表 / 全屏。第 3 位是**设置**不是亮度——依据 iina：悬浮控制栏那颗齿轮点开就是快捷设置（长宽比/倍速/亮度/音轨/字幕）。
 - 齿轮用 Material settings 轮廓路径，自造的 6 齿路径在 20px + 1.5 描边下会糊成花瓣。
 - 应用图标：`scripts/make-icon.py` 生成双层盘，每档单独画、不烤投影、16px 用圆盘（`2:528` 方块变体不采用）。
+
+## 参考：iina 的窗体边缘处理（2026-10-18 查源码）
+- **不自绘窗框**：`MainWindowController.swift` 里没有 `cornerRadius`／`borderWidth`／`layer.border`。圆角是系统窗框（Big Sur 起约 10pt），阴影是 `window.hasShadow`（只在 legacy 全屏关掉），窗口底色深色 `.black`／浅色 `.white`（填 letterbox）。
+- 内容顶到最上沿：`styleMask.insert(.fullSizeContentView)` + `titlebarAppearsTransparent = true`，标题栏不是一条独立实心带。
+- 标题栏 = `NSVisualEffectView(material: .titlebar, blendingMode: .withinWindow)`，**糊的是同窗口内的视频**（这正是 Win 叠加窗拿不到的那种 blur）。栏高 32/28pt（macOS 26+/旧），标题容器 +8。
+- 唯一一条线：标题栏底 `NSBox.boxType = .separator`、高 1pt、色 `NSColor.titleBarBorder`。另有标题文字黑 shadow（blur 8）保可读。
+- 流量灯进 `fadeableViews`，闲置时 `alphaValue = 1e-100`（**不是 isHidden**，保留命中区）；窗口模式 `titleVisibility = .hidden`。
+- 对照我们：Chroma 窗口有**一圈 1px 内描边**（左右 #747E88、顶 (75,84,90)、底 (75,77,80)），标题带独立 40/48 高、按钮常驻、无分隔线（`标题栏下边线` visible:false）。这圈描边是「描边感」的主要来源。
