@@ -26,9 +26,17 @@
 - 截图工具（`scripts/shot.py`）**必须先 `SetProcessDpiAwareness(2)`**：否则 Python 按 96dpi 虚拟化，`GetClientRect` 尺寸缩水、`ImageGrab` 只截到窗口左上角（表现为"界面只剩封面，歌单和控制栏消失"）。另两点：`SetWindowPos` 设的是**外框**尺寸（1560×1020 外框只给 1538×964 客户区），要按目标客户区用 `AdjustWindowRectExForDpi` 反推外框；DWM 动画期间抢截会在图左边留一条黑边，需轮询等外框位置稳定。
 - 发布版必须保持 **GUI 子系统**（`#![cfg_attr(all(not(debug_assertions), target_os="windows"), windows_subsystem="windows")]`），否则双击先弹 cmd。验证读 PE 头 `OptionalHeader.Subsystem`（2=GUI / 3=console），不要靠肉眼。GUI 子系统无 stderr，但 `eprintln!` 在空句柄下不会 panic（std 当空设备），所以 `report_error` 只额外补一条 `session.log` 即可。
 - 布局铁律：要让某一组控件在窗口正中，左右两栏必须**等宽**（都 `flex_1`，`flex: 1 1 0%`）。用 `justify_between` 把内容分左右两组时，两组宽度不等就会把"中间"顶偏——走带控制偏左就是这么来的（2026-10-18 修）。
+- **`h_flex()` 默认 `items_center`**：容器里的"内容全是绝对定位"的子元素（内容高度 0）会在交叉轴上塌成 0 高度。视觉看不出来（背景色由根节点铺满），但 `canvas` 拿到的 bounds 是 `Wx0`。视频区要用 `.self_stretch()` 撑满，并有回归用例 `stage_fills_space_between_title_band_and_bottom_band` 守着（黑屏有声音的根因就是这个，2026-10-18）。
+- 自绘标题带：`TitlebarOptions.appears_transparent = true` 后，**只有左侧拖动区域**能设 `WindowControlArea::Drag`；整条都设会把右侧最小化/关闭按钮变成非客户区，点击到不了 GPUI。双击最大化要 `on_double_click` + `.id()` + `InteractiveElementExt`。
+- 测试里 `window.find(id)` 只认得**注册进命中测试树**的元素：普通 `div().id(x)` 查不到，要加 `.test_support()`（如 `seek-bar`、`stage`）。
+- 模拟点击：`PostMessage(WM_LBUTTONDOWN)` 的 lparam 不总被采信，命中测试用**真实光标**；`SetCursorPos`+`mouse_event` 又会被窗口位置抖动带偏（误点在自绘标题带上会变成"拖动窗口"）。稳定做法是 `scripts/shot.py` 的 PostMessage 路径 + 按布局算出的逻辑坐标。
 
-## 设计稿要点（详见 2026-10-17 日志）
-- 色板严格取 Catppuccin Latte 官方值；Mauve #8839EF 唯一强调色。
+## 设计稿要点（详见 2026-10-17 / 2026-10-18 日志）
+- 色板严格取 Catppuccin Latte 官方值；Mauve #8839EF 唯一强调色。**v2 起是两套色板**：应用表面 Latte/Mocha，叠加层（胶囊）深色玻璃，见 `theme::overlay`。
+- 布局 v2 = IINA 式沉浸布局：自绘 34px 标题带 + 悬浮玻璃胶囊（内缩 24、圆角 14）+ 默认收起的 320 悬浮歌单面板；内容占满窗口。
 - **皮肤落地在 `crates/app/src/theme.rs`**：设计稿色板 → gpui-component 语义 token（Latte/Mocha 两套），界面只读 token。改动前一直用默认中性灰主题，这是"与设计稿差别很大"的根因（2026-10-18 修复）。
 - 图标规范：播放三角占圆直径 48%（B 档），32px 以下重绘而非缩放（占比 50-54%、去描边）；图标为正圆。
 - Ardot 可用字体仅 Inter / Noto 系列 / JetBrains Mono。
+- **视频浮层（OSC）不跟浅色主题走**：App 表面用 Latte，叠在画面上的工具栏/控制栏用深色玻璃（`#0B0C10` 60% + blur 32 + 白 10% 描边），图标 `#D5D9E2`，已播放进度与音量用 Mocha Mauve `#CBA6F7`，播放键仍是 `#8839EF`。玻璃透明度**必须 ≤65%**，否则在没有 backdrop blur 的预览/导出里会读成实心黑板。
+- 主播放窗口默认态 = 画面全窗铺满 + 悬浮控件，**不展示播放列表**；列表是 320×633 的悬浮玻璃面板（x936 y16），靠控制栏右侧列表图标开合。展开态在 macOS 页单独一帧（`20:1`）演示。
+- 视频截图素材注意「AI生成」水印：之前被右侧列表挡住，列表一收就暴露。修法是取原图裁掉底部（1536×1024 → 1536×960，正好 1.6 与 1280×800 同比）再覆盖。

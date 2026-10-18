@@ -21,9 +21,33 @@ mod video_overlay;
 
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use player_core::TrackMeta;
 
 use crate::assets::AppAssets;
 use crate::player_view::PlayerView;
+
+/// 从命令行取「启动即播放」的文件路径。
+///
+/// 支持三种写法（媒体播放器的惯例）：
+/// - `simple-media-player.exe D:\movie.mp4`（位置参数，等价于资源管理器「打开方式」）
+/// - `--play D:\movie.mp4`
+/// - `--play=D:\movie.mp4`
+fn open_arg() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if let Some(rest) = arg.strip_prefix("--play=") {
+            return Some(rest.to_string());
+        }
+        if arg == "--play" {
+            return args.next();
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        return Some(arg);
+    }
+    None
+}
 
 fn main() {
     let start_dark = std::env::args().any(|arg| arg == "--dark");
@@ -44,10 +68,42 @@ fn main() {
     // 恢复持久化状态（播放列表 + 设置）
     let saved_playlist = persistence::load_playlist();
     let settings = persistence::load_settings();
-    let (initial_tracks, initial_current) = match saved_playlist {
+    let (mut tracks, initial_current) = match saved_playlist {
         Some(file) => (file.tracks, file.current_index),
         None => (Vec::new(), None),
     };
+
+    // 命令行带了文件：加进列表（已在列表里就复用那一条）并自动开播。
+    // mpv 对重复分隔符不宽容（`C://` 会直接 file_error），所以统一成单斜杠。
+    let mut autoplay: Option<usize> = None;
+    let mut initial_current = initial_current;
+    if let Some(raw) = open_arg() {
+        let path = std::path::PathBuf::from(&raw);
+        if !path.exists() {
+            persistence::log_session(&format!("open arg missing: {raw}"));
+        } else {
+            let normalized = path.to_string_lossy().replace('\\', "/");
+            let index = match tracks.iter().position(|track| track.path == normalized) {
+                Some(index) => index,
+                None => {
+                    let title = path
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().to_string())
+                        .unwrap_or_else(|| normalized.clone());
+                    tracks.push(TrackMeta {
+                        title,
+                        artist: None,
+                        duration_secs: None,
+                        path: normalized,
+                    });
+                    tracks.len() - 1
+                }
+            };
+            persistence::log_session(&format!("open arg: {index} {raw}"));
+            autoplay = Some(index);
+            initial_current = Some(index);
+        }
+    }
 
     gpui_kit::application()
         .with_assets(AppAssets)
@@ -68,21 +124,27 @@ fn main() {
                 titlebar: Some(TitlebarOptions {
                     // 设计稿的产品名是 Chroma（音乐播放器的品牌名）
                     title: Some("Chroma".into()),
+                    // 关掉系统标题栏，由视图顶部 34px 的标题带自绘（拖动/双击/窗口按钮）。
+                    // GPUI 的 Windows 后端据 appears_transparent 决定是否隐藏非客户区，
+                    // 边框与四边缩放手柄仍由系统提供。
+                    appears_transparent: true,
                     ..Default::default()
                 }),
                 ..Default::default()
             };
 
             let initial_current = initial_current;
+            let tracks = tracks.clone();
             let settings = settings.clone();
             gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| {
                     PlayerView::new(
                         window,
                         cx,
-                        initial_tracks.clone(),
+                        tracks.clone(),
                         initial_current,
                         settings,
+                        autoplay,
                     )
                 })
             })

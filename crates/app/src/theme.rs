@@ -222,6 +222,53 @@ fn config(name: &str, mode: ThemeMode, p: &Palette) -> ThemeConfig {
 ///
 /// 必须在 `gpui_kit::init(cx)` 之后调用：那一步会先装一份默认主题并
 /// `Theme::change(Light)`，这里再把它替换成设计稿的色板。
+/// 浮在画面上的控件（OSC）配色。
+///
+/// 和 App 表面的 Latte 是**两套体系**：叠在任意亮度的画面/封面上时，浅色浮条既压不住
+/// 亮场景、也会把暗场景吃掉。IINA 在浅色系统下 OSC 同样走深色玻璃，这里照此处理；
+/// 唯一贯穿两套体系的是 Mauve。
+///
+/// 设计稿玻璃底是 `#0B0C10` 60% + backdrop blur 32。Windows 上没有 backdrop blur，
+/// 60% 压在亮画面上文字会糊，所以这里加浓到 72%。
+pub mod overlay {
+    use gpui_kit::Hsla;
+
+    /// 视频画布：比玻璃更深，和画面黑边融在一起
+    pub fn canvas() -> Hsla {
+        gpui_kit::rgb(0x08090C).into()
+    }
+
+    /// 玻璃底：`#0B0C10` @ 72%
+    pub fn glass() -> Hsla {
+        gpui_kit::rgba(0x0B0C10B8).into()
+    }
+
+    /// 玻璃描边：白 10%
+    pub fn border() -> Hsla {
+        gpui_kit::rgba(0xFFFFFF1A).into()
+    }
+
+    /// 浮层主图标/文字
+    pub fn fg() -> Hsla {
+        gpui_kit::rgb(0xD5D9E2).into()
+    }
+
+    /// 浮层次要文字（剩余时间、标题带）
+    pub fn dim() -> Hsla {
+        gpui_kit::rgb(0x8B909C).into()
+    }
+
+    /// 已播放进度 / 音量：Mocha 的 Mauve，在暗底上比 `#8839EF` 更亮
+    pub fn accent() -> Hsla {
+        gpui_kit::rgb(0xCBA6F7).into()
+    }
+
+    /// 播放键：仍是品牌 Mauve（设计稿明确浮层里只有它用这个色）
+    pub fn play() -> Hsla {
+        gpui_kit::rgb(0x8839EF).into()
+    }
+}
+
 pub fn install(cx: &mut App, dark: bool) {
     let light = Rc::new(config("Chroma Latte", ThemeMode::Light, &LATTE));
     let dark_cfg = Rc::new(config("Chroma Mocha", ThemeMode::Dark, &MOCHA));

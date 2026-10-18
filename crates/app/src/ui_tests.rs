@@ -75,6 +75,15 @@ fn open_view(
     cx: &mut TestAppContext,
     tracks: Vec<TrackMeta>,
 ) -> (AnyWindowHandle, Entity<PlayerView>) {
+    open_view_with(cx, tracks, None)
+}
+
+/// 同上，但可以指定「启动即播放」的曲目（对应命令行 `--play`）。
+fn open_view_with(
+    cx: &mut TestAppContext,
+    tracks: Vec<TrackMeta>,
+    autoplay: Option<usize>,
+) -> (AnyWindowHandle, Entity<PlayerView>) {
     cx.update(|cx| {
         // 主题 / 组件插件必须先初始化，否则渲染时取不到 Theme 全局状态。
         gpui_kit::init(cx);
@@ -91,7 +100,9 @@ fn open_view(
             cx,
             move |window, cx| {
                 let tracks = tracks.clone();
-                cx.new(|cx| PlayerView::new(window, cx, tracks, None, Settings::default()))
+                cx.new(|cx| {
+                    PlayerView::new(window, cx, tracks, None, Settings::default(), autoplay)
+                })
             },
         )
         .expect("打开测试窗口")
@@ -108,6 +119,9 @@ fn icon_buttons_expose_accessibility_labels(cx: &mut TestAppContext) {
     let (window, _view) = open_view(cx, Vec::new());
 
     cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        // 新设计默认收起播放列表（面板悬浮在画面上），先展开再查面板里的入口
+        window.click("toggle-playlist", cx);
         window.render_frame(cx);
         for (id, label) in [
             ("add-file", "添加文件"),
@@ -315,6 +329,9 @@ fn layout_keeps_playlist_and_controls_inside_window(cx: &mut TestAppContext) {
 
     cx.update_window(window, |_, window, cx| {
         window.render_frame(cx);
+        // 面板默认收起，先展开再量 add-file 的几何
+        window.click("toggle-playlist", cx);
+        window.render_frame(cx);
 
         let add_file = window.find("add-file");
         let play = window.find("play-pause");
@@ -341,6 +358,47 @@ fn layout_keeps_playlist_and_controls_inside_window(cx: &mut TestAppContext) {
         // 播放按钮应在窗口下半部分（控制栏），进度条在它上方
         assert!(play.bounds().top() > window_bounds.center().y);
         assert!(seek.bounds().bottom() <= play.bounds().top() + px(4.));
+    })
+    .unwrap();
+}
+
+/// 舞台（视频/音频内容区）必须撑满标题带与底部胶囊之间。
+///
+/// 守的是一条很隐蔽的回归：`h_flex()` 默认 `items_center`，而舞台的子元素全是绝对
+/// 定位（内容高度 0），漏了 `self_stretch` 的话舞台高度会塌成 0——GPUI 里画面上
+/// 看不出异常（背景色由根节点铺满），但视频区 canvas 捕获到 `0x0`，mpv 叠加窗
+/// 永远定不到位，表现为「有声音、黑屏」。
+#[gpui_kit::test]
+fn stage_fills_space_between_title_band_and_bottom_band(cx: &mut TestAppContext) {
+    fresh_dir("stage");
+    let (window, _view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+
+        let stage = window.find("stage").bounds();
+        let window_bounds = window.bounds();
+        let height = stage.size.height.as_f32();
+
+        assert!(
+            height > window_bounds.size.height.as_f32() * 0.5,
+            "舞台高度塌陷：{height}（窗口 {}），视频区会拿到 0 高度导致黑屏",
+            window_bounds.size.height
+        );
+        assert!(
+            (stage.left() - window_bounds.left()).as_f32().abs() <= 1.0
+                && (stage.right() - window_bounds.right()).as_f32().abs() <= 1.0,
+            "舞台应横向铺满：{stage:?} vs {window_bounds:?}"
+        );
+        // 顶部让开标题带、底部让开悬浮胶囊
+        assert!(
+            stage.top() > window_bounds.top(),
+            "舞台不应盖住标题带：{stage:?}"
+        );
+        assert!(
+            stage.bottom() < window_bounds.bottom(),
+            "舞台应给底部胶囊留出空间：{stage:?}"
+        );
     })
     .unwrap();
 }

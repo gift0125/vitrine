@@ -27,19 +27,39 @@ use gpui_kit::component::list::{List, ListEvent, ListState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
 use gpui_kit::component::{
-    h_flex, v_flex, ActiveTheme as _, Icon, Sizable as _, Theme, ThemeMode, WindowExt as _,
+    h_flex, v_flex, ActiveTheme as _, Icon, InteractiveElementExt as _, Sizable as _, Theme,
+    ThemeMode, WindowExt as _,
 };
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::persistence::{self, Settings};
 use crate::playlist::PlaylistDelegate;
+use crate::theme::overlay;
 use crate::video_overlay::{self, Hwnd, VideoOverlay};
 
 /// 进度条量程未知时的兜底（元数据解析失败）。
 const SEEK_FALLBACK_MAX: f32 = 600.0;
 /// 轮询间隔（计划约定 100ms）。
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
+/// 顶部标题带高度（系统标题栏已关闭，这一段是自绘拖拽区 + 窗口按钮）。
+const TITLE_BAND: f32 = 34.0;
+/// 底部悬浮胶囊的内缩。
+const CAPSULE_INSET: f32 = 24.0;
+/// 底部为悬浮胶囊预留的高度（胶囊 ~106 高 + 24 内缩 + 余量）。
+const BOTTOM_BAND: f32 = 132.0;
+/// 悬浮播放列表面板宽度（设计稿 320）。
+const PLAYLIST_WIDTH: f32 = 320.0;
+/// 时间码字体（设计稿用等宽）。
+const MONO_FONT: &str = "Consolas";
+
+/// ±10 秒图标的 path（24 格）。
+///
+/// 按设计稿手算的方向画：快退的缺口开在右上、箭头在顶部朝左，快进是精确镜像
+/// （不是把同一个图标翻转，否则箭头的切线方向会反）。
+const ICON_REWIND_10: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M12 3A9 9 0 1 0 21 12" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M11.9 3.1L15.6 0.6 15.6 5.6Z" fill="currentColor"/></svg>"#;
+const ICON_FORWARD_10: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M12 3A9 9 0 1 1 3 12" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M12.1 3.1L8.4 0.6 8.4 5.6Z" fill="currentColor"/></svg>"#;
+
 /// 窗口尺寸变化后多久落盘一次（tick 计数，50 ≈ 5s）。
 const WINDOW_SAVE_TICKS: usize = 50;
 
@@ -88,12 +108,16 @@ pub struct PlayerView {
     main_hwnd: Hwnd,
     /// 影院模式（隐藏歌单 + 系统全屏）
     cinema: bool,
+    /// 悬浮播放列表面板是否展开（新版设计稿默认收起）
+    playlist_open: bool,
 
     // ---- 用户可见错误 ----
     /// 待弹出的错误提示（由 tick 统一推成 toast，保证有 window 可用）
     pending_errors: Vec<SharedString>,
     /// 待弹出的普通提示（例如导入结果）
     pending_infos: Vec<SharedString>,
+    /// 启动即播放的曲目（命令行 `--play` / 位置参数）；在第一次 tick 消费
+    pending_autoplay: Option<usize>,
     /// 最近一条错误（便于测试断言，也给未来的状态栏复用）
     last_error: Option<SharedString>,
 }
@@ -105,6 +129,7 @@ impl PlayerView {
         initial_tracks: Vec<TrackMeta>,
         initial_current: Option<usize>,
         settings: Settings,
+        autoplay: Option<usize>,
     ) -> Self {
         let small = cx.weak_entity();
         let playlist =
@@ -222,9 +247,11 @@ impl PlayerView {
             video_rect,
             main_hwnd,
             cinema: false,
+            playlist_open: false,
             last_error: startup_errors.first().cloned(),
             pending_errors: startup_errors,
             pending_infos: Vec::new(),
+            pending_autoplay: autoplay,
         };
 
         // 100ms 轮询：进度同步 + 自动连播 + 叠加窗口跟随 + 窗口尺寸节流落盘
@@ -272,6 +299,11 @@ impl PlayerView {
 
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_errors(window, cx);
+
+        // 命令行「打开方式」：等第一帧渲染完再起播，构造期间不发通知
+        if let Some(index) = self.pending_autoplay.take() {
+            self.play_track(index, cx);
+        }
 
         // 影院模式只对视频成立：自动连播切到音频（或无视频可播）时必须退出全屏，
         // 否则影院按钮消失、用户被困在全屏里。
@@ -697,6 +729,33 @@ impl PlayerView {
         }
     }
 
+    /// 相对跳转（±10 秒按钮）：夹到 [0, 时长] 之间，避免越界后播放器自己回弹。
+    fn seek_rel(&mut self, delta: f64) {
+        if self.current.is_none() {
+            return;
+        }
+        let position = if self.video_active {
+            self.video
+                .engine
+                .as_ref()
+                .map(|e| e.status().position)
+                .unwrap_or(0.0)
+        } else {
+            self.engine
+                .as_ref()
+                .map(|e| e.position_secs())
+                .unwrap_or(0.0)
+        };
+        let target = (position + delta).clamp(0.0, self.seek_max as f64);
+        self.seek_to(target);
+    }
+
+    /// 展开/收起悬浮播放列表（新版设计稿默认收起，省下整块画面）。
+    fn toggle_playlist(&mut self, cx: &mut Context<Self>) {
+        self.playlist_open = !self.playlist_open;
+        cx.notify();
+    }
+
     fn set_volume_pct(&mut self, pct: i32, cx: &mut Context<Self>) {
         self.volume_pct = pct.clamp(0, 100);
         let volume = self.volume_pct as f32 / 100.0;
@@ -874,28 +933,284 @@ impl PlayerView {
     // 渲染
     // ------------------------------------------------------------------
     //
-    // 尺寸全部取设计稿（Ardot 主播放窗口 1280×800）：
-    //   - 播放列表面板：右侧 320 宽，padding 20，gap 10，条目 48 高
-    //   - 1px 分隔线：Surface0（唯一分隔手段，不做卡片投影）
-    //   - 控制栏：padding 16 + gap 12，进度轨道在上、时间行在下、控制行最底
-    //   - 播放按钮：44 正圆，Mauve 填充，白色图标
+    // 新版设计稿是 IINA 式沉浸布局（Ardot 主播放窗口 1280×800）：
+    //   - 画面铺满整窗，控件以浮层形式压在画面上
+    //   - 底部是内缩 24px 的悬浮胶囊（1232×100，圆角 14），深色玻璃
+    //   - 播放列表是 320 宽的悬浮面板，**默认收起**，由控制栏的列表图标开合
+    //   - 顶部只有一条 34px 的标题带（自绘），系统标题栏已关闭
+    //
+    // 架构限制（mpv 渲染在独立顶层窗口里，会盖住 GPUI 控件）导致两处必要偏差：
+    //   1. 视频画面只占「标题带以下、胶囊以上」，胶囊落在深色画布上而不是压在画面上；
+    //   2. 视频模式下列表展开时，画面右侧让位，否则面板会被 mpv 盖住。
+    //   音频模式没有这个限制，封面可以真正铺满整窗。
 
-    /// 播放列表面板：右侧固定 320 宽（设计稿 x=960、w=320）。
+    /// 顶部标题带：当前曲名 + 自绘窗口按钮（系统标题栏已在 main 里关掉）。
+    fn render_title_band(&self, cx: &Context<Self>) -> Div {
+        let title = match self.current_track(cx) {
+            Some(track) => match &track.artist {
+                Some(artist) if !artist.is_empty() => format!("{} · {}", track.title, artist),
+                _ => track.title.clone(),
+            },
+            None => "Chroma".to_string(),
+        };
+
+        h_flex()
+            .w_full()
+            .h(px(TITLE_BAND))
+            .flex_shrink_0()
+            .items_center()
+            .pl(px(16.))
+            // 只有左侧这段是拖拽区：整条都设成 Drag 的话，右侧窗口按钮会一起
+            // 被当成非客户区，点击事件就到不了 GPUI。
+            .child(
+                div()
+                    .id("title-drag")
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .window_control_area(WindowControlArea::Drag)
+                    .on_double_click(|_, window, _| window.zoom_window())
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(overlay::dim())
+                            .child(title),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .when(self.cinema, |el| {
+                        // 影院模式下仍然留一个退出按钮，否则用户没法回到普通窗口
+                        el.child(
+                            Button::new("exit-cinema")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Minimize)
+                                .tooltip("退出全屏")
+                                .accessibility_label("退出全屏")
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.toggle_cinema(window, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("win-min")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::WindowMinimize)
+                            .tooltip("最小化")
+                            .accessibility_label("最小化")
+                            .on_click(|_, window, _| window.minimize_window()),
+                    )
+                    .child(
+                        Button::new("win-max")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::WindowMaximize)
+                            .tooltip("最大化")
+                            .accessibility_label("最大化")
+                            .on_click(|_, window, _| window.zoom_window()),
+                    )
+                    .child(
+                        Button::new("win-close")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::WindowClose)
+                            .tooltip("关闭")
+                            .accessibility_label("关闭")
+                            .on_click(|_, window, _| window.remove_window()),
+                    )
+                    .pr(px(4.)),
+            )
+    }
+
+    /// 舞台：视频/音频两种内容，占满标题带与底部胶囊之间的区域。
+    ///
+    /// `self_stretch` 不能少：`h_flex()` 默认 `items_center`，舞台的子元素又全是
+    /// 绝对定位（内容高度 0），不撑满交叉轴的话舞台高度会塌成 0——视频区 canvas
+    /// 捕获到 `0x0`，mpv 叠加窗就永远定不到位（表现为黑屏但有声音）。
+    fn render_stage(&self, cx: &Context<Self>) -> impl gpui_kit::IntoElement {
+        let stage = div()
+            .id("stage")
+            .test_support()
+            .flex_1()
+            .self_stretch()
+            .min_w_0()
+            .min_h_0()
+            .relative()
+            .bg(if self.video_active {
+                overlay::canvas()
+            } else {
+                cx.theme().background
+            });
+
+        if self.video_active {
+            stage.child(self.render_video_surface(cx))
+        } else {
+            stage.child(self.render_audio_surface(cx))
+        }
+    }
+
+    /// 音频：居中的封面卡片 + 曲目信息（浮层胶囊压在下缘）。
+    fn render_audio_surface(&self, cx: &Context<Self>) -> Div {
+        let theme = cx.theme();
+        let track = self.current_track(cx);
+        let empty = self.playlist.read(cx).delegate().track_count() == 0;
+
+        let mut surface = v_flex()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap(px(18.))
+            .px(px(40.))
+            // 沉到窗口视觉中心偏上一点：完全居中会和悬浮胶囊贴太近，
+            // 完全让开胶囊（整块 BOTTOM_BAND）又显得整体偏上。
+            .pb(px(BOTTOM_BAND * 0.5))
+            .child(
+                div()
+                    .size(px(200.))
+                    .flex_shrink_0()
+                    .rounded(px(16.))
+                    .bg(theme.secondary)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_md()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        Icon::new(IconName::Music)
+                            .size(px(56.))
+                            .text_color(theme.muted_foreground),
+                    ),
+            );
+
+        match &track {
+            Some(track) => {
+                surface = surface.child(
+                    v_flex()
+                        .items_center()
+                        .gap(px(4.))
+                        .child(
+                            div()
+                                .text_size(px(20.))
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_color(theme.foreground)
+                                .child(track.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme.muted_foreground)
+                                .child(format!(
+                                    "{} · {}",
+                                    track
+                                        .artist
+                                        .clone()
+                                        .unwrap_or_else(|| "未知艺术家".to_string()),
+                                    fmt_time(track.duration_secs.unwrap_or(0.0))
+                                )),
+                        ),
+                );
+            }
+            None => {
+                surface = surface.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(if empty {
+                            "播放列表为空，点控制栏的列表图标添加媒体"
+                        } else {
+                            "从播放列表选择一项开始播放"
+                        }),
+                );
+            }
+        }
+
+        surface
+    }
+
+    /// 视频：黑色画布（mpv 渲染进叠加窗口，这里只提供位置与错误占位）。
+    fn render_video_surface(&self, _cx: &Context<Self>) -> Div {
+        let base = div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full()
+            .bg(overlay::canvas());
+
+        if let Some(err) = &self.video_error {
+            return base.flex().items_center().justify_center().child(
+                v_flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .p(px(24.))
+                    .child(
+                        Icon::new(IconName::CircleAlert)
+                            .size(px(32.))
+                            .text_color(gpui_kit::rgb(0xF38BA8)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(overlay::fg())
+                            .child(err.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(overlay::dim())
+                            .child("提示：安装 mpv 或设置 SMP_MPV_PATH 指向 mpv.exe"),
+                    ),
+            );
+        }
+
+        // 每帧把视频区 bounds 写回 Cell，tick 据此定位叠加窗口
+        let slot = self.video_rect.clone();
+        let stage = canvas(
+            move |bounds, _window, _cx| {
+                slot.set(Some((
+                    bounds.origin.x.as_f32(),
+                    bounds.origin.y.as_f32(),
+                    bounds.size.width.as_f32(),
+                    bounds.size.height.as_f32(),
+                )));
+            },
+            |_bounds, _out, _window, _cx| {},
+        )
+        .size_full();
+
+        base.child(stage)
+    }
+
+    /// 悬浮播放列表面板：320 宽、Latte 底、浮在画面上（默认可收起）。
     fn render_playlist_panel(&self, cx: &Context<Self>) -> Div {
         let theme = cx.theme();
         let count = self.playlist.read(cx).delegate().track_count();
 
         v_flex()
-            .h_full()
-            .w(px(320.))
-            .flex_shrink_0()
+            .absolute()
+            .top(px(TITLE_BAND + 6.))
+            .right(px(12.))
+            .bottom(px(BOTTOM_BAND))
+            .w(px(PLAYLIST_WIDTH))
+            .rounded(px(12.))
             .bg(theme.background)
-            .border_l_1()
+            .border_1()
             .border_color(theme.border)
-            .px(px(20.))
-            .pt(px(20.))
-            .pb(px(12.))
-            .gap(px(10.))
+            .shadow_lg()
+            .overflow_hidden()
+            .px(px(16.))
+            .pt(px(14.))
+            .pb(px(10.))
+            .gap(px(8.))
             .child(
                 h_flex()
                     .w_full()
@@ -916,8 +1231,8 @@ impl PlayerView {
                             .text_color(theme.muted_foreground)
                             .child(format!("{count} 个文件")),
                     )
-                    // 设计稿没有这三个入口，但功能上必须有；收成 20px 的 ghost 图标，
-                    // 颜色交给 muted 层级，不抢"播放列表"标题的视觉权重。
+                    // 设计稿没有这三个入口，但功能上必须有；收成 xsmall ghost 图标，
+                    // 颜色交给 muted 层级，不抢「播放列表」标题的视觉权重。
                     .child(
                         Button::new("add-file")
                             .ghost()
@@ -954,8 +1269,7 @@ impl PlayerView {
             )
             // 1px Surface0 分隔线（设计稿唯一的分隔方式）
             .child(div().w_full().h(px(1.)).flex_shrink_0().bg(theme.border))
-            // List 默认带 8px 左右内边距（会把条目挤得比标题缩进一格），
-            // 设计稿里条目只靠自身 8px padding 缩进，所以这里压成 0。
+            // List 默认带 8px 左右内边距（会把条目挤得比标题缩进一格），压成 0
             .child(
                 div()
                     .flex_1()
@@ -964,136 +1278,27 @@ impl PlayerView {
             )
     }
 
-    /// 音频：居中封面 + 曲目信息（对应设计稿「音乐模式」窗口的封面块）。
-    fn render_cover(&self, cx: &Context<Self>) -> Div {
-        let theme = cx.theme();
-        let track = self.current_track(cx);
-        let empty = self.playlist.read(cx).delegate().track_count() == 0;
-
-        let mut cover = v_flex()
-            .flex_1()
-            .h_full()
-            .items_center()
-            .justify_center()
-            .gap(px(20.))
-            .px(px(40.))
-            .child(
-                div()
-                    .size(px(300.))
-                    .flex_shrink_0()
-                    .rounded(px(18.))
-                    .bg(theme.secondary)
-                    .border_1()
-                    .border_color(theme.border)
-                    .shadow_sm()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        Icon::new(IconName::Music)
-                            .size(px(64.))
-                            .text_color(theme.muted_foreground),
-                    ),
-            );
-
-        if let Some(track) = track {
-            cover = cover
-                .child(
-                    v_flex()
-                        .items_center()
-                        .gap(px(6.))
-                        .child(
-                            div()
-                                .text_size(px(22.))
-                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                                .text_color(theme.foreground)
-                                .child(track.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(13.))
-                                .text_color(theme.muted_foreground)
-                                .child(format!(
-                                    "{} · {}",
-                                    track.artist.clone().unwrap_or_else(|| "未知艺术家".into()),
-                                    fmt_time(track.duration_secs.unwrap_or(0.0))
-                                )),
-                        ),
-                );
-        } else {
-            cover = cover.child(
-                div()
-                    .text_size(px(13.))
-                    .text_color(theme.muted_foreground)
-                    .child(if empty {
-                        "播放列表为空，点击右上角 + 添加媒体"
-                    } else {
-                        "从右侧播放列表选择一项开始播放"
-                    }),
-            );
-        }
-
-        cover
+    /// 悬浮胶囊：进度轨道 + 时间行 + 控制行，深色玻璃。
+    fn render_capsule(&self, cx: &mut Context<Self>) -> Div {
+        v_flex()
+            .absolute()
+            .left(px(CAPSULE_INSET))
+            .right(px(CAPSULE_INSET))
+            .bottom(px(CAPSULE_INSET))
+            .px(px(20.))
+            .py(px(12.))
+            .gap(px(6.))
+            .rounded(px(14.))
+            .bg(overlay::glass())
+            .border_1()
+            .border_color(overlay::border())
+            .shadow_lg()
+            .child(self.render_seek_row(cx))
+            .child(self.render_controls_row(cx))
     }
 
-    /// 视频：舞台区（mpv 渲染进叠加窗口，这里只提供位置与占位背景）。
-    fn render_video_stage(&self, _cx: &Context<Self>) -> Div {
-        let base = div()
-            .flex_1()
-            .h_full()
-            .bg(gpui_kit::rgb(0x000000))
-            .relative()
-            .flex()
-            .items_center()
-            .justify_center();
-
-        if let Some(err) = &self.video_error {
-            return base.child(
-                v_flex()
-                    .items_center()
-                    .gap(px(10.))
-                    .p(px(24.))
-                    .child(
-                        Icon::new(IconName::CircleAlert)
-                            .size(px(32.))
-                            .text_color(gpui_kit::rgb(0xF38BA8)),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .text_color(gpui_kit::rgb(0xCDD6F4))
-                            .child(err.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(gpui_kit::rgb(0x7F849C))
-                            .child("提示：安装 mpv 或设置 SMP_MPV_PATH 指向 mpv.exe"),
-                    ),
-            );
-        }
-
-        // 每帧把视频区 bounds 写回 Cell，tick 据此定位叠加窗口
-        let slot = self.video_rect.clone();
-        let stage = canvas(
-            move |bounds, _window, _cx| {
-                slot.set(Some((
-                    bounds.origin.x.as_f32(),
-                    bounds.origin.y.as_f32(),
-                    bounds.size.width.as_f32(),
-                    bounds.size.height.as_f32(),
-                )));
-            },
-            |_bounds, _out, _window, _cx| {},
-        )
-        .size_full();
-
-        base.child(stage)
-    }
-
-    /// 进度区：4px 轨道 + 下一行「当前 / 剩余」（设计稿把时间放在轨道下方）。
+    /// 进度：轨道在上、时间行在下（左当前 / 右剩余）。
     fn render_seek_row(&self, cx: &Context<Self>) -> Div {
-        let theme = cx.theme();
         let track = self.current_track(cx);
         let duration = match &track {
             Some(t) if self.video_active => {
@@ -1127,25 +1332,25 @@ impl PlayerView {
                 .unwrap_or(0.0)
         };
         let remaining = (duration - position).max(0.0);
-        let mono = theme.mono_font_family.clone();
 
         v_flex()
             .w_full()
             .gap(px(6.))
+            // Slider 自身没有 id / 无障碍信息（上游未实现），用带 id 的容器承载，
+            // 既给读屏软件一个可命名的分组，也让 UI 测试能定位到进度条几何。
             .child(
-                // Slider 自身没有 id / 无障碍信息（上游未实现），用带 id 的容器承载，
-                // 既给读屏软件一个可命名的分组，也让 UI 测试能定位到进度条几何。
                 div()
                     .id("seek-bar")
                     .aria_label("播放进度")
                     .w_full()
+                    .h(px(12.))
                     .flex()
+                    .items_center()
                     .test_support()
                     .child(
                         Slider::new(&self.seek)
+                            .bg(overlay::accent())
                             .flex_1()
-                            // bg 即「已播放段」，轨道自动取它的 20% 透明度版本
-                            .bg(theme.primary)
                             .disabled(self.current.is_none()),
                     ),
             )
@@ -1156,31 +1361,27 @@ impl PlayerView {
                     .justify_between()
                     .child(
                         div()
-                            .font_family(mono.clone())
+                            .font_family(MONO_FONT)
                             .text_size(px(11.))
-                            .text_color(theme.secondary_foreground)
+                            .text_color(overlay::fg())
                             .child(fmt_time(position)),
                     )
                     .child(
                         div()
-                            .font_family(mono)
+                            .font_family(MONO_FONT)
                             .text_size(px(11.))
-                            .text_color(theme.muted_foreground)
+                            .text_color(overlay::dim())
                             .child(format!("剩余 {}", fmt_time(remaining))),
                     ),
             )
     }
 
-    /// 控制行：左（音量）· 中（上一首 / 播放 / 下一首）· 右（全屏 / 换肤）。
+    /// 控制行：左音量 · 中走带（上一首 / -10s / 播放 / +10s / 下一首）· 右功能。
     ///
-    /// 左、右两栏都是 `flex_1`（`flex: 1 1 0%`，即等宽），所以中间那栏必然落在
-    /// 窗口正中。早先用 `justify_between` 把走带按钮和音量塞在同一组里，左侧内容
-    /// 比右侧多，走带就被挤到偏左的位置——这正是"播放控制没有居中"的原因。
+    /// 左、右两栏都是 `flex_1`（`flex: 1 1 0%`，等宽），中间那栏才落在窗口正中。
     fn render_controls_row(&self, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
-        let is_dark = theme.mode.is_dark();
-        let state = self.playback_state();
-        let playing = state.is_playing();
+        let is_dark = cx.theme().mode.is_dark();
+        let playing = self.playback_state().is_playing();
         let play_icon = if playing {
             IconName::Pause
         } else {
@@ -1193,12 +1394,14 @@ impl PlayerView {
         };
         let is_video = self.video_active;
         let cinema = self.cinema;
+        let playlist_open = self.playlist_open;
 
         h_flex()
             .w_full()
+            .h(px(44.))
             .items_center()
             .gap(px(12.))
-            // ---- 左：音量（flex_1，内容靠左） ----
+            // ---- 左：音量 ----
             .child(
                 h_flex()
                     .flex_1()
@@ -1208,16 +1411,16 @@ impl PlayerView {
                     .child(
                         Icon::new(volume_icon)
                             .size(px(16.))
-                            .text_color(theme.secondary_foreground),
+                            .text_color(overlay::fg()),
                     )
                     .child(
                         div()
                             .id("volume-bar")
                             .aria_label("音量")
-                            .w(px(88.))
+                            .w(px(64.))
                             .flex()
                             .test_support()
-                            .child(Slider::new(&self.volume).bg(theme.primary)),
+                            .child(Slider::new(&self.volume).bg(overlay::accent())),
                     ),
             )
             // ---- 中：走带控制（不参与伸缩，恒在窗口正中） ----
@@ -1225,24 +1428,28 @@ impl PlayerView {
                 h_flex()
                     .flex_shrink_0()
                     .items_center()
-                    .gap(px(14.))
+                    .gap(px(20.))
                     .child(
                         Button::new("prev")
                             .ghost()
-                            .with_size(px(30.))
+                            .with_size(px(28.))
                             .icon(IconName::SkipBack)
+                            .text_color(overlay::fg())
                             .tooltip("上一首")
                             .accessibility_label("上一首")
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.skip(-1, cx);
                             })),
                     )
-                    // 设计稿：44 正圆、Mauve 实心、白色图标
+                    .child(self.render_skip_button("seek-back-10", false, cx))
+                    // 设计稿：44 正圆、品牌 Mauve 实心、白色图标
                     .child(
                         Button::new("play-pause")
                             .primary()
                             .with_size(px(44.))
                             .rounded(px(22.))
+                            .bg(overlay::play())
+                            .text_color(gpui_kit::rgb(0xFFFFFF))
                             .icon(play_icon)
                             .tooltip(if playing { "暂停" } else { "播放" })
                             .accessibility_label(if playing { "暂停" } else { "播放" })
@@ -1250,11 +1457,13 @@ impl PlayerView {
                                 this.toggle_play(cx);
                             })),
                     )
+                    .child(self.render_skip_button("seek-fwd-10", true, cx))
                     .child(
                         Button::new("next")
                             .ghost()
-                            .with_size(px(30.))
+                            .with_size(px(28.))
                             .icon(IconName::SkipForward)
+                            .text_color(overlay::fg())
                             .tooltip("下一首")
                             .accessibility_label("下一首")
                             .on_click(cx.listener(|this, _e, _w, cx| {
@@ -1262,24 +1471,49 @@ impl PlayerView {
                             })),
                     ),
             )
-            // ---- 右：全屏（仅视频） + 明暗切换（flex_1，内容靠右） ----
+            // ---- 右：列表 / 全屏 / 换肤 ----
             .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
                     .items_center()
                     .justify_end()
-                    .gap(px(4.))
+                    .gap(px(6.))
+                    .child(
+                        Button::new("toggle-playlist")
+                            .ghost()
+                            .with_size(px(28.))
+                            .icon(IconName::ListMusic)
+                            .text_color(if playlist_open {
+                                overlay::accent()
+                            } else {
+                                overlay::fg()
+                            })
+                            .tooltip(if playlist_open {
+                                "收起播放列表"
+                            } else {
+                                "展开播放列表"
+                            })
+                            .accessibility_label(if playlist_open {
+                                "收起播放列表"
+                            } else {
+                                "展开播放列表"
+                            })
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.toggle_playlist(cx);
+                            })),
+                    )
                     .when(is_video, |el| {
                         el.child(
                             Button::new("cinema")
                                 .ghost()
-                                .with_size(px(30.))
+                                .with_size(px(28.))
                                 .icon(if cinema {
                                     IconName::Minimize
                                 } else {
                                     IconName::Maximize
                                 })
+                                .text_color(overlay::fg())
                                 .tooltip(if cinema { "退出全屏" } else { "全屏" })
                                 .accessibility_label(if cinema { "退出全屏" } else { "进入全屏" })
                                 .on_click(cx.listener(|this, _e, window, cx| {
@@ -1290,8 +1524,9 @@ impl PlayerView {
                     .child(
                         Button::new("theme-toggle")
                             .ghost()
-                            .with_size(px(30.))
+                            .with_size(px(28.))
                             .icon(if is_dark { IconName::Sun } else { IconName::Moon })
+                            .text_color(overlay::fg())
                             .tooltip("明暗主题切换")
                             .accessibility_label(if is_dark {
                                 "切换到浅色主题"
@@ -1310,21 +1545,59 @@ impl PlayerView {
             )
     }
 
-    /// 控制栏外壳：Base 底 + 顶部 1px Surface0，padding 16 / gap 12。
-    fn render_control_bar(&self, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
-        v_flex()
-            .w_full()
-            .flex_shrink_0()
-            .bg(theme.background)
-            .border_t_1()
-            .border_color(theme.border)
-            .px(px(16.))
-            .pt(px(14.))
-            .pb(px(12.))
-            .gap(px(12.))
-            .child(self.render_seek_row(cx))
-            .child(self.render_controls_row(cx))
+    /// ±10 秒按钮：圆弧 + 箭头 + 数字。
+    ///
+    /// 图标自带 path 而不是用 `IconName::RotateCcw`：图标包（`default-icons.txt`）
+    /// 只收了 `rotate-cw`，反向那个在包里根本没有，引用它会静默渲染成空白。
+    /// 数字用独立文本层（设计稿同款做法）：SVG `<text>` 依赖字体环境，会掉字。
+    fn render_skip_button(
+        &self,
+        id: &'static str,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let label = if forward { "快进 10 秒" } else { "快退 10 秒" };
+        let svg = if forward {
+            ICON_FORWARD_10
+        } else {
+            ICON_REWIND_10
+        };
+
+        Button::new(id)
+            .ghost()
+            .with_size(px(28.))
+            .text_color(overlay::fg())
+            .tooltip(label)
+            .accessibility_label(label)
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                this.seek_rel(if forward { 10.0 } else { -10.0 });
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .relative()
+                    .size(px(20.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(Icon::default().data(svg).size(px(18.)))
+                    .child(
+                        // 绝对定位必须给四边，否则它按"静态位置"排在图标后面，
+                        // 数字会跑到圆弧右边去。
+                        div()
+                            .absolute()
+                            .top(px(0.))
+                            .left(px(0.))
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(7.))
+                            .font_weight(gpui_kit::FontWeight::BOLD)
+                            .text_color(overlay::fg())
+                            .child("10"),
+                    ),
+            )
     }
 }
 
@@ -1370,28 +1643,37 @@ impl PlayerView {
 
 impl Render for PlayerView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let video_active = self.video_active;
-        let cinema = self.cinema;
-
-        v_flex()
+        div()
+            .relative()
             .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
-            // 主区域：左封面/视频舞台 + 右播放列表（设计稿 x=960 w=320，贴右边缘）
+            .bg(if self.video_active {
+                overlay::canvas()
+            } else {
+                cx.theme().background
+            })
+            .text_color(cx.theme().foreground)
             .child(
-                h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(if video_active {
-                        self.render_video_stage(cx)
-                    } else {
-                        self.render_cover(cx)
-                    })
-                    .when(!cinema, |el| el.child(self.render_playlist_panel(cx))),
+                v_flex()
+                    .size_full()
+                    .child(self.render_title_band(cx))
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_h_0()
+                            .child(self.render_stage(cx))
+                            // 视频模式下列表展开 → 画面右侧让位，
+                            // 否则悬浮面板会被 mpv 叠加窗整个盖住。
+                            .when(self.video_active && self.playlist_open, |el| {
+                                el.child(div().w(px(PLAYLIST_WIDTH + 24.)).flex_shrink_0())
+                            }),
+                    )
+                    // 底部预留悬浮胶囊的位置（视频模式下这块是画布）
+                    .child(div().h(px(BOTTOM_BAND)).flex_shrink_0()),
             )
-            // 底部控制栏（设计稿 y=694 h=106）
-            .child(self.render_control_bar(cx))
+            .child(self.render_capsule(cx))
+            .when(self.playlist_open && !self.cinema, |el| {
+                el.child(self.render_playlist_panel(cx))
+            })
     }
 }
 

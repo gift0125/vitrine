@@ -1,7 +1,11 @@
 """启动应用 → 置顶定位 → 截客户区。用于对照设计稿做视觉验收。
 
 用法：python scripts/shot.py <输出png> [--dark] [--w 1040] [--h 680]
-                              [--click "x,y"] [--wait 2.0] [--keep]
+                              [--click "x,y"]... [--wait 2.0] [--keep]
+                              [-- <透传给应用的参数>]
+
+--click 可以给多次，按顺序投递点击（例如先展开播放列表、再点某一集）。
+`--` 之后的参数原样传给应用（例如 `-- --play D:\\movie.mp4` 直接起播）。
 
 --w/--h 是**逻辑**尺寸（与设计稿 1280×800 同一坐标系）；脚本按屏幕缩放比换算成
 物理像素，截完再缩回逻辑尺寸，这样高 DPI 下也是 1:1 的清晰图。
@@ -40,9 +44,12 @@ keep = "--keep" in args
 width = int(args[args.index("--w") + 1]) if "--w" in args else 1040
 height = int(args[args.index("--h") + 1]) if "--h" in args else 680
 wait = float(args[args.index("--wait") + 1]) if "--wait" in args else 1.5
-click = None
-if "--click" in args:
-    click = [int(v) for v in args[args.index("--click") + 1].split(",")]
+clicks = []
+for i, a in enumerate(args):
+    if a == "--click":
+        clicks.append([int(v) for v in args[i + 1].split(",")])
+# `--` 之后的参数透传给应用（例如 --play 某文件）
+passthrough = args[args.index("--") + 1:] if "--" in args else []
 
 user32 = ctypes.windll.user32
 user32.SetWindowPos.argtypes = [
@@ -64,7 +71,7 @@ try:
 except AttributeError:  # Win10 1607 之前没有这个 API
     HAS_ADJUST_DPI = False
 
-cmd = [str(exe)] + (["--dark"] if dark else [])
+cmd = [str(exe)] + (["--dark"] if dark else []) + passthrough
 log = root / "target" / "shot-stderr.log"
 err = open(log, "wb")
 proc = subprocess.Popen(cmd, stdout=err, stderr=subprocess.STDOUT)
@@ -96,6 +103,37 @@ user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, outer_w, outer_h, SWP_SHOWWINDOW)
 user32.SetForegroundWindow(hwnd)
 
 
+def client_size():
+    cr = wintypes.RECT()
+    user32.GetClientRect(hwnd, ctypes.byref(cr))
+    return cr.right, cr.bottom
+
+
+def wait_settled():
+    """等客户区尺寸连续两次采样一致——SetWindowPos 之后 WM_SIZE 还没处理完就量，
+    会拿到上一次的尺寸，按它算修正量会把窗口越改越大。"""
+    last = client_size()
+    for _ in range(40):
+        time.sleep(0.05)
+        now = client_size()
+        if now == last:
+            return now
+        last = now
+    return last
+
+
+# 关掉系统标题栏后客户区比 AdjustWindowRect 估出来的高一截（它按标准外框算），
+# 所以用实测客户区再修正外框，保证截出来是严格的 1:1。
+for _ in range(4):
+    cw, ch = wait_settled()
+    dx, dy = phys_w - cw, phys_h - ch
+    if abs(dx) <= 1 and abs(dy) <= 1:
+        break
+    outer_w += dx
+    outer_h += dy
+    user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, outer_w, outer_h, SWP_SHOWWINDOW)
+
+
 def window_rect():
     r = wintypes.RECT()
     user32.GetWindowRect(hwnd, ctypes.byref(r))
@@ -114,16 +152,15 @@ for _ in range(40):
 
 # 需要交互（点播放列表某一行）时，直接给窗口投递鼠标消息，
 # 不移动真实光标——避免截图里混进悬停态。
-if click:
+for click in clicks:
     cx_, cy_ = round(click[0] * scale), round(click[1] * scale)
     lparam = (cy_ << 16) | (cx_ & 0xFFFF)
     user32.PostMessageW(hwnd, 0x0200, 0, lparam)  # WM_MOUSEMOVE
     user32.PostMessageW(hwnd, 0x0201, 1, lparam)  # WM_LBUTTONDOWN
     time.sleep(0.08)
     user32.PostMessageW(hwnd, 0x0202, 0, lparam)  # WM_LBUTTONUP
-    time.sleep(wait)
-else:
-    time.sleep(wait)
+    time.sleep(0.35)
+time.sleep(wait)
 
 rect = wintypes.RECT()
 user32.GetClientRect(hwnd, ctypes.byref(rect))
