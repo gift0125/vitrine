@@ -83,6 +83,8 @@
 - 起播按 mpv `dwidth/dheight` 把窗口调成画面尺寸：`plan_fit`（纯函数：1:1 → 缩进工作区 → 放大到最小窗口，中心锚点 + 夹回 `rcWork`）→ `fit_to_video`。执行必须走 `cx.spawn_in`（见上文 `SetWindowPos` 那条）。
 - `fit_done: Option<(w,h)>` 每部片子只调一次（`start_video` 清空）；`fit_seen` 做"同尺寸连报两次"去抖；最大化/影院/全屏时不动窗口，`fit_done` 留空、退出后下一帧补上。
 - 最大化状态下按住画面也能拖（只在最小化时无视）；`set_rect` 改为每帧 `ensure_below` 查一次 z 序。
+- **圆角要两块窗口一起设**：`DwmSetWindowAttribute(hwnd, 33 /*DWMWA_WINDOW_CORNER_PREFERENCE*/, &2 /*DWMWCP_ROUND*/, 4)`。上面两角属主窗口标题带、下面两角属视频叠加窗（主窗口那一带只有胶囊），只设一块会在角上留方角。退出视频模式设 1（DONOTROUND）；Win10 无此属性、静默忽略。别用 `SetWindowRgn` 切圆角（1 bit，必锯齿）。验收读回属性值判定，别用像素（角外是桌面，颜色不可控）。
+- `scripts/shot.py --margin N`：圆角/阴影在客户区之外，只截客户区看不到；留 margin 时窗口摆到 `(N,N)` 免得 bbox 越界被裁。
 
 ## 设计稿要点
 - 色板严格取 Catppuccin Latte 官方值；Mauve #8839EF 唯一强调色。**v2 起两套色板**：应用表面 Latte/Mocha，叠加层深色玻璃（`theme::overlay`）。
