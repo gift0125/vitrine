@@ -14,7 +14,15 @@
 - 区域细节：物理像素、**相对窗口矩形**；`CreateRoundRectRgn` 收**直径**不是半径；去重键不含窗口位置（纯移动不重设，否则拖动每帧重绘、画面抖）；视频窗铺主窗**外框**不是客户区（否则边框那圈透桌面）。
 - **胶囊尺寸不能写死**（高度随字号/行距变）→ 胶囊内部 `canvas` 每帧把 bounds 写进 `capsule_rect`，`chrome_rects` 用它算区域；chrome 外扩 1.5px 免得切 1px 白描边。视频模式标题带也要铺 `overlay::glass()`。
 - **圆角要两块窗口一起设**：`DwmSetWindowAttribute(hwnd, 33, &2, 4)`；上两角属主窗标题带、下两角属视频叠加窗，只设一块留方角。退出视频模式设 1；Win10 静默忽略。别用 `SetWindowRgn`（1bit 必锯齿）；验收读回属性值别用像素。
+- **`SetWindowRgn` 传空 region 会把窗口从 DWM 合成树里摘掉** → 区域现在会合法地变空（控制层淡出），`set_region` 末尾 `GetRgnBox` 判一次，空就塞 1×1 px。判据「区域为零 ≠ 窗口消失」。
 - 代价：无区域级 backdrop blur（acrylic 只能整窗且糊窗口**背后**）、无 Aero Snap、缩放可能闪一帧。歌单面板保持 Latte 浅底。验收 = `verify_floating_chrome.py` + `ui_tests::chrome_region_covers_capsule_and_panel`。
+
+## 控制层自动淡出（标题带 / 胶囊 / 底部遮罩）
+- 判据是纯函数 `chrome_visible_target(video_active, playing, busy, idle)`：**只有「视频 + 在播 + 没在碰控件」才淡**；暂停 / 面板 / 信息卡 / 拖放提示 / 状态胶囊 / 正在拖进度一律留着（那会儿他在读东西）。`CHROME_IDLE` 2500ms、`CHROME_FADE_STEP` 0.25/100ms tick、`CHROME_HIDDEN_EPS` 0.01。
+- **不用 `with_animation`**：那个动画只在有帧驱动时推进，而这里的帧是 tick 拉起来的。
+- **淡掉的另一半是区域**：只画成透明、区域还留着 = 看不见的按钮照样吃点击 + 画面少一块能拖动/双击的地方 → `chrome_rects()` 在 `alpha ≤ EPS` 时返回**空 Vec**，整块让给叠加窗。
+- 「用户还在」**三个来源缺一就失灵**：① 根节点 `on_mouse_move`；② 叠加窗 wndproc 的 `WM_MOUSEMOVE`（画面区已从主窗区域剪掉，事件到不了 GPUI）→ `static ACTIVITY` + `activity_stamp()` 由 tick take；③ `intercept_keystrokes`。鼠标移动只写时间戳**不 notify**（每帧 notify = 整窗跟鼠标重绘）。
+- 诊断开关 `SMP_CHROME_TRACE=1` 打 `[chrome] alpha/target/idle/...`（500ms 限流）。
 
 ## Win32 / GPUI 行为
 - **`SetWindowPos` / `ShowWindow` 不能在 `Context::update` 里同步调**：同步派发 `WM_SIZE` → 立刻重布局，而 App 正被可变借用 → `handle.update` 失败、布局停旧尺寸、hitbox 全错位。丢进 `cx.spawn_in(window, async{…}).detach()`。
@@ -46,13 +54,18 @@
 - **控制栏 v3 几何（数字来自 `design/spec.json`，改任一条同步 `verify_floating_chrome.py` 的常数）**：胶囊 **760×92**、距下 24、圆角 14、padding **20/8**；进度区**两行**（时间行 16 → gap 4 → 轨道 4px 714 宽，`PROGRESS_SIDE_PAD=2` = spec 3 扣掉 1px 边框）；走带行 44，播放键 **44 圆**（Mauve 发光 0/4/18 35%）、走带键盒 28/图标 22，中心 −96/−54/0/+54/+96；左组 ⓘ + 音量 96；右组盒 24/gap 16 → 中心距 **40**，从右往左 全屏 0、列表 1、主题 2、音轨 3、字幕 4（设计稿 6 个含画中画，未接）；信息卡 240×180 浮胶囊上方 16、贴 x24；`BOTTOM_BAND` 118。
 - **展开歌单时胶囊居中于剩余画面**（x=88 = (1280−320−24−760)/2），不是整窗居中；面板 320 宽、`top = 标题带+8`、`right 24`、`bottom 119`、头 48/行 48/尾 44。
 - **浅底面板上的按钮必须用主题色**（`panel_button(fg, primary)`）：`overlay::fg()`（#D5D9E2）在 Latte 浅底上几乎看不见——页脚的循环/随机/排序踩过。面板列表容器要有 `overflow_hidden`，只给 `min_h_0` 会让最后一行画到页脚上面。
+- **质感三层（`spec.json → texture_layers`）**：L1 已做 = 胶囊 `v_gradient(#1A1C28 60%, #0B0C10 74%)` + 白 14% 描边 `edge()` + 两条 1px 绝对定位矩形当内描边（上白 16% `highlight` / 下黑 30% `shade`）+ 双层阴影（`contact 0 2 6 @26%`、`ambient 0 16 40 @32%`）+ 240 高底部渐隐；L2 已做 = 画面取色只取**色相**（S 46% / L 36%，不取明度），染 α .26/.08。**L3 真模糊仍做不到**（要 libmpv render API，跟 `--wid` 叠加窗互斥），`glass()` 72% 继续用在标题带/信息卡/面板，别伪造模糊层。
+- **`v_gradient()` 是必需的**：`linear_gradient(angle, from, to)` 只收两个 `LinearColorStop`，`Hsla`/`Rgba` 都没有 `From` 实现 → 必须 `linear_color_stop(color, pct)` 包一层。没有径向渐变：播放键用「竖向渐变 `#A05BF5→#6E24D8` + `inset 0 1px 0 rgba(255,255,255,.35)`」凑球面。
+- **悬停白 10% 只能用 `ButtonCustomVariant`**：`ghost` 的悬停色写死在 `ButtonVariant::hovered`（= `theme.accent` 亮 Lavender）。`chrome_button(cx, …)` 用 `.color/.foreground/.hover/.active` + `.rounded(6)`；`.active()` 收的是**颜色**，没有按下缩放。`panel_button` 仍走主题色（浅底）。
 - **`overlay::glass()` 实际 72%（`0x0B0C10B8`）**，本地导出帧已是 L3（48% + backdrop blur 56）：这条渲染路径拿不到区域级 backdrop blur，48% 不糊就会糊字，所以维持平 72%。验收色差判据（两处 > 25）在 72% 下过。
-- 画在画面上的东西（胶囊 / 歌单 / 信息卡）**都必须进 `chrome_rects`**：漏了 = 节点在、看不见、点不到（三次各踩一次，用户看到"点了没反应"）。
+- 画在画面上的东西（胶囊 / 歌单 / 信息卡 / 底部遮罩）**都必须进 `chrome_rects`**：漏了 = 节点在、看不见、点不到（三次各踩一次，用户看到"点了没反应"）。反向代价：进了区域就吃鼠标，所以**底部遮罩自己补了 `on_double_click → toggle_cinema`**（不然窗口最下 240px 点哪都没反应），且不设 `WindowControlArea::Drag`（会把压在它上面的胶囊按钮变非客户区）。
 - mpv 编码名是**并列别名**（`h264 (High) / AVC / …`）→ 取第一段（`short_codec`）；`video-bitrate` 对部分容器报 `unavailable`（合成 mp4 就是），显示 `—` 是对的，别补假数。
+- **取画面颜色走 `screenshot-raw`**：`mpv_command_node(["screenshot-raw","video"])` → `mpv_node` MAP 的 `w/h/stride/format/data(byte_array)`，**`mpv_free_node_contents` 必须调**（整帧归我们，不释放每次换片漏 ~5MB）。抓的是**当前显示的那一帧** → 不能刚 `loadfile` 就抓（还是上一部/黑帧，染错不会自愈），延迟 400ms + 重试 3×500ms，只在起播/`seek_to` 触发。
 - `cycle sid/aid` **无返回值**、单轨不做事 → 记切换前轨号 + 时间戳，tick 比对 observed 值，800ms 超时就说"没有其他轨可切"。
 - 验收脚本**永远别按"胶囊铺满整宽"算坐标**：胶囊 760 居中后那些点落在画面上，点击被叠加窗吃掉，像"应用 bug"；`wait_settled()` 探针同理（每次白等 3s）。素材要 **120s**（`target/verify-long.mp4` 自动生成）：40s 片子播完 → 叠加窗隐藏 → 取样全变 `#EFF1F5`，多项假失败。
 - **脚本里的胶囊左沿必须走 `capsule_left()`**（跟随面板展开态）。写死整窗居中 → 收起歌单那一下点到胶囊外 → 面板一直开着 → 后面所有按钮坐标偏 344，报出「字幕/音轨没反应」「ⓘ 没反应」两条**假失败**（应用一直是对的）。同理：每次点击都要记 `WindowFromPoint` 的窗口类名，非主窗就判 FAIL —— 坐标偏了点击会静默落到叠加窗上，截图看不出来。
 - 合成输入（`mouse_event`）下的**第一次点击偶尔被吞**：验收里凡是有状态的点击都按**结果**重试（歌单 / Esc / 双击 / ⓘ 最多 3 次），判据不放松。
+- **验收脚本会被自己的新功能打败**：控制层 2.5s 自动淡出 → `region_contains(any)` False → `panel_open()` 假 False → 后续点击落到叠加窗（被当拖动/双击）→ 一串假失败。凡脚本有空闲间隔，`click()`/`wait_settled()` 开头统一 `wake()`（光标抖到画面中心、等 0.45s 淡入）。
 - **`h_flex()` 默认 `items_center`**：子元素全绝对定位（内容高 0）交叉轴塌成 0 → `canvas` bounds `Wx0`。视频区要 `.self_stretch()`，回归 `stage_fills_space_between_title_band_and_bottom_band`。
 - **`height:100%` 在不定高父级退化成 auto** → `.h_full()` 解析不出（按钮只剩图标高）。写死 `.h(px(..))`，父级补 `.h_full()`。
 - 自绘标题带：`appears_transparent = true` 后**只有左侧拖动区**能设 `WindowControlArea::Drag`（整条都设会让右侧按钮变非客户区）。窗口按钮 `IconName::Window*` 是 24 网格 + 2px 描边，缩 10px 会糊 → 手写 10×10、1px SVG；46 宽 × 标题栏高，关闭键悬停 `#C42B1C`。

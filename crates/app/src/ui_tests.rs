@@ -21,7 +21,7 @@ use player_core::TrackMeta;
 use smallvec::SmallVec;
 
 use crate::persistence::{self, Settings};
-use crate::player_view::{seek_target, short_codec, PlayerView};
+use crate::player_view::{chrome_visible_target, seek_target, short_codec, PlayerView};
 use crate::video_overlay::OverlayEvent;
 
 /// 每个用例一个独立临时目录，避免并行执行时互相踩。
@@ -958,8 +958,8 @@ fn capsule_is_760_by_92_and_progress_is_two_rows(cx: &mut TestAppContext) {
 
         let bounds = window.bounds();
         let rects = view.read(cx).test_chrome_rects(window);
-        // 第 0 个是标题带，第 1 个是胶囊（挖洞时各自带 1.5 的抗锯齿留白）
-        let capsule = rects.get(1).expect("视频模式必须有胶囊的窗口区域");
+        // 顺序：0 标题带、1 底部渐隐遮罩、2 胶囊（挖洞时各自带 1.5 的抗锯齿留白）
+        let capsule = rects.get(2).expect("视频模式必须有胶囊的窗口区域");
         assert!(
             (capsule.width - 760.0).abs() <= 3.5,
             "胶囊宽应贴设计稿 760（含留白），实际 {}",
@@ -1099,8 +1099,8 @@ fn info_card_toggles_and_is_carved_out(cx: &mut TestAppContext) {
             window.try_find("video-info-card").is_none(),
             "默认不该展开信息卡"
         );
-        // 关着的时候 chrome 只有标题带 + 胶囊
-        assert_eq!(view.read(cx).test_chrome_rects(window).len(), 2);
+        // 关着的时候 chrome 只有标题带 + 底部遮罩 + 胶囊
+        assert_eq!(view.read(cx).test_chrome_rects(window).len(), 3);
 
         window.click("video-info", cx);
         window.render_frame(cx);
@@ -1116,7 +1116,7 @@ fn info_card_toggles_and_is_carved_out(cx: &mut TestAppContext) {
         );
 
         let rects = view.read(cx).test_chrome_rects(window);
-        assert_eq!(rects.len(), 3, "展开后 chrome 应多一块（信息卡）");
+        assert_eq!(rects.len(), 4, "展开后 chrome 应多一块（信息卡）");
         // 区域比布局框多一圈 1.5 抗锯齿留白，`canvas` 量的又比布局框略小一点（边框 +
         // 内边距的盒模型差），所以按 ±3 比，不追那零点几像素
         assert!(
@@ -1131,7 +1131,7 @@ fn info_card_toggles_and_is_carved_out(cx: &mut TestAppContext) {
         window.click("video-info", cx);
         window.render_frame(cx);
         assert!(!view.read(cx).test_info_open());
-        assert_eq!(view.read(cx).test_chrome_rects(window).len(), 2);
+        assert_eq!(view.read(cx).test_chrome_rects(window).len(), 3);
     })
     .unwrap();
 }
@@ -1317,6 +1317,83 @@ fn chapter_tab_switches_and_resets_on_close(cx: &mut TestAppContext) {
             !view.read(cx).test_chapter_tab(),
             "收面板要回到「播放列表」，否则下次展开是一张空页"
         );
+    })
+    .unwrap();
+}
+
+// ----------------------------------------------------------------------
+// 控制层自动淡出（视频播放中 2.5s 没输入）+ 淡出后区域收缩
+// ----------------------------------------------------------------------
+
+/// 淡出的判据：只有「视频 + 播放中 + 没在碰控件 + 超过 2.5s 没输入」才收起来。
+///
+/// 这条容易写反（反过来就是"看视频时控制栏永远在"或者"暂停了还自己消失"），
+/// 而界面上很难一眼看出来——所以逐条钉死。
+#[test]
+fn chrome_fades_only_when_a_video_is_playing_and_idle() {
+    use std::time::Duration;
+    const IDLE: Duration = Duration::from_millis(2500);
+
+    // 播放中、没输入、超过 2.5s → 淡出
+    assert!(!chrome_visible_target(true, true, false, IDLE));
+    assert!(!chrome_visible_target(
+        true,
+        true,
+        false,
+        IDLE + Duration::from_millis(500)
+    ));
+    // 差一点到 2.5s 还不淡（用户刚动过鼠标）
+    assert!(chrome_visible_target(
+        true,
+        true,
+        false,
+        IDLE - Duration::from_millis(1)
+    ));
+    // 暂停：用户停下来就是为了找控件
+    assert!(chrome_visible_target(true, false, false, IDLE * 4));
+    // 正在拖进度 / 面板开着 / 信息卡开着 / 拖放提示 / 状态胶囊
+    assert!(chrome_visible_target(true, true, true, IDLE * 4));
+    // 音频模式：标题带和胶囊是界面本体，不存在"淡出"
+    assert!(chrome_visible_target(false, true, false, IDLE * 4));
+}
+
+/// 淡到 0 之后，主窗口的区域必须**整块让给画面**。
+///
+/// 只把元素画成透明是不够的：那几块还留在区域里，鼠标移过去会落在看不见的按钮上
+/// （点击被吃掉、拖不动画面），画面也少了一块"能点的区域"。反过来，淡出/淡入的
+/// 中途（alpha 0.5）区域还得留着，否则玻璃会闪一下才回来。
+#[gpui_kit::test]
+fn hidden_chrome_leaves_no_window_region(cx: &mut TestAppContext) {
+    fresh_dir("chrome-fade-region");
+    let (window, view) = open_view(cx, Vec::new());
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| view.test_set_video_mode(true));
+        window.render_frame(cx);
+        assert!(
+            !view.read(cx).test_chrome_rects(window).is_empty(),
+            "亮着的时候区域里必须有 chrome"
+        );
+
+        // 淡到一半：还在区域里（玻璃正在变透明，但整块仍是主窗口画的）
+        view.update(cx, |view, _| view.test_set_chrome_alpha(0.5));
+        window.render_frame(cx);
+        assert!(
+            !view.read(cx).test_chrome_rects(window).is_empty(),
+            "淡出途中区域不能提前收缩，否则会看到一块「闪掉」的画面"
+        );
+
+        // 完全淡掉：一个矩形都不留
+        view.update(cx, |view, _| view.test_set_chrome_alpha(0.0));
+        window.render_frame(cx);
+        assert!(
+            view.read(cx).test_chrome_rects(window).is_empty(),
+            "淡出完成后必须把整窗让出去，否则看不见的按钮还会吃点击"
+        );
+
+        // 鼠标一动 → 淡回来 → 区域跟着回来
+        view.update(cx, |view, _| view.test_set_chrome_alpha(1.0));
+        window.render_frame(cx);
+        assert!(!view.read(cx).test_chrome_rects(window).is_empty());
     })
     .unwrap();
 }

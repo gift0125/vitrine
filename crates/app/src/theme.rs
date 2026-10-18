@@ -260,6 +260,13 @@ fn config(name: &str, mode: ThemeMode, p: &Palette) -> ThemeConfig {
 ///
 /// 设计稿玻璃底是 `#0B0C10` 60% + backdrop blur 32。Windows 上没有 backdrop blur，
 /// 60% 压在亮画面上文字会糊，所以这里加浓到 72%。
+///
+/// 质感按 `design/spec.json → texture_layers` 的三层来：
+/// - **L1 定向光**（[`capsule_top`]/[`capsule_bottom`]/[`edge`]/[`highlight`]/
+///   [`shade`]/[`contact`]/[`ambient`]）：纯样式，已经落地；
+/// - **L2 画面染色**（[`tint_layer`]）：一次缩略图取色，已经落地；
+/// - **L3 真背景模糊**：`--wid` 叠加窗这条渲染路径拿不到区域级 backdrop blur，
+///   要等把 libmpv 的 render API 接进 GPUI 自己的合成树，暂时不做。
 pub mod overlay {
     use gpui_kit::Hsla;
 
@@ -269,6 +276,8 @@ pub mod overlay {
     }
 
     /// 玻璃底：`#0B0C10` @ 72%
+    ///
+    /// 标题带、信息卡、播放列表面板这些**没有** L1 定向光的浮层继续用它。
     pub fn glass() -> Hsla {
         gpui_kit::rgba(0x0B0C10B8).into()
     }
@@ -276,6 +285,78 @@ pub mod overlay {
     /// 玻璃描边：白 10%
     pub fn border() -> Hsla {
         gpui_kit::rgba(0xFFFFFF1A).into()
+    }
+
+    // ---- L1 定向光（`texture_layers.L1_directional_light`）----
+    //
+    // 设计稿的胶囊不是一块平底色，而是一条 180° 的竖向渐变（上偏蓝灰、下压深黑）
+    // 加两道 1px 内描边 + 两层投影。GPUI 的 `linear_gradient` 只收两个色标，
+    // 设计稿是三段，所以按「渐变 + 1px 内描边层」拆成两层实现。
+
+    /// 胶囊渐变顶：`rgba(26,28,40,.60)`
+    pub fn capsule_top() -> Hsla {
+        gpui_kit::rgba(0x1A1C2899).into()
+    }
+
+    /// 胶囊渐变底：`rgba(11,12,16,.74)`
+    pub fn capsule_bottom() -> Hsla {
+        gpui_kit::rgba(0x0B0C10BD).into()
+    }
+
+    /// 胶囊描边：白 14%（比信息卡的 10% 亮一档——它压在画面上、要显出「一片玻璃」）
+    pub fn edge() -> Hsla {
+        gpui_kit::rgba(0xFFFFFF24).into()
+    }
+
+    /// 上沿 1px 内高光：`rgba(255,255,255,.16)`
+    pub fn highlight() -> Hsla {
+        gpui_kit::rgba(0xFFFFFF29).into()
+    }
+
+    /// 下沿 1px 内暗线：`rgba(0,0,0,.30)`
+    pub fn shade() -> Hsla {
+        gpui_kit::rgba(0x0000004D).into()
+    }
+
+    /// 接触阴影（贴地那层，`0 2px 6px rgba(0,0,0,.26)`）
+    pub fn contact() -> Hsla {
+        gpui_kit::rgba(0x00000042).into()
+    }
+
+    /// 环境阴影（散开那层，`0 16px 40px rgba(0,0,0,.32)`）
+    pub fn ambient() -> Hsla {
+        gpui_kit::rgba(0x00000052).into()
+    }
+
+    /// 底部渐隐遮罩的深色：`rgba(11,12,16,.55)`
+    ///
+    /// 设计稿 `texture_layers.L1.bottom_vignette`：控制栏底下压一层 240 高的
+    /// 渐变，玻璃才像「浮在画面上」，11px 小字在亮场景上也不用靠加深玻璃保可读。
+    pub fn vignette() -> Hsla {
+        gpui_kit::rgba(0x0B0C108C).into()
+    }
+
+    /// 播放键的球面渐变顶：`#A05BF5`
+    pub fn play_top() -> Hsla {
+        gpui_kit::rgb(0xA05BF5).into()
+    }
+
+    /// 播放键的球面渐变底：`#6E24D8`
+    pub fn play_bottom() -> Hsla {
+        gpui_kit::rgb(0x6E24D8).into()
+    }
+
+    /// 图标悬停底色：`rgba(255,255,255,.10)`
+    pub fn hover() -> Hsla {
+        gpui_kit::rgba(0xFFFFFF1A).into()
+    }
+
+    /// 图标按下底色：`rgba(255,255,255,.16)`
+    ///
+    /// 设计稿写的是 `active: scale .92`，GPUI 没有 transform 缩放，用略亮一档的
+    /// 底色代替——按下去有反馈，但不会让 24px 的字形抖动。
+    pub fn active() -> Hsla {
+        gpui_kit::rgba(0xFFFFFF29).into()
     }
 
     /// 浮层主图标/文字
@@ -313,6 +394,31 @@ pub mod overlay {
     pub fn play() -> Hsla {
         gpui_kit::rgb(0x8839EF).into()
     }
+
+    /// L2 画面染色层：把画面底部的色相以固定饱和度/明度混进玻璃。
+    ///
+    /// `hue` 取画面底部中间那块的色相（0~360），饱和度固定 46%、明度固定 36%
+    /// （设计稿 `texture_layers.L2_frame_tint.rule`：**不取明度**——直接混画面均值
+    /// 只会把玻璃染得更黑）。混入比例上 26%、中 8%。
+    pub fn tint(hue: f32, alpha: f32) -> Hsla {
+        gpui_kit::hsla(hue / 360.0, 0.46, 0.36, alpha)
+    }
+}
+
+/// 180° 竖直线性渐变（上 → 下）。
+///
+/// GPUI 的 `linear_gradient` 只收**两个**色标，设计稿里那些三段渐变（玻璃
+/// `26%→6%→48%`、播放键的球面）只能靠「一层渐变 + 一层纯色/内描边」拆开。
+/// 色标位置固定 0 / 1：需要中间停靠点时叠第二层。
+pub fn v_gradient(
+    from: impl Into<gpui_kit::Hsla>,
+    to: impl Into<gpui_kit::Hsla>,
+) -> gpui_kit::Background {
+    gpui_kit::linear_gradient(
+        180.,
+        gpui_kit::linear_color_stop(from, 0.0),
+        gpui_kit::linear_color_stop(to, 1.0),
+    )
 }
 
 pub fn install(cx: &mut App, dark: bool) {

@@ -242,6 +242,7 @@ mod win {
             ellipse_h: i32,
         ) -> Hwnd;
         fn CombineRgn(dest: Hwnd, src1: Hwnd, src2: Hwnd, mode: i32) -> i32;
+        fn GetRgnBox(region: Hwnd, rect: *mut Rect) -> i32;
         fn DeleteObject(object: Hwnd) -> i32;
     }
 
@@ -274,6 +275,19 @@ mod win {
 
     /// 画面上点出来的交互（双击 → 全屏），同样等 tick 取走。
     static EVENTS: std::sync::Mutex<Vec<OverlayEvent>> = std::sync::Mutex::new(Vec::new());
+
+    /// 画面上最后一次鼠标移动的时刻（控制层自动淡出用）。
+    ///
+    /// 主窗口的区域把画面挖掉了（见 `set_region`），所以画面上的鼠标移动只有
+    /// 叠加窗知道。控制层淡掉之后整块区域都让给叠加窗，用户"晃一下鼠标叫回
+    /// 控制栏"这件事就完全靠这里上报。
+    static ACTIVITY: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+    fn stamp_activity() {
+        if let Ok(mut slot) = ACTIVITY.lock() {
+            *slot = Some(std::time::Instant::now());
+        }
+    }
 
     /// 主窗口现在是不是影院（全屏）模式。
     ///
@@ -447,6 +461,8 @@ mod win {
             // 最小化状态下不拖也不双击：那是"还原窗口"的活儿，交给系统/任务栏。
         }
         if msg == WM_MOUSEMOVE {
+            // 先记一笔"用户还在动鼠标"：控制层淡出之后，这是唯一能把它叫回来的信号
+            stamp_activity();
             if let Some(drag) = drag_of(hwnd) {
                 let cursor = screen_point(hwnd, lparam);
                 {
@@ -784,6 +800,18 @@ mod win {
                     DeleteObject(add);
                 }
             }
+            // 空区域（控制层淡掉、整窗都让给画面时就是这种）不能真的交上去：
+            // `SetWindowRgn` 收到空区域等于让窗口"不存在"，DWM 会把它从合成树里
+            // 摘掉，回程（淡入）时窗口句柄、焦点、z 序都要重新长回来。留 1 像素
+            // 的窗口在左上角——物理上看不见，但窗口还是活的。
+            let mut box_rect = Rect::default();
+            if GetRgnBox(region, &mut box_rect) <= 1 {
+                let keep = CreateRectRgn(ox, oy, ox + 1, oy + 1);
+                if keep != 0 {
+                    CombineRgn(region, region, keep, RGN_OR);
+                    DeleteObject(keep);
+                }
+            }
             // 成功后 region 归系统所有，**不要** DeleteObject
             SetWindowRgn(hwnd, region, 1);
         }
@@ -809,6 +837,15 @@ mod win {
             rect.right - rect.left,
             rect.bottom - rect.top,
         )
+    }
+
+    /// 画面上的鼠标移动：给控制层的自动淡出报个「用户还在」。
+    ///
+    /// 画面区不在主窗口的区域里（见 `set_region`），所以主窗口收不到这些移动：
+    /// 控制层淡掉之后鼠标划过视频，GPUI 那边一点消息都没有，只有这里知道。
+    /// 取走即清空——tick 每 100ms 消费一次，多个移动只留最后一个时间戳。
+    pub fn activity_stamp() -> Option<std::time::Instant> {
+        ACTIVITY.lock().ok().and_then(|mut slot| slot.take())
     }
 }
 
@@ -840,6 +877,9 @@ mod win {
     }
     pub fn set_region(_hwnd: Hwnd, _stage: (f32, f32, f32, f32), _chrome: &[ChromeRect], _s: f32) {}
     pub fn clear_region(_hwnd: Hwnd) {}
+    pub fn activity_stamp() -> Option<std::time::Instant> {
+        None
+    }
     pub fn window_rect(_hwnd: Hwnd) -> (i32, i32, i32, i32) {
         (0, 0, 0, 0)
     }
@@ -962,4 +1002,9 @@ pub fn set_region(main: Hwnd, stage: (f32, f32, f32, f32), chrome: &[ChromeRect]
 /// 退出视频模式：主窗口恢复整窗矩形。
 pub fn clear_region(main: Hwnd) {
     win::clear_region(main);
+}
+
+/// 画面上最后一次鼠标移动（控制层自动淡出用），取走即清空。
+pub fn activity_stamp() -> Option<std::time::Instant> {
+    win::activity_stamp()
 }

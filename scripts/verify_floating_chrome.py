@@ -339,6 +339,22 @@ def panel_open():
     return region_contains(lw - PLAYLIST_INSET - PLAYLIST_WIDTH / 2, 120)
 
 
+def wake():
+    """把控制层叫回来（播放中 2.5s 没有输入它就淡出了）。
+
+    自动化脚本每两步之间常静置 1~3 秒，正好落进淡出窗口：这时主窗口的区域已经
+    收缩成 1 像素，点击**直接落到下层叠加窗**上——轻则"点了没反应"，重则开始拖窗
+    （窗口被挪走，后面所有坐标全错），或者被当成双击进了全屏。所以每次点击/取样
+    之前先晃一下光标；0.45s 是淡入时间（4 个 100ms tick）。
+    """
+    ox, oy = client_origin()
+    cx, cy = ox + round(lw * 0.5 * scale), oy + round(lh * 0.5 * scale)
+    user32.SetCursorPos(cx - 30, cy)
+    time.sleep(0.05)
+    user32.SetCursorPos(cx, cy)
+    time.sleep(0.45)
+
+
 def wait_settled(timeout=3.0):
     """等一切跟上新的窗口几何：外框对齐 + 顶栏两端/胶囊都回到区域里。
 
@@ -347,6 +363,7 @@ def wait_settled(timeout=3.0):
     `region_contains(任意点)` 恒为 True，后面所有"面板/胶囊在不在区域里"的
     判断都会假通过（歌单明明没展开也判通过了，实测踩过）。
     """
+    wake()
     wait_aligned(timeout)
     wait_region(lw * 0.5, lh * 0.45, False, timeout)
     wait_region(2, 17, True, timeout)
@@ -474,6 +491,8 @@ def click(lx, ly):
     不能只 PostMessage：GPUI 的命中测试用的是光标位置，投递的 lparam 不总被采信
     （这条踩过坑，记在项目备忘里）。这里窗口位置稳定，直接用真实输入。
     """
+    # 控制层可能已经淡出（见 wake）：先叫回来，等区域恢复再谈坐标
+    wake()
     ox, oy = client_origin()
     sx, sy = ox + round(lx * scale), oy + round(ly * scale)
     # 打一下这一点到底属于哪个窗口：区域没减对时，点击会被 mpv 那一层吃掉，
@@ -963,14 +982,29 @@ print(
 # 界面上"点了没反应"和"切到了"长得一样。所以判据同样落在 IPC trace 上：
 # 两条 cycle 命令真的发出去了，说明按钮到引擎这段是通的（应用会给 800ms 的
 # 超时提示"没有其他字幕轨可切"，那是取值的表现，不是接线问题）。
+def click_until_cycle(point, want, tries=3):
+    """点到 trace 里出现第 `want` 条 cycle 为止（合成长按偶发被吞，按结果重试）。
+
+    判据仍是"两条命令真的发出去了"，重试只解决输入层丢事件——应用侧从来没错。
+    每次重试前等 0.7s：两个按钮只隔 40 逻辑像素，落在 `SM_CXDOUBLECLK`(36) 与
+    `GetDoubleClickTime`(500ms) 里会被判成双击，第二次点击就不当单击处理。
+    """
+    for _ in range(tries):
+        hits = trace_hits('"cycle"')
+        if hits >= want:
+            return hits
+        click(*point)
+        hits = wait_trace('"cycle"', want, timeout=1.5)
+        if hits >= want:
+            return hits
+        time.sleep(0.7)
+    return trace_hits('"cycle"')
+
+
 cycles_before = trace_hits('"cycle"')
-click(*right_group_button(3))  # 音轨
-wait_trace('"cycle"', cycles_before + 1)
-# 两个按钮只隔 40 逻辑像素，连点两次落在 `SM_CXDOUBLECLK`(36) 与 `GetDoubleClickTime`
-# (500ms) 里会被判成双击，第二次点击就不当单击处理了 → 只发出 1 条 cycle。
+click_until_cycle(right_group_button(3), cycles_before + 1)  # 音轨
 time.sleep(0.8)
-click(*right_group_button(4))  # 字幕
-cycles_after = wait_trace('"cycle"', cycles_before + 2)
+cycles_after = click_until_cycle(right_group_button(4), cycles_before + 2)  # 字幕
 cycle_ok = cycles_after >= cycles_before + 2
 print(f"字幕/音轨 → cycle 命令 {cycles_before}→{cycles_after} 条")
 

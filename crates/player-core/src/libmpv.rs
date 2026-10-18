@@ -33,6 +33,11 @@ pub const MPV_FORMAT_STRING: c_int = 1;
 pub const MPV_FORMAT_FLAG: c_int = 3;
 pub const MPV_FORMAT_INT64: c_int = 4;
 pub const MPV_FORMAT_DOUBLE: c_int = 5;
+/// `mpv_node` 数组（`screenshot-raw` 的 argv 与返回值都是 node）
+pub const MPV_FORMAT_NODE_ARRAY: c_int = 7;
+pub const MPV_FORMAT_NODE_MAP: c_int = 8;
+/// `mpv_byte_array`：`screenshot-raw` 的像素就是它
+pub const MPV_FORMAT_BYTE_ARRAY: c_int = 9;
 
 // ---- mpv_event_id ----
 pub const MPV_EVENT_NONE: c_int = 0;
@@ -86,6 +91,192 @@ pub struct MpvEventLogMessage {
     pub log_level: c_int,
 }
 
+/// `mpv_byte_array`：一块裸内存（`screenshot-raw` 的像素数据）。
+#[repr(C)]
+pub struct MpvByteArray {
+    pub data: *mut c_void,
+    pub size: usize,
+}
+
+/// `mpv_node_list`：数组（`keys` 为空）或字典（`values[i]` 对应 `keys[i]`）。
+#[repr(C)]
+pub struct MpvNodeList {
+    pub num: i32,
+    pub values: *mut MpvNode,
+    pub keys: *mut *mut c_char,
+}
+
+/// `mpv_node` 里的那个联合体。
+///
+/// 用 Rust 的 `union` 而不是「按最大成员占位 + transmute」：`mpv_node` 是
+/// `#[repr(C)]` 的 `{ union; mpv_format }`，联合体的对齐是 8（含指针/int64/double），
+/// Rust 的 union 也是同一套规则，布局因此逐字节一致。
+#[repr(C)]
+pub union MpvNodeData {
+    pub string: *mut c_char,
+    pub flag: c_int,
+    pub int64: i64,
+    pub double_: f64,
+    pub list: *mut MpvNodeList,
+    pub byte_array: *mut MpvByteArray,
+}
+
+/// `mpv_node`（`client.h`）。
+#[repr(C)]
+pub struct MpvNode {
+    pub data: MpvNodeData,
+    pub format: c_int,
+}
+
+/// `screenshot-raw` 抓下来的裸帧（每次取色用一次，用完就丢）。
+#[derive(Clone, Debug, PartialEq)]
+pub struct RawFrame {
+    pub width: usize,
+    pub height: usize,
+    /// 每行字节数（可能大于 `width × bpp`：mpv 对齐到 32/64 字节）
+    pub stride: usize,
+    /// mpv 报的像素格式名：`bgr0` / `rgb0` / `bgra` / `rgb24` …
+    pub format: String,
+    pub data: Vec<u8>,
+}
+
+impl RawFrame {
+    /// 每像素字节数与通道顺序（`(r, g, b)` 在字节里的下标）。
+    ///
+    /// 不猜格式：mpv 的 `format` 字段首字母就说明了通道顺序（`bgr*` / `rgb*`），
+    /// 长度就是每像素字节数（`bgr0` = 4）。认不出来就当 BGRA 处理。
+    fn layout(&self) -> (usize, [usize; 3]) {
+        let bpp = self.format.len().max(3);
+        let order = if self.format.starts_with('r') {
+            [0, 1, 2]
+        } else {
+            [2, 1, 0]
+        };
+        (bpp, order)
+    }
+
+    /// 画面**底部中间 60%×38%** 的平均色（设计稿 `L2_frame_tint.sample_region`：
+    /// 那块正好在控制栏背后）。
+    ///
+    /// 大范围抽样而不是逐像素：一个 1080p 帧的这块有 47 万像素，取均值时每 4 个
+    /// 跳一个已经完全不影响结果，但能把一次取色的开销压到 1ms 量级。
+    pub fn bottom_band_mean(&self) -> Option<(f32, f32, f32)> {
+        if self.width < 4 || self.height < 4 || self.data.is_empty() {
+            return None;
+        }
+        let (bpp, order) = self.layout();
+        let x0 = (self.width as f32 * 0.20) as usize;
+        let x1 = (self.width as f32 * 0.80) as usize;
+        let y0 = (self.height as f32 * 0.62) as usize;
+        let y1 = self.height;
+        let (region_w, region_h) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+        if region_w == 0 || region_h == 0 {
+            return None;
+        }
+        let step = (((region_w * region_h) as f32 / 20_000.0).sqrt() as usize).max(1);
+
+        let (mut sr, mut sg, mut sb, mut n) = (0u64, 0u64, 0u64, 0u64);
+        let mut y = y0;
+        while y < y1 {
+            let row = y * self.stride;
+            let mut x = x0;
+            while x < x1 {
+                let base = row + x * bpp;
+                if base + 2 < self.data.len() {
+                    sr += self.data[base + order[0]] as u64;
+                    sg += self.data[base + order[1]] as u64;
+                    sb += self.data[base + order[2]] as u64;
+                    n += 1;
+                }
+                x += step;
+            }
+            y += step;
+        }
+        if n == 0 {
+            return None;
+        }
+        let n = n as f32;
+        Some((sr as f32 / n, sg as f32 / n, sb as f32 / n))
+    }
+}
+
+/// RGB → 色相（0~360 度，饱和度/明度丢掉不要）。
+///
+/// 设计稿只要色相：直接把画面均值混进玻璃等于把它染得更黑（暗场景几乎全黑，
+/// 混完看不出色温），固定 S/L 才能让每一部片子的玻璃都落在同一个观感上。
+pub fn rgb_hue(r: f32, g: f32, b: f32) -> f32 {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    if delta <= f32::EPSILON {
+        return 0.0; // 灰阶没有色相
+    }
+    let h = if max == r {
+        ((g - b) / delta).rem_euclid(6.0)
+    } else if max == g {
+        (b - r) / delta + 2.0
+    } else {
+        (r - g) / delta + 4.0
+    };
+    h * 60.0
+}
+
+/// 把 `mpv_node`（MAP）读成 [`RawFrame`]。
+///
+/// SAFETY: 调用方必须保证 `node` 来自一次成功的 `mpv_command_node`，且在
+/// `mpv_free_node_contents` 之前调用；里面的指针只在这一次返回值里有效。
+unsafe fn parse_raw_frame(node: &MpvNode) -> Option<RawFrame> {
+    if node.format != MPV_FORMAT_NODE_MAP {
+        return None;
+    }
+    let list = node.data.list.as_ref()?;
+    if list.values.is_null() || list.num <= 0 {
+        return None;
+    }
+    let (mut width, mut height, mut stride) = (0usize, 0usize, 0usize);
+    let mut format = String::new();
+    let mut data: Option<Vec<u8>> = None;
+    for i in 0..list.num as usize {
+        let key_ptr = if list.keys.is_null() {
+            return None;
+        } else {
+            *list.keys.add(i)
+        };
+        if key_ptr.is_null() {
+            continue;
+        }
+        let key = CStr::from_ptr(key_ptr).to_str().unwrap_or_default();
+        let value = &*list.values.add(i);
+        match (key, value.format) {
+            ("w", MPV_FORMAT_INT64) => width = value.data.int64.max(0) as usize,
+            ("h", MPV_FORMAT_INT64) => height = value.data.int64.max(0) as usize,
+            ("stride", MPV_FORMAT_INT64) => stride = value.data.int64.max(0) as usize,
+            ("format", MPV_FORMAT_STRING) => {
+                let text = value.data.string;
+                if !text.is_null() {
+                    format = CStr::from_ptr(text).to_string_lossy().into_owned();
+                }
+            }
+            ("data", MPV_FORMAT_BYTE_ARRAY) => {
+                let bytes = value.data.byte_array.as_ref()?;
+                if bytes.data.is_null() || bytes.size == 0 {
+                    return None;
+                }
+                let slice = std::slice::from_raw_parts(bytes.data as *const u8, bytes.size);
+                data = Some(slice.to_vec());
+            }
+            _ => {}
+        }
+    }
+    Some(RawFrame {
+        width,
+        height,
+        stride,
+        format,
+        data: data?,
+    })
+}
+
 type FnCreate = unsafe extern "C" fn() -> *mut c_void;
 type FnInitialize = unsafe extern "C" fn(*mut c_void) -> c_int;
 type FnTerminateDestroy = unsafe extern "C" fn(*mut c_void);
@@ -104,6 +295,8 @@ type FnErrorString = unsafe extern "C" fn(c_int) -> *const c_char;
 type FnFree = unsafe extern "C" fn(*mut c_void);
 type FnRequestLog = unsafe extern "C" fn(*mut c_void, *const c_char) -> c_int;
 type FnClientApiVersion = unsafe extern "C" fn() -> u64;
+type FnCommandNode = unsafe extern "C" fn(*mut c_void, *mut MpvNode, *mut MpvNode) -> c_int;
+type FnFreeNodeContents = unsafe extern "C" fn(*mut MpvNode);
 
 /// 已加载的 libmpv 函数表。`Library` 必须与函数指针同生命周期。
 pub struct LibMpv {
@@ -124,6 +317,8 @@ pub struct LibMpv {
     free: FnFree,
     request_log_messages: FnRequestLog,
     client_api_version: FnClientApiVersion,
+    command_node: FnCommandNode,
+    free_node_contents: FnFreeNodeContents,
 }
 
 // 函数指针本身与上下文无关；`Library` 的句柄在进程内长期有效。
@@ -191,6 +386,12 @@ impl LibMpv {
                 )),
                 client_api_version: std::mem::transmute::<*const c_void, FnClientApiVersion>(sym!(
                     b"mpv_client_api_version\0"
+                )),
+                command_node: std::mem::transmute::<*const c_void, FnCommandNode>(sym!(
+                    b"mpv_command_node\0"
+                )),
+                free_node_contents: std::mem::transmute::<*const c_void, FnFreeNodeContents>(sym!(
+                    b"mpv_free_node_contents\0"
                 )),
                 _library: library,
             };
@@ -323,6 +524,50 @@ impl LibMpv {
         let mut ptrs: Vec<*const c_char> = owned.iter().map(|c| c.as_ptr()).collect();
         ptrs.push(std::ptr::null());
         unsafe { (self.command)(ctx, ptrs.as_ptr()) }
+    }
+
+    /// `screenshot-raw`：把**当前显示的那一帧**抓成裸像素。
+    ///
+    /// 只用来做 L2 的画面取色（一次缩略图 + 一次均值），所以：
+    /// - 走 `mpv_command_node`：`screenshot-raw` 的结果是一棵只存在于返回值里的
+    ///   `mpv_node`（`w` / `h` / `stride` / `format` / `data`），`mpv_command` 那套
+    ///   argv 接口拿不到它；
+    /// - 结果必须 `mpv_free_node_contents` 归还，否则每取一次色漏一帧的内存；
+    /// - 像素格式由 mpv 决定（通常是 `bgr0`），按 `format` 字段的**首字母**判断
+    ///   RGB / BGR，不猜。
+    pub fn screenshot_raw(&self, ctx: *mut c_void) -> Option<RawFrame> {
+        let names = ["screenshot-raw", "video"];
+        let owned: Vec<CString> = names
+            .iter()
+            .map(|n| CString::new(*n).unwrap_or_default())
+            .collect();
+        let mut args: Vec<MpvNode> = owned
+            .iter()
+            .map(|c| MpvNode {
+                data: MpvNodeData {
+                    string: c.as_ptr() as *mut c_char,
+                },
+                format: MPV_FORMAT_STRING,
+            })
+            .collect();
+        let mut list = MpvNodeList {
+            num: args.len() as i32,
+            values: args.as_mut_ptr(),
+            keys: std::ptr::null_mut(),
+        };
+        let mut call = MpvNode {
+            data: MpvNodeData { list: &mut list },
+            format: MPV_FORMAT_NODE_ARRAY,
+        };
+        // SAFETY: `mpv_node` 是 POJO，零值合法（格式 NONE）；返回前 mpv 会填好它。
+        let mut result: MpvNode = unsafe { std::mem::zeroed() };
+        let rc = unsafe { (self.command_node)(ctx, &mut call, &mut result) };
+        if rc < 0 {
+            return None;
+        }
+        let frame = unsafe { parse_raw_frame(&result) };
+        unsafe { (self.free_node_contents)(&mut result) };
+        frame
     }
 
     pub fn observe_property(
@@ -493,5 +738,57 @@ mod tests {
         assert_eq!(found.as_deref(), Some(decoy.as_path()));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 色相：纯红 0°、纯绿 120°、纯蓝 240°，灰阶没有色相。
+    #[test]
+    fn hue_matches_the_color_wheel() {
+        assert!((rgb_hue(255.0, 0.0, 0.0) - 0.0).abs() < 0.5);
+        assert!((rgb_hue(0.0, 255.0, 0.0) - 120.0).abs() < 0.5);
+        assert!((rgb_hue(0.0, 0.0, 255.0) - 240.0).abs() < 0.5);
+        assert_eq!(rgb_hue(90.0, 90.0, 90.0), 0.0, "灰阶没有色相");
+        // 设计稿举例的偏蓝底 `rgb(46,62,71)`：色相落在 190~205 之间（他们写 197°）
+        let hue = rgb_hue(46.0, 62.0, 71.0);
+        assert!(
+            (190.0..=205.0).contains(&hue),
+            "偏蓝底应落在蓝青区间，实际 {hue}"
+        );
+    }
+
+    /// 底部中间 60%×38% 的均值：越界、行距、通道顺序都要对。
+    #[test]
+    fn bottom_band_mean_respects_stride_and_channel_order() {
+        // 8x8 的 bgr0 帧：整帧纯蓝（B=255,R=0），行距故意给宽一点（8×4 + 4）
+        let (w, h, stride) = (8usize, 8usize, 8 * 4 + 4);
+        let mut data = vec![0u8; stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                let base = y * stride + x * 4;
+                data[base] = 255; // B
+                data[base + 1] = 0; // G
+                data[base + 2] = 0; // R
+            }
+        }
+        let frame = RawFrame {
+            width: w,
+            height: h,
+            stride,
+            format: "bgr0".to_string(),
+            data,
+        };
+        let (r, g, b) = frame.bottom_band_mean().expect("应该取到均值");
+        assert!(
+            r < 1.0 && g < 1.0,
+            "BGR 顺序读错会在这里露出来：r={r} g={g}"
+        );
+        assert!((b - 255.0).abs() < 1.0, "蓝色通道应满值，实际 {b}");
+
+        // 同一块数据按 rgb0 解释，通道顺序就该翻过来
+        let as_rgb = RawFrame {
+            format: "rgb0".to_string(),
+            ..frame.clone()
+        };
+        let (r, _, b) = as_rgb.bottom_band_mean().unwrap();
+        assert!((r - 255.0).abs() < 1.0 && b < 1.0, "rgb0 应把首字节当 R");
     }
 }

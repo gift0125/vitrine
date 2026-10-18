@@ -22,7 +22,7 @@ use player_core::{
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::list::{List, ListEvent, ListState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
@@ -134,6 +134,25 @@ const PLAYLIST_HEADER: f32 = 48.0;
 const PLAYLIST_FOOTER: f32 = 44.0;
 /// 列表行高（设计稿 48，双行：标题 + 「规格 · 时长」）。
 const PLAYLIST_ROW: f32 = 48.0;
+/// 底部渐隐遮罩高度（设计稿 `texture_layers.bottom_vignette`：240）。
+const VIGNETTE_HEIGHT: f32 = 240.0;
+/// 播放中多久没有输入就开始淡出控制层。
+///
+/// 视频播放器（IINA / QuickTime / VLC）的通用手感是 2~3 秒；取中间值。暂停、
+/// 拖动进度、开着面板时**不**淡出——那会儿用户正在读控件。
+const CHROME_IDLE: Duration = Duration::from_millis(2500);
+/// 淡出/淡入每 100ms tick 走一步：0.25 → 400ms 淡完，四步用肉眼已经看不出台阶。
+///
+/// 不用 GPUI 的 `with_animation`：那个动画只在有帧驱动时推进，而这个界面的帧
+/// 是 tick 拉起来的（画面本身就是 mpv 在画，主窗口大部分时间是空的）。
+const CHROME_FADE_STEP: f32 = 0.25;
+/// 淡到这个值以下就当「已经隐藏」：区域收缩（画面整块让出去）用。
+const CHROME_HIDDEN_EPS: f32 = 0.01;
+/// 换片 / seek 之后多久去抓一帧算色相（等解码出首帧）。
+const TINT_DELAY: Duration = Duration::from_millis(400);
+/// 取色失败（首帧还没到）的重试间隔，以及最多重试几次。
+const TINT_RETRY: Duration = Duration::from_millis(500);
+const TINT_TRIES: u8 = 3;
 /// 时间码字体（设计稿用等宽）：跟主题走，取平台原生的等宽族。
 ///
 /// 写死 "Consolas" 在 macOS/Linux 上不存在，会退到非等宽字体，
@@ -206,21 +225,30 @@ const ICON_PAUSE_FILL: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewB
 /// 是描边、`Captions` 是矩形加两横、`ListMusic` 带音符）。这几枚在
 /// `ICON_*` 里手绘，`active` 只改颜色不改形状。
 fn chrome_button(
+    cx: &gpui::App,
     id: &'static str,
     icon: Icon,
     label: &'static str,
     size: f32,
     active: bool,
 ) -> Button {
-    Button::new(id)
-        .ghost()
-        .with_size(px(size))
-        .icon(icon)
-        .text_color(if active {
+    // `ghost` 变体的悬停底色是 `theme.accent`（浅底主题下是一块亮 Lavender），
+    // 压在深玻璃上完全不对——设计稿要的是白 10%。`ghost` 的悬停色写死在
+    // `ButtonVariant::hovered` 里，只有 `custom` 变体肯用调用方给的颜色。
+    let custom = ButtonCustomVariant::new(cx)
+        .color(gpui_kit::transparent_black())
+        .foreground(if active {
             overlay::accent()
         } else {
             overlay::fg()
         })
+        .hover(overlay::hover())
+        .active(overlay::active());
+    Button::new(id)
+        .custom(custom)
+        .with_size(px(size))
+        .icon(icon)
+        .rounded(px(6.))
         .tooltip(label)
         .accessibility_label(label)
 }
@@ -335,6 +363,25 @@ pub(crate) fn seek_target(position: f64, delta: f64, max: f64) -> f64 {
     (position + delta).clamp(0.0, max)
 }
 
+/// 控制层（标题带 + 胶囊 + 底部遮罩）该不该显示。
+///
+/// 抽成纯函数是因为这条判据的每一根分支都对应一个用户场景，而真正的调用点
+/// （`PlayerView::chrome_wanted`）背后挂着 mpv 引擎，测试里造不出来：
+/// - 播放中 2.5 秒没输入 → 淡出（`CHROME_IDLE`）；
+/// - 暂停 / 音频模式 / 正在拖进度 / 面板或信息卡开着 → 必须留着；
+/// - 有任何输入（鼠标移动、按键、点按钮）→ 立刻淡回来。
+pub(crate) fn chrome_visible_target(
+    video_active: bool,
+    playing: bool,
+    busy: bool,
+    idle: Duration,
+) -> bool {
+    if !video_active || busy || !playing {
+        return true;
+    }
+    idle < CHROME_IDLE
+}
+
 pub struct PlayerView {
     engine: Option<AudioEngine>,
     playlist: Entity<ListState<PlaylistDelegate>>,
@@ -421,6 +468,27 @@ pub struct PlayerView {
     cinema: bool,
     /// 悬浮播放列表面板是否展开（新版设计稿默认收起）
     playlist_open: bool,
+    /// 控制层（标题带 + 胶囊 + 底部遮罩）当前的透明度：1 全显、0 全隐。
+    ///
+    /// 视频播放中一段时间没有输入就淡到 0，鼠标一动淡回来（见 [`CHROME_IDLE`]）。
+    /// 只在 tick 里按 `CHROME_FADE_STEP` 推一步，所以淡出是 4 帧的阶梯，不是
+    /// 真正的插值——换来的是**不需要额外帧驱动**，界面的帧本来就由 tick 拉起来。
+    chrome_alpha: f32,
+    /// 最近一次输入（鼠标移动/按键）的时刻，自动淡出的判据。
+    activity: Instant,
+    /// 鼠标移动的时间戳（`Cell`：`on_mouse_move` 每帧都来，不能每次都 notify）。
+    ///
+    /// 和 `drop_activity` 同一个套路：监听里只写时间戳，由 tick 消费并决定重绘。
+    activity_moved: Rc<Cell<Option<Instant>>>,
+    /// L2 画面染色：当前片子底部中间那块的**色相**（0~360）。
+    ///
+    /// 只在换片 / seek 之后取一次（一次缩略截图 + 一次均值），不做逐帧取色。
+    /// `None` = 还没取到（刚起播、或截图失败）：这时胶囊就是纯 L1 的玻璃。
+    frame_tint: Option<f32>,
+    /// 下一次该取色的时刻（换片/seek 之后延迟 [`TINT_DELAY`]，等首帧真解码出来）。
+    tint_due: Option<Instant>,
+    /// 取色已经重试了几次（首帧没到的时候 `screenshot-raw` 会失败）。
+    tint_tries: u8,
 
     // ---- 用户可见错误 ----
     /// 待弹出的错误提示（由 tick 统一推成 toast，保证有 window 可用）
@@ -600,6 +668,12 @@ impl PlayerView {
             zoom_pending: None,
             cinema: false,
             playlist_open: false,
+            chrome_alpha: 1.0,
+            activity: Instant::now(),
+            activity_moved: Rc::new(Cell::new(None)),
+            frame_tint: None,
+            tint_due: None,
+            tint_tries: 0,
             last_error: startup_errors.first().cloned(),
             pending_errors: startup_errors,
             pending_infos: Vec::new(),
@@ -641,6 +715,8 @@ impl PlayerView {
                 if event.keystroke.modifiers.modified() {
                     return;
                 }
+                // 按键也算"用户还在"：控制层淡掉之后按一下方向键，它得亮回来再动
+                let _ = weak.update(cx, |view, _| view.activity = Instant::now());
                 let handled = match event.keystroke.key.as_str() {
                     "escape" => {
                         // 只有真的在全屏时才吃这个键——否则会把将来的对话框/弹层的 Esc 挡掉
@@ -796,6 +872,12 @@ impl PlayerView {
             self.status_pill_shown = pill_live;
             cx.notify();
         }
+
+        // 控制层淡出/淡入：必须在 `sync_overlay_rect` 之前——区域要看 `chrome_alpha`。
+        self.tick_chrome_fade(cx);
+
+        // L2 画面染色：换片 / seek 之后隔一会儿取一次色（见 `schedule_frame_tint`）。
+        self.tick_frame_tint(cx);
 
         // 最大化状态：用户可能用系统的双击标题栏 / Aero Snap / 右键菜单改变它，
         // 这些都不经过我们的按钮，所以每帧比对一次，变了才重绘（图标要换成「还原」）。
@@ -1155,9 +1237,28 @@ impl PlayerView {
         // 抗锯齿留白：区域切得太贴边会把圆角的白描边切掉半个像素
         const PAD: f32 = 1.5;
 
-        let mut chrome = Vec::with_capacity(4);
+        // 控制层已经淡掉了：整块让给叠加窗。
+        //
+        // 这一条是自动淡出的**另一半**——只把元素画成透明、区域还留着的话，
+        // 那几块依然是主窗口的地盘：鼠标移过去落在看不见的按钮上，画面也少了
+        // 一块"能点的区域"（淡出后拖动/双击都该回到画面自己的手势上）。
+        if self.chrome_alpha <= CHROME_HIDDEN_EPS {
+            return Vec::new();
+        }
+
+        let mut chrome = Vec::with_capacity(5);
         // 标题带整条留下：右端还有窗口按钮，中间截断会很奇怪
         chrome.push(ChromeRect::rect(0., 0., width, TITLE_BAND));
+
+        // 底部渐隐遮罩：整条压在画面上，所以整块都得留在主窗口里
+        if self.video_active {
+            chrome.push(ChromeRect::rect(
+                0.,
+                (height - VIGNETTE_HEIGHT).max(0.),
+                width,
+                VIGNETTE_HEIGHT.min(height),
+            ));
+        }
 
         if let Some((x, y, w, h)) = self.capsule_rect.get() {
             chrome.push(ChromeRect::rounded(
@@ -1285,6 +1386,11 @@ impl PlayerView {
         let track = self.playlist.read(cx).delegate().track(index).cloned();
         let Some(track) = track else { return };
         let want_video = is_video_file(Path::new(&track.path));
+
+        // 开播这一刻算一次输入：新片子的前 2.5 秒控制层必须是亮着的，
+        // 否则刚打开视频就是一块"什么都没有"的画面（用户还没碰过任何输入）。
+        self.activity = Instant::now();
+        self.schedule_frame_tint();
 
         if want_video {
             // 音频引擎让位（mpv 负责音视频）
@@ -1540,6 +1646,8 @@ impl PlayerView {
             if let Some(engine) = &self.video.engine {
                 engine.seek(secs);
             }
+            // 换了画面就要重新取色：色相跟着镜头走（切到蓝天/夜戏/雪景）
+            self.schedule_frame_tint();
         } else if let Some(engine) = &mut self.engine {
             engine.seek(secs);
         }
@@ -2883,6 +2991,143 @@ impl PlayerView {
     /// 贴的是**画面左下角**（x24），高度 180、底边正好压在胶囊上沿之上 16。用
     /// 「一列自底向上排」而不是给卡片算 `bottom = 窗口高 - 胶囊高 - 24 - 16`：
     /// 胶囊高度是内容撑开的，写死算式会在换字号/换皮肤时错位。
+    /// 画面底部的渐隐遮罩（设计稿 `texture_layers.L1.bottom_vignette`）。
+    ///
+    /// 240 高、从全透明压到 `rgba(11,12,16,.55)`。它不是装饰：玻璃浮在亮画面上
+    /// 时（雪景、白墙、天空），11px 的时间码和 1px 图标会被糊掉，只能靠把玻璃
+    /// 越加越浓自救（现在是 72%，设计稿要 60%）。底下先压一层渐变，玻璃就敢薄。
+    ///
+    /// **它必须进 `chrome_rects`**：画在画面上却不在主窗区域里，等于被 mpv 叠加窗
+    /// 整块盖住（画了看不见）。而进了区域就吃鼠标，所以这里补上和画面同款的双击
+    /// （全屏）——否则窗口最下面三分之一会变成"点哪都没反应"。
+    ///
+    /// 不给它 `WindowControlArea::Drag`：那会让压在它上面的胶囊按钮变成非客户区
+    /// （标题带那条只敢给左半段设 Drag，就是同一个坑）。淡出之后这块区域整个让给
+    /// 叠加窗，拖动又回到画面自己的手势上。
+    fn render_vignette(&self, cx: &mut Context<Self>) -> impl gpui_kit::IntoElement {
+        let stamp = self.activity_moved.clone();
+        div()
+            .id("vignette")
+            .absolute()
+            .left(px(0.))
+            .right(px(0.))
+            .bottom(px(0.))
+            .h(px(VIGNETTE_HEIGHT))
+            .bg(crate::theme::v_gradient(
+                gpui_kit::rgba(0x0B0C1000),
+                overlay::vignette(),
+            ))
+            .on_mouse_move(move |_, _, _| stamp.set(Some(Instant::now())))
+            .on_double_click(cx.listener(|this, _e, window, cx| {
+                this.toggle_cinema(window, cx);
+            }))
+    }
+
+    /// 换片 / seek 之后排一次画面取色。
+    ///
+    /// 延迟 400ms 是留给"解码出帧"的：`screenshot-raw` 抓的是**当前显示的那一帧**，
+    /// 刚 `loadfile` 完去抓，拿到的还是上一部片子的画面（或者一张黑帧），染出来的
+    /// 色相是错的，而且这种错不会自己恢复。
+    fn schedule_frame_tint(&mut self) {
+        self.frame_tint = None;
+        self.tint_tries = 0;
+        self.tint_due = Some(Instant::now() + TINT_DELAY);
+    }
+
+    /// 到点了就取一次色；失败最多重试 3 次（`screenshot-raw` 在首帧之前会失败）。
+    fn tick_frame_tint(&mut self, cx: &mut Context<Self>) {
+        if !self.video_active {
+            self.tint_due = None;
+            if self.frame_tint.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let Some(due) = self.tint_due else { return };
+        if Instant::now() < due {
+            return;
+        }
+        self.tint_due = None;
+        let hue = self.video.engine.as_ref().and_then(|e| e.frame_hue());
+        match hue {
+            Some(hue) => {
+                if self.frame_tint != Some(hue) {
+                    self.frame_tint = Some(hue);
+                    cx.notify();
+                }
+            }
+            None if self.tint_tries < TINT_TRIES => {
+                self.tint_tries += 1;
+                self.tint_due = Some(Instant::now() + TINT_RETRY);
+            }
+            None => {}
+        }
+    }
+
+    /// 控制层该不该显示（自动淡出的目标态）。
+    ///
+    /// 只有「视频 + 正在播放 + 用户没在碰控件」才淡出。暂停时必须留着：用户停下来
+    /// 就是为了找控件；面板/信息卡/拖放提示/状态胶囊同理，那会儿他正在读东西。
+    fn chrome_wanted(&self) -> bool {
+        let busy = self.playlist_open
+            || self.info_open
+            || self.drop_hint_shown
+            || self.user_seeking
+            || self.status_pill_live().is_some();
+        chrome_visible_target(
+            self.video_active,
+            self.playback_state().is_playing(),
+            busy,
+            self.activity.elapsed(),
+        )
+    }
+
+    /// 每 tick 推一步透明度（见 [`CHROME_FADE_STEP`]）。
+    fn tick_chrome_fade(&mut self, cx: &mut Context<Self>) {
+        // 鼠标移动有两条来源：主窗口这边（`render` 根节点的 on_mouse_move）和
+        // 叠加窗（画面区不在主窗区域里，那边自己记）。都在动之前先把时间戳并进来。
+        let moved = self
+            .activity_moved
+            .take()
+            .or_else(video_overlay::activity_stamp);
+        if let Some(stamp) = moved {
+            self.activity = stamp;
+        }
+        let target = if self.chrome_wanted() { 1.0 } else { 0.0 };
+        if std::env::var_os("SMP_CHROME_TRACE").is_some() {
+            use std::sync::Mutex;
+            static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+            let mut slot = LAST.lock().unwrap();
+            let due = slot
+                .map(|at: Instant| at.elapsed() >= Duration::from_millis(500))
+                .unwrap_or(true);
+            if due {
+                *slot = Some(Instant::now());
+                eprintln!(
+                    "[chrome] alpha={:.2} target={target:.2} video={} playing={} idle={:.1}s pill={} seeking={} drop={} panel={} info={}",
+                    self.chrome_alpha,
+                    self.video_active,
+                    self.playback_state().is_playing(),
+                    self.activity.elapsed().as_secs_f32(),
+                    self.status_pill_live().is_some(),
+                    self.user_seeking,
+                    self.drop_hint_shown,
+                    self.playlist_open,
+                    self.info_open,
+                );
+            }
+        }
+        if (self.chrome_alpha - target).abs() < 0.001 {
+            return;
+        }
+        self.chrome_alpha = if target > self.chrome_alpha {
+            (self.chrome_alpha + CHROME_FADE_STEP).min(1.0)
+        } else {
+            (self.chrome_alpha - CHROME_FADE_STEP).max(0.0)
+        };
+        cx.notify();
+    }
+
     fn render_bottom_chrome(&self, cx: &mut Context<Self>) -> Div {
         div()
             .absolute()
@@ -3066,10 +3311,57 @@ impl PlayerView {
             .w(px(CAPSULE_WIDTH))
             .max_w_full()
             .rounded(px(CAPSULE_RADIUS))
-            .bg(overlay::glass())
+            // 圆角裁掉 1px 内描边和染色层探出去的那点角
+            .overflow_hidden()
+            // L1 定向光：竖向渐变（上偏蓝灰、下压深黑），不是一块平底色
+            .bg(crate::theme::v_gradient(
+                overlay::capsule_top(),
+                overlay::capsule_bottom(),
+            ))
             .border_1()
-            .border_color(overlay::border())
-            .shadow_lg()
+            .border_color(overlay::edge())
+            // 接触阴影 + 环境阴影：贴地那层负责"压住"，散开那层负责"浮起来"
+            .shadow(vec![
+                BoxShadow {
+                    color: overlay::contact(),
+                    offset: point(px(0.), px(2.)),
+                    blur_radius: px(6.),
+                    spread_radius: px(0.),
+                    inset: false,
+                },
+                BoxShadow {
+                    color: overlay::ambient(),
+                    offset: point(px(0.), px(16.)),
+                    blur_radius: px(40.),
+                    spread_radius: px(0.),
+                    inset: false,
+                },
+            ])
+            // L2 画面染色（取不到画面时这一层干脆不画）
+            .when_some(self.frame_tint, |el, hue| {
+                el.child(div().absolute().top(px(0.)).left(px(0.)).size_full().bg(
+                    crate::theme::v_gradient(overlay::tint(hue, 0.26), overlay::tint(hue, 0.08)),
+                ))
+            })
+            // L1 的两道 1px 内描边：上沿吃光、下沿压暗，玻璃才有一层厚度
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .right(px(0.))
+                    .h(px(1.))
+                    .bg(overlay::highlight()),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom(px(0.))
+                    .left(px(0.))
+                    .right(px(0.))
+                    .h(px(1.))
+                    .bg(overlay::shade()),
+            )
             .child(
                 canvas(
                     move |bounds, _window, _cx| {
@@ -3303,6 +3595,7 @@ impl PlayerView {
                     .gap(px(TRANSPORT_GAP))
                     .child(
                         chrome_button(
+                            cx,
                             "prev",
                             Icon::default().data(ICON_PREV),
                             "上一首",
@@ -3315,28 +3608,43 @@ impl PlayerView {
                     )
                     .child(self.render_skip_button("seek-back-10", false, cx))
                     // 播放键：44 正圆 + 两侧各 4 的呼吸垫（设计稿圆和 ±10 之间比
-                    // 图标之间宽 8），外圈再压一层 Mauve 辉光——设计稿那颗圆是
-                    // 「亮着的」，纯色实心在深玻璃上会显得比周围图标还平。
+                    // 图标之间宽 8）。设计稿那颗圆是**球面**的：
+                    // `radial-gradient(120% 120% at 32% 18%, #A05BF5 → #8839EF 46% → #6E24D8)`
+                    // 外加 1px 白色内高光。GPUI 没有径向渐变，用「竖向渐变 + 内阴影
+                    // 高光 + 外发光」凑出同一个观感。
                     .child(
                         div().flex_shrink_0().p(px(PLAY_BREATH)).child(
                             Button::new("play-pause")
                                 .primary()
                                 .with_size(px(PLAY_BUTTON))
                                 .rounded(px(PLAY_BUTTON / 2.))
-                                .bg(overlay::play())
+                                .bg(crate::theme::v_gradient(
+                                    overlay::play_top(),
+                                    overlay::play_bottom(),
+                                ))
                                 .text_color(gpui_kit::rgb(0xFFFFFF))
                                 .icon(Icon::default().data(if playing {
                                     ICON_PAUSE_FILL
                                 } else {
                                     ICON_PLAY_FILL
                                 }))
-                                .shadow(vec![BoxShadow {
-                                    color: overlay::play().opacity(0.35),
-                                    offset: point(px(0.), px(4.)),
-                                    blur_radius: px(18.),
-                                    spread_radius: px(0.),
-                                    inset: false,
-                                }])
+                                .shadow(vec![
+                                    BoxShadow {
+                                        color: overlay::play().opacity(0.35),
+                                        offset: point(px(0.), px(4.)),
+                                        blur_radius: px(18.),
+                                        spread_radius: px(0.),
+                                        inset: false,
+                                    },
+                                    // `inset 0 1px 0 rgba(255,255,255,.35)`
+                                    BoxShadow {
+                                        color: gpui_kit::rgba(0xFFFFFF59).into(),
+                                        offset: point(px(0.), px(1.)),
+                                        blur_radius: px(0.),
+                                        spread_radius: px(0.),
+                                        inset: true,
+                                    },
+                                ])
                                 .tooltip(if playing { "暂停" } else { "播放" })
                                 .accessibility_label(if playing { "暂停" } else { "播放" })
                                 .on_click(cx.listener(|this, _e, _w, cx| {
@@ -3347,6 +3655,7 @@ impl PlayerView {
                     .child(self.render_skip_button("seek-fwd-10", true, cx))
                     .child(
                         chrome_button(
+                            cx,
                             "next",
                             Icon::default().data(ICON_NEXT),
                             "下一首",
@@ -3373,6 +3682,7 @@ impl PlayerView {
                     .when(is_video, |el| {
                         el.child(
                             chrome_button(
+                                cx,
                                 "subtitles",
                                 Icon::default().data(ICON_CC),
                                 "切换字幕轨",
@@ -3387,6 +3697,7 @@ impl PlayerView {
                         )
                         .child(
                             chrome_button(
+                                cx,
                                 "audio-track",
                                 Icon::default().data(ICON_AUDIO_BARS),
                                 "切换音轨",
@@ -3402,6 +3713,7 @@ impl PlayerView {
                     })
                     .child(
                         chrome_button(
+                            cx,
                             "theme-toggle",
                             Icon::new(if is_dark {
                                 IconName::Sun
@@ -3427,6 +3739,7 @@ impl PlayerView {
                     )
                     .child(
                         chrome_button(
+                            cx,
                             "toggle-playlist",
                             Icon::default().data(ICON_LIST_LINES),
                             if playlist_open {
@@ -3444,6 +3757,7 @@ impl PlayerView {
                     .when(is_video, |el| {
                         el.child(
                             chrome_button(
+                                cx,
                                 "cinema",
                                 Icon::new(if cinema {
                                     IconName::Minimize
@@ -3601,6 +3915,16 @@ impl PlayerView {
     /// 而「视频用胶囊、音频用 toast」只取决于 `video_active` 这一个布尔。
     pub(crate) fn test_set_video_mode(&mut self, on: bool) {
         self.video_active = on;
+    }
+
+    /// 测试用：把控制层的透明度钉到某个值（淡出到 0 之后区域必须收缩）。
+    pub(crate) fn test_set_chrome_alpha(&mut self, alpha: f32) {
+        self.chrome_alpha = alpha;
+    }
+
+    /// 测试用：读当前控制层透明度。
+    pub(crate) fn test_chrome_alpha(&self) -> f32 {
+        self.chrome_alpha
     }
 
     /// 测试用：直接切「最大化」状态。
@@ -3772,12 +4096,20 @@ impl Render for PlayerView {
         } else {
             cx.theme().background
         };
+        // 控制层透明度：视频播放中一段时间没输入就淡掉（见 `chrome_wanted`）。
+        // 淡到 0 也不撤元素——**区域**（`chrome_rects`）会先把它们从主窗口里剪掉，
+        // 命中测试跟着区域走，所以不会留下看不见但点得到的按钮。
+        let chrome_alpha = self.chrome_alpha;
+        let move_stamp = self.activity_moved.clone();
 
         div()
             .relative()
             .size_full()
             .bg(background)
             .text_color(cx.theme().foreground)
+            // 任何鼠标移动都算"用户还在"：视频模式下它会把淡出的控制层叫回来。
+            // 只写时间戳不 notify——每帧通知会让整窗跟着鼠标重绘。
+            .on_mouse_move(move |_, _, _| move_stamp.set(Some(Instant::now())))
             // 外部文件拖到窗口上：只记时间戳，提示层由 tick 控制（见 drop_activity）
             .drag_over::<ExternalPaths>(move |style, _, _, _| {
                 drag_stamp.set(Some(Instant::now()));
@@ -3792,11 +4124,24 @@ impl Render for PlayerView {
             })
             // 视频模式：舞台铺满**整个窗口**，标题带/胶囊/歌单压在画面上（见 chrome_holes）。
             // 必须排在最前面——GPUI 按子节点顺序绘制，后画的才在上面。
-            .when(self.video_active, |el| el.child(self.render_stage(cx)))
+            .when(self.video_active, |el| {
+                el.child(self.render_stage(cx))
+                    // 底部渐隐遮罩：压在画面之上、胶囊之下。包一层只为拿 `.opacity`
+                    // （遮罩自己是 `Stateful`，`IntoElement` 上没有透明度）。
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(0.))
+                            .left(px(0.))
+                            .size_full()
+                            .opacity(chrome_alpha)
+                            .child(self.render_vignette(cx)),
+                    )
+            })
             .child(
                 v_flex()
                     .size_full()
-                    .child(self.render_title_band(cx))
+                    .child(self.render_title_band(cx).opacity(chrome_alpha))
                     .child(
                         h_flex()
                             .flex_1()
@@ -3809,7 +4154,7 @@ impl Render for PlayerView {
                     // 底部预留悬浮胶囊的位置（视频模式下这块是画布）
                     .child(div().h(px(BOTTOM_BAND)).flex_shrink_0()),
             )
-            .child(self.render_bottom_chrome(cx))
+            .child(self.render_bottom_chrome(cx).opacity(chrome_alpha))
             .when(self.playlist_open && !self.cinema, |el| {
                 el.child(self.render_playlist_panel(cx))
             })

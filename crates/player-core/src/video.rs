@@ -419,6 +419,22 @@ impl VideoEngine {
             .collect()
     }
 
+    /// 取一帧画面、算它的**色相**（`texture_layers.L2_frame_tint`）。
+    ///
+    /// 只在换片 / seek 之后调一次：`screenshot-raw` 要拷一整帧（1080p ≈ 8MB），
+    /// 每帧算一次等于白扔掉 8MB/s 的带宽去染一块 760×92 的玻璃。取不到就返回
+    /// `None`（还没解码出首帧、或 VO 没在出图），调用方保持纯 L1 玻璃即可。
+    pub fn frame_hue(&self) -> Option<f32> {
+        let frame = self.mpv.screenshot_raw(self.ctx.raw())?;
+        let (r, g, b) = frame.bottom_band_mean()?;
+        let hue = crate::libmpv::rgb_hue(r, g, b);
+        trace(&format!(
+            "screenshot-raw {}x{} stride={} {} 底部均值=({r:.0},{g:.0},{b:.0}) 色相={hue:.0}°",
+            frame.width, frame.height, frame.stride, frame.format
+        ));
+        Some(hue)
+    }
+
     /// 取走并清除「最近一次加载/解码失败」标记（UI 每轮轮询调用一次）。
     pub fn take_error(&self) -> Option<String> {
         let mut st = self.status.lock().ok()?;

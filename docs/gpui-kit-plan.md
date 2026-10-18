@@ -1269,6 +1269,151 @@ GPUI 不总生效，要展开面板/弹卡片这种有状态的点击得用真�
 
 ---
 
+### ✨ 第十四轮：按 `texture_layers` 补质感 + 控制层自动淡出（2026-10-18）
+
+设计稿的 `spec.json` 里有一节 `texture_layers`，把「质感」拆成三层，按依赖顺序叠加：
+**L1 纯样式 → L2 一次画面取色 → L3 真背景模糊**。本轮把 L1、L2 全量落地，L3 记成
+架构债（它要先做 `libmpv` render API 迁移，跟 `--wid` 叠加窗互斥）。
+
+#### L1：定向光（纯样式，一次改完）
+
+| 项 | 设计稿 | 实现 |
+|---|---|---|
+| 胶囊底 | `linear-gradient(180deg, rgba(26,28,40,.60), rgba(11,12,16,.74))` | `theme::v_gradient(capsule_top(), capsule_bottom())` |
+| 边框 | `1px rgba(255,255,255,.14)` | 新增 `overlay::edge()`（白 14%，比信息卡那圈 `border()` 的 10% 亮一档） |
+| 内描边 | `inset 0 1px 0 rgba(255,255,255,.16)` + `inset 0 -1px 0 rgba(0,0,0,.30)` | 两个绝对定位的 1px 矩形（见下） |
+| 阴影 | `0 2px 6px rgba(0,0,0,.26)` + `0 16px 40px rgba(0,0,0,.32)` | `shadow(vec![contact, ambient])` |
+| 底部遮罩 | 240 高，`rgba(11,12,16,.55) → 0` | `render_vignette()`，见下 |
+| 图标悬停 | `rgba(255,255,255,.10)` / R6 / active scale .92 | `ButtonCustomVariant`（见下） |
+| 播放键 | 径向渐变 + `inset 0 1px 0 rgba(255,255,255,.35)` | 竖向渐变 + 内阴影高光（见下） |
+| 数字 | `tabular-nums` | 时间码本来就取等宽族（`mono_font_family()`），天然等宽 |
+
+三处 GPUI 没有对应能力，只能凑：
+
+1. **内阴影**：`BoxShadow { inset: true }` 能画，但它跟着圆角走、只在一整块元素的内侧，
+   而「上沿吃光 + 下沿压暗」是两条**不连续**的线。做法是胶囊 `.overflow_hidden()` 之后挂两个
+   `absolute` 的 1px 矩形（top 用 `highlight()`、bottom 用 `shade()`）。`overflow_hidden`
+   同时也是 L2 染色层要的——那层是 `size_full()` 的方角矩形，不裁就会把四个圆角涂成直角。
+2. **径向渐变**：`gpui_kit::linear_gradient` 只有线性，没有 radial。播放键改成
+   `play_top #A05BF5 → play_bottom #6E24D8` 的竖向渐变（正好是径向渐变的高光→暗部两端），
+   再叠一条 `inset 0 1px 0 rgba(255,255,255,.35)` 的内阴影当高光点。44px 的圆上，
+   这套和真径向渐变肉眼分不出——渐变方向一致、高光位置也一致。
+3. **悬停色**：`ghost` 变体的悬停底色写死在 `ButtonVariant::hovered` 里，是 `theme.accent`
+   （浅底主题下是一块亮 Lavender），压在深玻璃上完全不对。只有 `custom` 变体肯用调用方
+   给的颜色 → `chrome_button` 改成 `ButtonCustomVariant::{color,foreground,hover,active}`，
+   顺手把 `rounded(6)` 补上（设计稿 `icon_hover.radius`）。`panel_button` **不动**——
+   歌单是浅底面板，那里必须跟主题色走（第十三轮踩过的坑）。
+
+`v_gradient` 这个小工具是必需的：`linear_gradient(angle, from, to)` 只收两个
+`LinearColorStop`，而 `Hsla`/`Rgba` 都**没有** `From` 实现，必须手动包
+`linear_color_stop(color, pct)`。所有竖向两段渐变都走它。
+
+#### 底部遮罩为什么必须存在，又为什么必须吃鼠标
+
+`bottom_vignette` 在设计稿里叫「补的这层」：设计稿只有顶部遮罩，控制栏是直接压在画面上的。
+亮画面上（雪景、白墙、天空）11px 时间码和 1px 图标会被糊掉，玻璃只能靠**加浓**自救
+（现在是平铺 72%，设计稿要 60%）。底下先压一层 240px 的渐变，玻璃就敢薄。
+
+它是**画在画面上**的东西 → 必须进 `chrome_rects`（否则被 mpv 叠加窗整块盖住，画了看不见，
+这是第五轮/第十一轮各踩过一次的坑）。而进了区域就吃鼠标 → 窗口最下面三分之一会变成
+「点哪都没反应」。所以遮罩自己补了 `on_double_click → toggle_cinema`，和画面同款手势。
+它**不设** `WindowControlArea::Drag`（会让压在它上面的胶囊按钮变成非客户区）。
+
+#### L2：从画面取色，只取色相
+
+规则来自设计稿，并且有实测依据：**只取 HSL 的色相，饱和度固定 46%、明度固定 36%**。
+不取明度的原因写在设计稿里——素材底部均值只有 `rgb(46,62,71)`，直接混进去等于把玻璃染得更黑；
+固定明度才能保证暗画面也有稳定色温。
+
+实现走 mpv 的 `screenshot-raw`：
+
+```
+mpv_command_node(["screenshot-raw", "video"])  →  mpv_node(MAP: w/h/stride/format/data)
+   ↓  mpv_free_node_contents 立刻释放
+RawFrame::bottom_band_mean()   // x 20..80%、y 62..100%，抽样到 ~2 万点
+   ↓
+libmpv::rgb_hue()              // 0..360
+   ↓
+theme::overlay::tint(hue, α)   // hsla(h/360, .46, .36, α)，α 上 .26 / 下 .08
+```
+
+实测这张素材报 `1280x720 stride=5120 bgr0`，底部均值 `(119,135,123)`、色相 `136°`——
+胶囊上确实浮出一层很淡的薄荷色偏（青绿画面），和画面同调。
+
+两个坑：
+
+- **`mpv_free_node_contents` 必须调**：`screenshot-raw` 把整帧（720p ≈ 5.5MB）塞进
+  `mpv_byte_array`，归属于我们给的 `mpv_node`，不释放就是每次换片漏 5MB。
+- **不能刚 `loadfile` 就去抓**：抓的是「当前显示的那一帧」，那会儿还是上一部片子（或黑帧），
+  染错的色相**不会自己恢复**。`schedule_frame_tint()` 延迟 400ms、失败重试 3 次 ×500ms。
+  加一次取色的时机只有两个：`play_track` 起播、`seek_to` 之后（镜头变了色相就变了）。
+
+#### L3 为什么停在账上
+
+`L3_real_blur` 要的是区域级 backdrop blur——Win 现在这块玻璃是**主窗口的一块 div**，
+它背后是 mpv 的自建叠加窗，不是 GPUI 的合成树，所以拿不到「糊窗口背后」的能力
+（acrylic 只能整窗，而且糊的是窗口**背后**的桌面）。正解是 libmpv render API 把画面
+画进我们自己的合成树（`mpv_render_context`），那是架构级改造，见
+`.workbuddy/memory/libmpv-migration.md`。在那之前**不伪造**：不加假的模糊层骗验收。
+
+#### 自动淡出：设计比实现难
+
+现象是「打开视频后标题栏和控制栏都不淡出」——因为压根没写过。需求侧要回答三个问题：
+
+1. **什么时候该淡出**：抽成纯函数 `chrome_visible_target(video, playing, busy, idle)`：
+   只有「视频 + 正在播放 + 用户没在碰控件」才淡。暂停必须留着（用户停下来就是为了找控件）；
+   面板 / 信息卡 / 拖放提示 / 状态胶囊 / 正在拖进度同理，那会儿他正在读东西。
+2. **怎么淡**：`chrome_alpha` 每 100ms tick 走 0.25 一步，400ms 走完。**不用
+   `with_animation`**——那个动画只在有帧驱动时推进，而这个界面的帧是 tick 拉起来的。
+   4 步在 92px 的胶囊上已经看不出台阶。
+3. **淡出之后交互归谁**：这是容易漏的另一半。只把元素画成透明、区域还留着的话，那几块
+   依然是主窗口的地盘：鼠标移过去落在**看不见的按钮**上，画面也少了一块能拖动/双击的区域。
+   所以 `chrome_rects()` 在 `alpha ≤ 0.01` 时返回**空 Vec**，整块让给叠加窗。
+
+「用户还在」这条信号有**三个来源**，缺一个就会出现「动了鼠标它不回来」：
+
+| 来源 | 为什么要单独接 |
+|---|---|
+| 根节点 `on_mouse_move` | 标题带、胶囊、窗口边缘这些还在主窗口区域里的地方 |
+| `video_overlay` 的 `WM_MOUSEMOVE` | **画面区已经被从主窗区域里剪掉了**，那边的鼠标事件根本到不了 GPUI → 叠加窗 wndproc 写一个 `static ACTIVITY: Mutex<Option<Instant>>`，tick 用 `activity_stamp()`（take 语义，取一次就清）读走 |
+| `intercept_keystrokes` | 淡掉之后按方向键，得先把它叫回来再动 |
+
+鼠标移动**只写时间戳、不 notify**：每帧通知会让整窗跟着鼠标重绘，而淡出判据本来就是
+tick 在算的（和 `drop_activity` 同一个套路）。
+
+两个副作用要一起修：
+
+- `set_region` 收到**空区域**会把窗口从 DWM 合成树里摘掉（`SetWindowRgn` 传空 region 的语义）。
+  `chrome_rects()` 现在会合法地返回空 → 在 `set_region` 末尾用 `GetRgnBox` 判一下，
+  空的话塞一个 1×1 px 进去，保证「区域为零 ≠ 窗口消失」。
+- 验收脚本会**因为淡出而假失败**：脚本空闲 2.5 秒后控制层自动淡掉，`region_contains(any)`
+  变 False → `panel_open()` 判 False → 点「展开歌单」那一下落到叠加窗上（被当成拖动/双击），
+  后面每个按钮坐标全错。这跟应用行为无关，全是脚本的锅 → `click()` / `wait_settled()`
+  开头统一 `wake()`（把光标抖到画面中心，等 0.45s 淡入），`cycle sid/aid` 那两个点击改成
+  按结果重试。诊断用 `SMP_CHROME_TRACE=1` 打出来的 `[chrome] alpha/target/idle` 证实：
+  `alpha=1.00 → target=0.00` 恰好在 `idle=2.5s`，鼠标一动回 `1.00`。
+
+#### 结果
+
+- `cargo test --workspace`：24（core）+ **39**（app，新增 `chrome_fades_only_when_a_video_is_playing_and_idle`、
+  `hidden_chrome_leaves_no_window_region`）全绿；
+- `scripts/verify_floating_chrome.py`：**18 项 ALL OK**（连跑三次）；
+- 实测淡出后视频继续解码（两次取样左下角时间码不同）；遮罩区双击进全屏
+  （`逻辑(150,410) 处窗口类 = Zed::Window`，外框 `(0,0,3840,2160)`）；
+- 文档截图重拍（`docs/screenshots/chroma-video*.png`）：胶囊有渐变 + 薄荷色偏，
+  底三分之一压暗，播放键是一颗球。
+
+#### 留给下一轮
+
+- **L3** 需要 libmpv render API（架构级）；
+- 设计稿 `L1.track_hover`（轨道 4→6、滑块 10→12）没做：`gpui-kit 0.7.3` 的 `Slider`
+  不给 hover 状态，得先有可替换的滑块；
+- `icon_hover.active_scale .92`（按下缩到 92%）没做：`ButtonCustomVariant::active()` 收的是
+  **颜色**不是缩放，上游没有按下缩放这个口子；要么等版本，要么自己画按钮。
+
+
+---
+
 ## 4. 里程碑与时间线
 
 | 里程碑 | 内容 | 累计工期 |
