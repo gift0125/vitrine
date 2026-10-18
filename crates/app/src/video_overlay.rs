@@ -29,11 +29,15 @@
 //! ## 输入因此要转一手
 //!
 //! 画面区不在主窗口的区域里了，点在上面命中的是视频窗。它只是个画布（不抢焦点、
-//! 也没有 GPUI），所以替主窗口挡两件事：
+//! 也没有 GPUI），所以替主窗口挡三件事：
 //!
 //! - 按住画面 → 自己实现窗口拖动（位移一比一，叠加窗同步粘上去）；
-//! - 双击画面 → `set_zoomed` 最大化/还原（等价于双击标题栏）；
+//! - 双击画面 → **全屏播放 / 退出全屏**（播放器的通用手势；[`OverlayEvent`]
+//!   交给 GPUI 侧执行，见下）；
 //! - 文件拖进来 → `WM_DROPFILES` 收进队列，主线程 tick 取走。
+//!
+//! 双击这里**不能**再等价于双击标题栏（最大化）：用户要的是「双击画面看全屏」，
+//! 最大化有标题带右上角那个按钮。
 //!
 //! ## 坐标约定
 //!
@@ -73,7 +77,7 @@ const WM_DROPFILES: u32 = 0x0233;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
-/// 双击画面：等价于双击标题栏（最大化/还原）。
+/// 双击画面：全屏播放 / 退出全屏。
 ///
 /// 前提是窗口类带 `CS_DBLCLKS`——没有它系统只会连发两条 `WM_LBUTTONDOWN`，
 /// `WM_LBUTTONDBLCLK` 永远不来（踩过）。
@@ -131,6 +135,18 @@ impl ChromeRect {
 }
 
 const CLASS_NAME: &str = "SimpleMediaPlayerVideoOverlay";
+
+/// 画面上发生的、要交给 GPUI 侧执行的交互。
+///
+/// wndproc 是自由函数，既不在 GPUI 的 `App` 上下文里、也拿不到 `Window`（调不了
+/// `toggle_fullscreen`），改不动视图状态。所以和拖放的路径一样：**先落队列**，
+/// 由主线程的 100ms tick 取走执行。代价是延迟不超过一帧（≤100ms），
+/// 用户感知不到——但代码里必须清楚「双击画面」是在下一次 tick 才生效的。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayEvent {
+    /// 双击画面：进入 / 退出全屏播放（影院模式）
+    ToggleCinema,
+}
 
 #[cfg(windows)]
 mod win {
@@ -206,7 +222,6 @@ mod win {
         fn GetWindow(hwnd: Hwnd, cmd: u32) -> Hwnd;
         fn ReleaseCapture() -> i32;
         fn SetCapture(hwnd: Hwnd) -> Hwnd;
-        fn GetCursorPos(point: *mut Point) -> i32;
         fn SetForegroundWindow(hwnd: Hwnd) -> i32;
         fn IsZoomed(hwnd: Hwnd) -> i32;
         fn SetWindowRgn(hwnd: Hwnd, region: Hwnd, redraw: i32) -> i32;
@@ -256,6 +271,32 @@ mod win {
     /// `WM_DROPFILES` 只在 wndproc 里能拿到，而这一刻我们不在 GPUI 的 `App`
     /// 上下文里，改不了视图状态，所以先落队列再统一消费。
     static DROPPED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    /// 画面上点出来的交互（双击 → 全屏），同样等 tick 取走。
+    static EVENTS: std::sync::Mutex<Vec<OverlayEvent>> = std::sync::Mutex::new(Vec::new());
+
+    /// 主窗口现在是不是影院（全屏）模式。
+    ///
+    /// wndproc 看不到 GPUI 的 `state.fullscreen`，但它要判断两件事：
+    /// 双击该「进全屏」还是「退全屏」（其实都是 toggle，不用判断）、
+    /// **以及此刻还能不能拖动窗体**——全屏时窗口已经铺满屏幕，拖它只会把画面
+    /// 拖出屏幕、留下一块空白（用户观感像"窗口坏了"）。所以由 GPUI 侧在状态
+    /// 变化时同步过来，tick 里读这个开关。
+    static CINEMA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    pub fn set_cinema(on: bool) {
+        CINEMA.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn is_cinema() -> bool {
+        CINEMA.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn push_event(event: OverlayEvent) {
+        if let Ok(mut queue) = EVENTS.lock() {
+            queue.push(event);
+        }
+    }
 
     /// 一次「按住画面拖动」的起点。
     ///
@@ -359,16 +400,16 @@ mod win {
         if msg == WM_LBUTTONDOWN {
             // 画面这块不在主窗口的区域里，按下来的是我们：自己开一轮拖动。
             let main = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
-            let mut cursor = Point::default();
-            unsafe {
-                GetCursorPos(&mut cursor);
-            }
+            // 坐标取**消息里的**，不取 `GetCursorPos()`：合成输入（验收脚本 PostMessage）
+            // 下真实光标还停在别处，用它判断双击会永远判不出来——而且消息里的坐标
+            // 就是系统判双击用的那一份，语义最正。
+            let screen = screen_point(hwnd, lparam);
             trace(&format!(
                 "lbuttondown main={main} iconic={} zoomed={} at=({},{})",
                 unsafe { IsIconic(main) },
                 unsafe { IsZoomed(main) },
-                cursor.x,
-                cursor.y
+                screen.0,
+                screen.1
             ));
             if main != 0 && unsafe { IsIconic(main) } == 0 {
                 // 先激活主窗口。这块窗口是 `WS_EX_NOACTIVATE`（点了不抢焦点才不闪），
@@ -376,15 +417,15 @@ mod win {
                 // 既不会激活窗口、第一次双击还会被系统当成「激活」吃掉。
                 activate(main);
                 // 双击自己判（`WM_LBUTTONDBLCLK` 在合成输入下不会来），见 take_double_press
-                if take_double_press(cursor.x, cursor.y) {
+                if take_double_press(screen.0, screen.1) {
                     // 第一下可能已经开了拖动（正常会有 UP 收尾，这里兜一层）
                     end_drag(hwnd);
-                    let zoomed = unsafe { IsZoomed(main) } != 0;
-                    trace(&format!("double press -> set_zoomed(zoomed={})", !zoomed));
-                    crate::window_actions::set_zoomed(main, !zoomed);
+                    trace("double press -> toggle cinema");
+                    push_event(OverlayEvent::ToggleCinema);
                     return 0;
                 }
-                if unsafe { IsZoomed(main) } == 0 {
+                // 全屏时不拖：窗口已经铺满屏幕，拖它只会把画面拖出去留一块空白
+                if !is_cinema() && unsafe { IsZoomed(main) } == 0 {
                     let mut rect = Rect::default();
                     unsafe {
                         GetWindowRect(main, &mut rect);
@@ -393,7 +434,7 @@ mod win {
                         *slot = Some(Drag {
                             overlay: hwnd,
                             main,
-                            cursor: (cursor.x, cursor.y),
+                            cursor: screen,
                             origin: (rect.left, rect.top),
                         });
                     }
@@ -407,25 +448,28 @@ mod win {
         }
         if msg == WM_MOUSEMOVE {
             if let Some(drag) = drag_of(hwnd) {
-                let mut cursor = Point::default();
-                unsafe {
-                    GetCursorPos(&mut cursor);
-                    let x = drag.origin.0 + (cursor.x - drag.cursor.0);
-                    let y = drag.origin.1 + (cursor.y - drag.cursor.1);
+                let cursor = screen_point(hwnd, lparam);
+                {
+                    let x = drag.origin.0 + (cursor.0 - drag.cursor.0);
+                    let y = drag.origin.1 + (cursor.1 - drag.cursor.1);
                     trace(&format!("drag -> main@({x},{y})"));
-                    SetWindowPos(
-                        drag.main,
-                        0,
-                        x,
-                        y,
-                        0,
-                        0,
-                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                    );
+                    unsafe {
+                        SetWindowPos(
+                            drag.main,
+                            0,
+                            x,
+                            y,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
                     // 叠加窗立刻贴上去：不等 GPUI 的 100ms tick，
                     // 否则拖动过程中画面会明显落后于窗口边框。
                     let (mx, my, mw, mh) = outer_rect(drag.main);
-                    SetWindowPos(hwnd, 0, mx, my, mw, mh, SWP_NOZORDER | SWP_NOACTIVATE);
+                    unsafe {
+                        SetWindowPos(hwnd, 0, mx, my, mw, mh, SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
                 }
                 return 0;
             }
@@ -440,9 +484,10 @@ mod win {
             return 0;
         }
         if msg == WM_LBUTTONDBLCLK {
-            // 双击画面 = 双击标题栏。走自己的 `set_zoomed`（`ShowWindowAsync`），
-            // 而不是转交 `WM_NCLBUTTONDBLCLK`：那条路在 GPUI 窗口上会把 `WS_MAXIMIZE`
-            // 位弄丢（窗口撑到工作区、`IsZoomed` 却是假，标题带图标和"再点还原"全乱）。
+            // 双击画面 = 全屏播放 / 退出全屏（播放器手势）。
+            //
+            // 这里**不再**转交 `WM_NCLBUTTONDBLCLK`（最大化）：那条路在 GPUI 窗口上会把
+            // `WS_MAXIMIZE` 位弄丢；而且用户要的是"双击看全屏"，本来就不该最大化。
             let main = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
             if main != 0 {
                 activate(main);
@@ -452,9 +497,8 @@ mod win {
                 if let Ok(mut slot) = LAST_PRESS.lock() {
                     *slot = None;
                 }
-                let zoomed = unsafe { IsZoomed(main) } != 0;
-                trace(&format!("dblclk -> set_zoomed(zoomed={})", !zoomed));
-                crate::window_actions::set_zoomed(main, !zoomed);
+                trace("dblclk -> toggle cinema");
+                push_event(OverlayEvent::ToggleCinema);
             }
             return 0;
         }
@@ -473,6 +517,22 @@ mod win {
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// 鼠标消息里的客户区坐标 → 屏幕坐标。
+    ///
+    /// `lparam` 的低 16 位是 x、高 16 位是 y，都是**有符号**的 16 位（负坐标要还原成
+    /// 负数，否则窗口跑到多显示器负区域时拖动会跳）。
+    fn screen_point(hwnd: Hwnd, lparam: isize) -> (i32, i32) {
+        let bits = lparam as u32;
+        let mut point = Point {
+            x: (bits & 0xFFFF) as u16 as i16 as i32,
+            y: ((bits >> 16) & 0xFFFF) as u16 as i16 as i32,
+        };
+        unsafe {
+            ClientToScreen(hwnd, &mut point);
+        }
+        (point.x, point.y)
     }
 
     /// 把主窗口提到前台。
@@ -578,6 +638,14 @@ mod win {
     /// 取走并清空拖放队列（主线程 tick 调用）。
     pub fn take_dropped() -> Vec<String> {
         DROPPED
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue))
+            .unwrap_or_default()
+    }
+
+    /// 取走并清空画面交互队列（主线程 tick 调用）。
+    pub fn take_events() -> Vec<OverlayEvent> {
+        EVENTS
             .lock()
             .map(|mut queue| std::mem::take(&mut *queue))
             .unwrap_or_default()
@@ -746,7 +814,7 @@ mod win {
 
 #[cfg(not(windows))]
 mod win {
-    use super::{ChromeRect, Hwnd};
+    use super::{ChromeRect, Hwnd, OverlayEvent};
 
     pub fn create_overlay(_main: Hwnd) -> Option<Hwnd> {
         None
@@ -754,6 +822,10 @@ mod win {
     pub fn take_dropped() -> Vec<String> {
         Vec::new()
     }
+    pub fn take_events() -> Vec<OverlayEvent> {
+        Vec::new()
+    }
+    pub fn set_cinema(_on: bool) {}
     pub fn destroy(_hwnd: Hwnd) {}
     pub fn show(_hwnd: Hwnd) {}
     pub fn hide(_hwnd: Hwnd) {}
@@ -870,6 +942,16 @@ pub fn window_rect(hwnd: Hwnd) -> (i32, i32, i32, i32) {
 /// 取走视频窗收到的拖放路径（主线程 tick 调用）。
 pub fn take_dropped() -> Vec<String> {
     win::take_dropped()
+}
+
+/// 取走画面上点出来的交互（双击 → 全屏），主线程 tick 调用。
+pub fn take_events() -> Vec<OverlayEvent> {
+    win::take_events()
+}
+
+/// 告诉视频窗「主窗口现在是不是全屏」——全屏时它不再拖窗体。
+pub fn set_cinema(on: bool) {
+    win::set_cinema(on)
 }
 
 /// 视频模式下给主窗口设区域：整窗 − 画面区 ＋ chrome。

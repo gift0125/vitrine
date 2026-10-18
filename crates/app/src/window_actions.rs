@@ -51,6 +51,59 @@ pub fn set_rounded(hwnd: Hwnd, rounded: bool) {
     imp::set_rounded(hwnd, rounded)
 }
 
+/// 让**客户区铺满整个窗口矩形**（左 / 右 / 下三边吃掉系统那圈缩放边框）。
+///
+/// ## 为什么必须这么做
+///
+/// 自绘标题栏的窗口仍然是 `WS_THICKFRAME`，系统会在外边留一圈给缩放用的**不可见边框**
+/// （实测 1.5 倍屏下外框比客户区宽 22、高 11 物理像素）。于是：
+///
+/// - 视频叠加窗铺的是**外框**（铺客户区会从边框里透出桌面，见 `video_overlay`）；
+/// - 标题带/胶囊只能画在**客户区**（GPUI 的画布就是客户区，画不到外面去）。
+///
+/// 结果就是窗口左右各露出 7 逻辑像素的画面——用户看到的是「顶栏没有铺满宽度」。
+/// 客户区铺满整窗之后两者严丝合缝，标题带一直画到窗口边缘。
+///
+/// ## 怎么做到
+///
+/// 拦 `WM_NCCALCSIZE`：先让原来的处理（GPUI）算一遍——它负责「最大化时顶边往下让
+/// 一条边框」这条规则（不让的话最大化后标题带上半截会被屏幕边缘切掉）——再把
+/// 左 / 右 / 下三边改回窗口矩形。**不动** `WS_THICKFRAME`，所以四边拖拽缩放照旧。
+pub fn make_client_full_bleed(hwnd: Hwnd) {
+    imp::make_client_full_bleed(hwnd)
+}
+
+/// 客户区是不是已经铺满整个窗口矩形。
+///
+/// 系统在**进出全屏**那一下并不重算客户区（实测：窗口已经缩回 1280×731，
+/// `GetClientRect` 还报 3840×2010、原点停在旧位置），整张界面就停在旧尺寸上。
+/// 调用方（100ms tick）发现不一致时补一次 [`refresh_client_area`]。
+pub fn client_matches_window(hwnd: Hwnd) -> bool {
+    imp::client_matches_window(hwnd)
+}
+
+/// 让系统重新算一次客户区（`SWP_FRAMECHANGED`，不动位置和尺寸）。
+///
+/// **不要在 `Context::update` 里直接调**：它会同步回调 `WM_SIZE`（同一个坑，
+/// 见 `fit_to_video` 的说明），要走前台任务。
+pub fn refresh_client_area(hwnd: Hwnd) {
+    imp::refresh_client_area(hwnd)
+}
+
+/// 把「客户区已经铺满、布局却还停在旧尺寸」这个状态踢醒。
+///
+/// GPUI 进出全屏那一下会丢掉自己的一次尺寸通知（`WM_SIZE` 在 `SetWindowPos` 里同步
+/// 派发，回调里 `App` 正被借用）。`window.bounds()`（= 平台侧记的 `logical_size`）
+/// 已经是新尺寸，布局用的 `viewport_size` 却还是旧的：顶栏、胶囊、窗口按钮全都按
+/// 旧尺寸画在左上角，点击也命中不到。
+///
+/// 这里做的就是把**当前真实客户区尺寸**再投递一条 `WM_SIZE`——GPUI 的尺寸处理只认
+/// lparam，是幂等的，重放一次布局就按新尺寸重排。用 `PostMessage` 而不是
+/// `SendMessage`：必须落在消息循环里，不能在别人的 `update` 栈里重入。
+pub fn kick_layout(hwnd: Hwnd) {
+    imp::kick_layout(hwnd)
+}
+
 /// 客户区的最小尺寸（逻辑像素）：和 `main.rs` 的 `window_min_size` 保持一致。
 ///
 /// 系统会把窗口压不到这个尺寸以下（GPUI 把它交给 `WM_GETMINMAXINFO`）。而按画面
@@ -165,11 +218,47 @@ pub fn fit_to_video(hwnd: Hwnd, video: (u32, u32)) -> bool {
 
 #[cfg(windows)]
 mod imp {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
     use super::{plan_fit, FitScene, Hwnd, MIN_CLIENT, SCREEN_MARGIN, SW_MAXIMIZE, SW_RESTORE};
 
     const MONITOR_DEFAULTTONEAREST: u32 = 2;
     const SWP_NOZORDER: u32 = 0x0004;
     const SWP_NOACTIVATE: u32 = 0x0010;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_FRAMECHANGED: u32 = 0x0020;
+    const GWLP_WNDPROC: i32 = -4;
+    /// `GWL_STYLE`（`GetWindowLongW` 的索引）与「可缩放边框」样式位。
+    const GWL_STYLE: i32 = -16;
+    const WS_THICKFRAME: u32 = 0x0004_0000;
+    const WM_NCCALCSIZE: u32 = 0x0083;
+    const WM_NCHITTEST: u32 = 0x0084;
+    const WM_GETMINMAXINFO: u32 = 0x0024;
+    const WM_SIZE: u32 = 0x0005;
+    /// `WM_SIZE` 的 `wParam`：窗口既没最大化也没最小化（补发通知时用它）。
+    const SIZE_RESTORED: usize = 0;
+    /// `WM_NCHITTEST` 的返回码：客户区 / 左 / 右 / 下 / 左下 / 右下。
+    const HTCLIENT: isize = 1;
+    const HTLEFT: isize = 10;
+    const HTRIGHT: isize = 11;
+    const HTBOTTOM: isize = 15;
+    const HTBOTTOMLEFT: isize = 16;
+    const HTBOTTOMRIGHT: isize = 17;
+    /// 缩放热区宽度（逻辑像素）。
+    ///
+    /// 客户区铺满之后，那圈边框变成了我们自己的客户区，`DefWindowProc` 不再往里
+    /// 认「这是边框」——四边就拉不动了。所以自己补一条热区，宽度取 Windows 的
+    /// 常规手感（8）稍窄一点，避免吃掉标题带左端那 16px 的拖拽区。
+    const RESIZE_GRIP: f32 = 6.0;
+
+    /// `WM_NCCALCSIZE`（`wParam = TRUE`）的入参：前三个矩形是「建议客户区 / 客户区 /
+    /// 窗口矩形」，后面跟一个 `WINDOWPOS` 指针。只用到第一项。
+    #[repr(C)]
+    struct NcCalcSizeParams {
+        rgrc: [Rect; 3],
+        window_pos: *mut std::ffi::c_void,
+    }
 
     /// `DWMWA_WINDOW_CORNER_PREFERENCE` 与它的取值（Win11 SDK 的头文件值）。
     ///
@@ -189,11 +278,30 @@ mod imp {
 
     #[repr(C)]
     #[derive(Default, Clone, Copy)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
     struct MonitorInfo {
         cb_size: u32,
         monitor: Rect,
         work: Rect,
         flags: u32,
+    }
+
+    /// `MINMAXINFO`：只关心 `ptMinTrackSize`（前三个 `POINT` 是保留位 / 最大化尺寸 /
+    /// 最大化位置，必须照样留出空间，否则读到的偏移是错的）。
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct MinMaxInfo {
+        reserved: Point,
+        max_size: Point,
+        max_position: Point,
+        min_track: Point,
+        max_track: Point,
     }
 
     #[link(name = "user32")]
@@ -214,6 +322,19 @@ mod imp {
             cy: i32,
             flags: u32,
         ) -> i32;
+        fn SetWindowLongPtrW(hwnd: Hwnd, index: i32, value: isize) -> isize;
+        fn PostMessageW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> i32;
+        fn DefWindowProcW(hwnd: Hwnd, msg: u32, wparam: usize, lparam: isize) -> isize;
+        fn ScreenToClient(hwnd: Hwnd, point: *mut Point) -> i32;
+        fn IsIconic(hwnd: Hwnd) -> i32;
+        fn GetWindowLongW(hwnd: Hwnd, index: i32) -> i32;
+        fn CallWindowProcW(
+            previous: isize,
+            hwnd: Hwnd,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+        ) -> isize;
     }
 
     #[link(name = "dwmapi")]
@@ -228,6 +349,223 @@ mod imp {
 
     pub fn is_zoomed(hwnd: Hwnd) -> bool {
         hwnd != 0 && unsafe { IsZoomed(hwnd) } != 0
+    }
+
+    /// 原来那个窗口过程（GPUI 的），`full_bleed_proc` 逐条转发给它。
+    static PREVIOUS_WNDPROC: AtomicIsize = AtomicIsize::new(0);
+
+    /// 铺满之前实测的**外框 − 客户区**（宽、高，物理像素），如 (22, 11)。
+    ///
+    /// 客户区铺满之后这圈"边框"已经不存在了，但 GPUI 在窗口**创建时**就把这个厚度
+    /// 记进了 `border_offset`，并拿它算 `ptMinTrackSize`（`最小客户区 + 厚度`）。
+    /// 1280×720 的片子正好等于最小高度 480 逻辑像素 × DPI，于是被顶成 720+11=731
+    /// ——「窗口 = 内容」就差这 11 像素。见 `full_bleed_proc` 里的减除。
+    static FRAME_INSETS: [std::sync::atomic::AtomicI32; 2] = [
+        std::sync::atomic::AtomicI32::new(0),
+        std::sync::atomic::AtomicI32::new(0),
+    ];
+
+    /// 拦 `WM_NCCALCSIZE`：把客户区的左 / 右 / 下三边扩到窗口矩形。
+    ///
+    /// 顶边**不碰**：GPUI 在最大化时会把 `top` 往下让一条边框的厚度，正是为了让
+    /// 标题带不被屏幕边缘切掉——这里照抄它的结果即可。
+    ///
+    /// 窗口矩形取系统在入参里给的那份（`wParam != 0` 时是 `rgrc[1]`，`wParam == 0`
+    /// 时就是 `lparam` 指向的那个 `RECT` 的初值），**不能**调 `GetWindowRect`：
+    /// 这一刻窗口矩形正在变（尤其是进出全屏那一下），读到的还是旧值，客户区就会
+    /// 停在旧尺寸上（实测表现为「窗口已经缩回 1280×731，客户区还报 3840×2010」）。
+    ///
+    /// `wParam == 0`（单纯改尺寸）这一路也必须改：GPUI 只在 `wParam != 0` 时自己
+    /// 处理标题栏，改尺寸那一下会退回 `DefWindowProc`，客户区仍是「窗口减边框」，
+    /// 于是每改一次尺寸都要靠 tick 里的自愈再补一次 `SetWindowPos`（画面会抖一下）。
+    unsafe extern "system" fn full_bleed_proc(
+        hwnd: Hwnd,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize {
+        let previous = PREVIOUS_WNDPROC.load(Ordering::Relaxed);
+        if previous == 0 {
+            return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+        }
+        // 先抄下窗口矩形：`CallWindowProcW` 会**就地把这块内存改成客户区**。
+        let window_rect = if msg == WM_NCCALCSIZE && lparam != 0 {
+            Some(unsafe {
+                if wparam != 0 {
+                    (*(lparam as *const NcCalcSizeParams)).rgrc[1]
+                } else {
+                    *(lparam as *const Rect)
+                }
+            })
+        } else {
+            None
+        };
+        // 先让 GPUI 算（它管顶边与最大化补偿），再改三边
+        let result = unsafe { CallWindowProcW(previous, hwnd, msg, wparam, lparam) };
+        if let Some(window) = window_rect {
+            unsafe {
+                let client = if wparam != 0 {
+                    &mut (*(lparam as *mut NcCalcSizeParams)).rgrc[0]
+                } else {
+                    &mut *(lparam as *mut Rect)
+                };
+                client.left = window.left;
+                client.right = window.right;
+                client.bottom = window.bottom;
+            }
+        } else if msg == WM_NCHITTEST && result == HTCLIENT {
+            // GPUI 认了「这是客户区」，但那块地方本来属于系统边框 → 补回缩放热区
+            if let Some(edge) = unsafe { frame_edge(hwnd, lparam) } {
+                return edge;
+            }
+        } else if msg == WM_GETMINMAXINFO && lparam != 0 {
+            // 最小尺寸里那圈幻影边框（见 `FRAME_INSETS`）要减掉，否则窗口比画面高一条
+            unsafe {
+                let info = &mut *(lparam as *mut MinMaxInfo);
+                let insets = [
+                    FRAME_INSETS[0].load(Ordering::Relaxed),
+                    FRAME_INSETS[1].load(Ordering::Relaxed),
+                ];
+                info.min_track.x = (info.min_track.x - insets[0]).max(1);
+                info.min_track.y = (info.min_track.y - insets[1]).max(1);
+            }
+        }
+        result
+    }
+
+    /// 光标在左 / 右 / 下边框（含两个下角）附近时给出对应的 `HT*` 码。
+    unsafe fn frame_edge(hwnd: Hwnd, lparam: isize) -> Option<isize> {
+        if hwnd == 0 || unsafe { IsZoomed(hwnd) } != 0 || unsafe { IsIconic(hwnd) } != 0 {
+            return None; // 最大化/最小化时没有边框可拉
+        }
+        // 全屏时 GPUI 会把 `WS_THICKFRAME` 摘掉：那会儿整块屏幕都是内容，不该能拉边
+        let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+        if style & WS_THICKFRAME == 0 {
+            return None;
+        }
+        let bits = lparam as u32;
+        let mut point = Point {
+            x: (bits & 0xFFFF) as u16 as i16 as i32,
+            y: ((bits >> 16) & 0xFFFF) as u16 as i16 as i32,
+        };
+        let mut rect = Rect::default();
+        unsafe {
+            ScreenToClient(hwnd, &mut point);
+            if GetClientRect(hwnd, &mut rect) == 0 {
+                return None;
+            }
+        }
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+        let grip = (RESIZE_GRIP * scale).round().max(1.0) as i32;
+        let (width, height) = (rect.right, rect.bottom);
+        let left = point.x < grip;
+        let right = point.x >= width - grip;
+        let bottom = point.y >= height - grip;
+        Some(match (left, right, bottom) {
+            (true, _, true) => HTBOTTOMLEFT,
+            (_, true, true) => HTBOTTOMRIGHT,
+            (true, _, _) => HTLEFT,
+            (_, true, _) => HTRIGHT,
+            (_, _, true) => HTBOTTOM,
+            _ => return None,
+        })
+    }
+
+    pub fn make_client_full_bleed(hwnd: Hwnd) {
+        if hwnd == 0 || PREVIOUS_WNDPROC.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        // 趁客户区还没铺满，量一下这圈边框有多厚（GPUI 就是这么量的，见 FRAME_INSETS）
+        let mut window = Rect::default();
+        let mut client = Rect::default();
+        if unsafe { GetWindowRect(hwnd, &mut window) != 0 && GetClientRect(hwnd, &mut client) != 0 }
+        {
+            FRAME_INSETS[0].store(
+                (window.right - window.left) - client.right,
+                Ordering::Relaxed,
+            );
+            FRAME_INSETS[1].store(
+                (window.bottom - window.top) - client.bottom,
+                Ordering::Relaxed,
+            );
+        }
+        let previous =
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, full_bleed_proc as *const () as isize) };
+        if previous == 0 {
+            return;
+        }
+        PREVIOUS_WNDPROC.store(previous, Ordering::Relaxed);
+        // 换过窗口过程不会自己重算客户区，得主动触发一次
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+        crate::persistence::log_session(&format!(
+            "client full bleed: WM_NCCALCSIZE hooked (frame insets {}x{})",
+            FRAME_INSETS[0].load(Ordering::Relaxed),
+            FRAME_INSETS[1].load(Ordering::Relaxed),
+        ));
+    }
+
+    pub fn client_matches_window(hwnd: Hwnd) -> bool {
+        if hwnd == 0 {
+            return true;
+        }
+        let mut window = Rect::default();
+        let mut client = Rect::default();
+        let ok = unsafe {
+            GetWindowRect(hwnd, &mut window) != 0 && GetClientRect(hwnd, &mut client) != 0
+        };
+        if !ok {
+            return true;
+        }
+        (window.right - window.left) == client.right
+            && (window.bottom - window.top) == client.bottom
+    }
+
+    pub fn refresh_client_area(hwnd: Hwnd) {
+        if hwnd == 0 {
+            return;
+        }
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                0,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            );
+        }
+    }
+
+    pub fn kick_layout(hwnd: Hwnd) {
+        if hwnd == 0 {
+            return;
+        }
+        let mut client = Rect::default();
+        if unsafe { GetClientRect(hwnd, &mut client) } == 0 {
+            return;
+        }
+        let width = client.right.max(1) as u32 & 0xFFFF;
+        let height = client.bottom.max(1) as u32 & 0xFFFF;
+        unsafe {
+            PostMessageW(
+                hwnd,
+                WM_SIZE,
+                SIZE_RESTORED,
+                ((height << 16) | width) as isize,
+            )
+        };
     }
 
     pub fn set_zoomed(hwnd: Hwnd, zoomed: bool) {
@@ -337,6 +675,16 @@ mod imp {
     pub fn set_zoomed(_hwnd: Hwnd, _zoomed: bool) {}
 
     pub fn set_rounded(_hwnd: Hwnd, _rounded: bool) {}
+
+    pub fn make_client_full_bleed(_hwnd: Hwnd) {}
+
+    pub fn client_matches_window(_hwnd: Hwnd) -> bool {
+        true
+    }
+
+    pub fn refresh_client_area(_hwnd: Hwnd) {}
+
+    pub fn kick_layout(_hwnd: Hwnd) {}
 
     pub fn fit_to_video(_hwnd: Hwnd, _video: (u32, u32)) -> bool {
         false

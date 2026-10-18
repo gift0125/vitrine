@@ -22,10 +22,10 @@
 | 拖放导入 | 从资源管理器拖文件/文件夹进窗口：入列表并立刻播第一个（文件夹递归扫描），**不弹提示**——画面换了就是回执 |
 | 自动连播 | 一曲结束自动下一首；播完列表末尾停止 |
 | 进度与音量 | 拖动进度条跳转、音量 0–100 实时生效 |
-| 影院模式 | 视频播放时一键全屏并隐藏歌单，退出自动恢复 |
+| 影院模式 | 视频播放时**双击画面**进入全屏播放（也可点胶囊里的全屏键 / 按 F11），退出有四个口子：`Esc`、再双击画面、右上角「最大化」、胶囊里的退出键；退出后自动恢复原窗口尺寸 |
 | 窗口按画面定尺寸 | 起播时按 mpv 报的显示尺寸把窗口调成画面大小（放得下就 **1:1**，一个像素都不缩放），不留黑边；之后可以自由拉，不会被弹回去 |
 | 圆角窗口 | 视频播放时窗体是圆角（Windows 11 的 DWM 圆角，画面本身也跟着圆），回到音频模式恢复直角 |
-| 画面拖动窗体 | 按住画面拖拽即移动窗口；双击画面最大化/还原 |
+| 画面拖动窗体 | 按住画面拖拽即移动窗口（全屏时不拖）；双击标题栏仍是与系统一致的最大化/还原 |
 | 明暗主题 | 右上角一键切换，配色全部走主题 token |
 | 状态持久化 | 播放列表、上次曲目、音量、窗口尺寸自动保存 |
 | 错误提示 | 文件损坏、格式不支持、mpv 缺失等都有提示：音频模式走右上角 toast，视频模式走标题带胶囊 |
@@ -245,20 +245,24 @@ GPUI 的 Windows 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`）
 算好半径再抗锯齿，也就是 Windows 11 上其它窗口的样子。Windows 10 没有这条属性，调用被
 静默忽略、窗口保持直角。
 
-### 按住画面拖动 / 双击最大化
+### 按住画面拖动 / 双击全屏
 
 画面区不在主窗口的区域里了，点在上面命中的是视频窗，所以这两件事由
 `video_overlay` 的 wndproc 接：
 
 - `WM_LBUTTONDOWN` 记起点 + `SetCapture`，`WM_MOUSEMOVE` 里按**累计位移** `SetWindowPos`
   主窗口，并同步把叠加窗粘上去（不等 100ms 的 tick，拖动时画面才不落后）；
-- `WM_LBUTTONDBLCLK` 直接调 `window_actions::set_zoomed`（等价于双击标题栏）。
+- 双击 → **全屏播放**（不是最大化）：wndproc 只把「发生了一次双击」排进队列
+  （`OverlayEvent::ToggleCinema`），由 100ms tick 调 `PlayerView::set_cinema` 切影院模式。
+  双击**自己的判**——这块窗口是 `WS_EX_NOACTIVATE`，系统对"没被激活的窗口"只连发
+  `WM_LBUTTONDOWN`，`WM_LBUTTONDBLCLK` 常常不来。
+- 全屏态下不再拖窗体（画面本来就铺满屏幕）。
 
-不用「转交系统」的两条捷径，都踩过：
+同一处代码不用「转交系统」的捷径，都踩过：
 
 - `SendMessageW(main, WM_NCLBUTTONDOWN, HTCAPTION)` 让系统做模态拖动——在这个窗口上
   只跟上头一两步就停住（GPUI 的 wndproc 自己处理 `WM_MOUSEMOVE`，系统的模态循环拿不到
-  位移），紧接着的双击还会被当成「继续拖动」，窗口挪一段而不是最大化；
+  位移）；
 - 转交 `WM_NCLBUTTONDBLCLK`——窗口会撑到工作区，但 `WS_MAXIMIZE` 位丢了，`IsZoomed`
   为假，标题带图标和「再点一次还原」全乱。
 
@@ -266,6 +270,32 @@ GPUI 的 Windows 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`）
 
 > 也别给叠加窗加 `WS_EX_TRANSPARENT` 想「命中穿透」：实测会让整块窗口**不再被合成**，
 > 帧还在但完全看不见。
+
+### 全屏播放的四个出口
+
+`Esc` / 再双击画面 / 右上角「最大化」/ 胶囊里的退出键，四条路都走同一个
+`PlayerView::set_cinema(false, …)`：
+
+| 出口 | 实现 | 注意 |
+|---|---|---|
+| `Esc` / `F11` | `App::intercept_keystrokes` | 不能用 `bind_keys` + `on_action`：没有焦点元素时 GPUI 把按键派发给 dispatch 树的**根**，那是 gpui-component 的 `Root`，挂在视图根节点上的 `on_action` 永远收不到 |
+| 再双击画面 | 叠加窗双击 → 队列 → tick | 见上 |
+| 右上角「最大化」 | `toggle_maximize` 里先判 `cinema` → 退影院 | 全屏时 GPUI 已摘掉 `WS_MAXIMIZEBOX`，这时再 `SW_MAXIMIZE` 只会卡在错乱态 |
+| 胶囊里的退出键 | `exit-cinema` 按钮 | 影院模式下标题带右侧会多出这个键 |
+
+**坑：进出全屏那一下 GPUI 会把自己的尺寸通知丢掉。** `WM_SIZE` 是在 `SetWindowPos`
+里**同步**派发的，此时 App 正被本轮 `update` 借用，GPUI 的 resize 回调里
+`handle.update()` 拿不到借用权（`log_err` 之后静默失败，连日志都没有）。结果是
+`window.bounds()` 已经是全屏尺寸，**布局用的 `viewport_size` 还停在旧尺寸**——
+画面铺满整屏，顶栏却只画在左上角 853×34 那一小块里、右上角的窗口按钮根本不存在，
+点哪里都没反应。
+
+`refresh()` 治不好（它不碰 viewport，只是标脏），`bounds_changed(cx)` 更不能直接调
+（会把 `bounds_observers` 全跑一遍，其中就有对本视图的 `update` → panic
+「cannot update PlayerView while it is already being updated」）。可用的是给窗口
+**补一条 `WM_SIZE`**（`window_actions::kick_layout`，`PostMessage` 到消息循环里，
+lparam 用真实客户区尺寸）：GPUI 的尺寸处理只认 lparam、是幂等的，重放一次布局就按
+新尺寸重排。tick 里每 100ms 比一次 `viewport_size` 和 `window.bounds()`，不一致就补一条。
 
 > 踩坑记录：Windows 命名管道上挂起的 `ReadFile` 会阻塞 `WriteFile`（即使句柄是 `try_clone` 出来的），
 > 所以 IPC 不能「读线程 + 写线程」并发，必须单线程串行 + `PeekNamedPipe` 非阻塞探测。

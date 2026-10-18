@@ -113,6 +113,10 @@ fn main() {
             // 设计稿色板（Catppuccin Latte / Mocha），必须在 init 之后覆盖默认主题
             theme::install(cx, start_dark);
 
+            // 快捷键（Esc 退出全屏 / F11 切换全屏）注册在 `PlayerView::new` 里：
+            // 它要的是 App 级的 keystroke 拦截，不是 keymap + on_action
+            // （原因见那里的注释）。
+
             let w = settings.window_width.clamp(720.0, 4096.0);
             let h = settings.window_height.clamp(480.0, 4096.0);
             let bounds = Bounds {

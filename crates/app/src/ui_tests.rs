@@ -15,13 +15,14 @@ use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::test::TestWindowExt as _;
 use gpui_kit::{
     point, px, size, AnyWindowHandle, AppContext as _, Bounds, Entity, ExternalPaths,
-    FileDropEvent, InputEvent as _, TestAppContext, WindowBounds, WindowOptions,
+    FileDropEvent, InputEvent as _, Keystroke, TestAppContext, WindowBounds, WindowOptions,
 };
 use player_core::TrackMeta;
 use smallvec::SmallVec;
 
 use crate::persistence::{self, Settings};
 use crate::player_view::PlayerView;
+use crate::video_overlay::OverlayEvent;
 
 /// 每个用例一个独立临时目录，避免并行执行时互相踩。
 fn fresh_dir(tag: &str) -> PathBuf {
@@ -716,6 +717,120 @@ fn chrome_region_covers_capsule_and_panel(cx: &mut TestAppContext) {
             covered(&rects, panel.center().x.as_f32(), panel.center().y.as_f32()),
             "歌单面板必须在区域里，否则展开后是一片画面：{rects:?} vs {panel:?}"
         );
+    })
+    .unwrap();
+}
+
+// ----------------------------------------------------------------------
+// 全屏播放（影院模式）：入口、出口、顶栏宽度
+// ----------------------------------------------------------------------
+
+/// 双击画面 → 全屏播放，`Esc` → 回到窗口。
+///
+/// 用户报的是三连：「双击时不是全屏播放」「全屏后 esc 不能返回窗口」。
+/// 之前双击走的是最大化（等价双击标题栏），而全屏之后**根本没有任何键盘出口**——
+/// 应用里一条 `bind_keys` 都没有，`Esc` 从来没被派发过。
+#[gpui_kit::test]
+fn double_click_enters_cinema_and_escape_returns_to_window(cx: &mut TestAppContext) {
+    fresh_dir("cinema-keys");
+    let (window, view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| view.test_set_video_mode(true));
+        window.render_frame(cx);
+        assert!(!view.read(cx).test_cinema(), "视频模式默认不该是全屏");
+
+        // 画面上的双击：视频窗把事件排队，tick 取走 → 切全屏
+        view.update(cx, |view, cx| {
+            view.test_on_overlay_event(OverlayEvent::ToggleCinema, window, cx);
+        });
+        assert!(view.read(cx).test_cinema(), "双击画面应进入全屏播放");
+        assert!(
+            window.is_fullscreen(),
+            "影院模式必须真的把窗口切成全屏，否则只是看起来像"
+        );
+
+        // Esc 走的是真实键盘链路：PlatformInput::KeyDown → App 级 keystroke 拦截
+        let handled = window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+        assert!(handled, "Esc 应被 PlayerView 的按键拦截吃掉");
+        assert!(!view.read(cx).test_cinema(), "Esc 应退出全屏播放");
+        assert!(!window.is_fullscreen(), "Esc 之后窗口不能再是全屏态");
+
+        // 不在全屏时不该吞 Esc（将来有对话框/弹层要靠它关闭）
+        let handled = window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+        assert!(!handled, "窗口态下 Esc 应继续往下派发");
+    })
+    .unwrap();
+}
+
+/// 全屏时点「最大化」按钮 = 回到窗口。
+///
+/// 全屏时 GPUI 把 `WS_MAXIMIZEBOX` / `WS_CAPTION` 一起摘掉了，此时再
+/// `ShowWindowAsync(SW_MAXIMIZE)` 会把窗口弄成「铺满工作区、但 GPUI 仍认为在全屏」
+/// 的错乱态——用户点完的感受就是「回不到窗口」。
+#[gpui_kit::test]
+fn maximize_button_leaves_cinema(cx: &mut TestAppContext) {
+    fresh_dir("cinema-max");
+    let (window, view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        view.update(cx, |view, _| view.test_set_video_mode(true));
+        window.render_frame(cx);
+        view.update(cx, |view, cx| {
+            view.test_on_overlay_event(OverlayEvent::ToggleCinema, window, cx);
+        });
+        assert!(view.read(cx).test_cinema());
+
+        view.update(cx, |view, cx| view.test_toggle_maximize(window, cx));
+        assert!(
+            !view.read(cx).test_cinema(),
+            "全屏时「最大化」应退回窗口模式"
+        );
+        assert!(!window.is_fullscreen(), "退回之后窗口不能还是全屏");
+        assert!(
+            !view.read(cx).test_maximized(),
+            "退回窗口后不该顺手把自己标成最大化（图标会变成「还原」）"
+        );
+    })
+    .unwrap();
+}
+
+/// 标题带必须铺满整窗宽度（含右上角那三颗窗口按钮）。
+///
+/// 用户报「顶栏没有铺满宽度」。布局这一层守的是：三个窗口按钮贴着窗口右沿、
+/// 标题带在窗口区域里就是 `(0, 0, 窗口宽, TITLE_BAND)` —— 区域少算一段，
+/// 那一段就会被系统剪掉，看着就是「顶栏缺了一角」。
+#[gpui_kit::test]
+fn title_band_spans_full_width(cx: &mut TestAppContext) {
+    fresh_dir("band-width");
+    let (window, view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        for video in [false, true] {
+            view.update(cx, |view, _| view.test_set_video_mode(video));
+            window.render_frame(cx);
+
+            let bounds = window.bounds();
+            let close = window.find("win-close").bounds();
+            assert!(
+                (close.right() - bounds.right()).as_f32().abs() <= 1.0,
+                "关闭按钮应贴着窗口右沿（video={video}）：按钮 {close:?} vs 窗口 {bounds:?}"
+            );
+            assert!(
+                (close.top() - bounds.top()).as_f32().abs() <= 1.0,
+                "窗口按钮应贴着窗口上沿（video={video}）：按钮 {close:?} vs 窗口 {bounds:?}"
+            );
+
+            let rects = view.read(cx).test_chrome_rects(window);
+            assert!(
+                rects.iter().any(|rect| rect.x <= 0.5
+                    && rect.y <= 0.5
+                    && (rect.width - bounds.size.width.as_f32()).abs() <= 1.0
+                    && rect.height >= 30.0),
+                "标题带在窗口区域里必须覆盖整宽（video={video}）：{rects:?} vs 窗口宽 {}",
+                bounds.size.width.as_f32()
+            );
+        }
     })
     .unwrap();
 }

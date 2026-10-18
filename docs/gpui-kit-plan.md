@@ -852,6 +852,123 @@ OK: 视频模式两块窗口都设了圆角（角上像素 (3, 92, 163)，不是
 
 ---
 
+### 🖥 第九轮：全屏播放的四个出口 + 顶栏真的铺满（2026-10-18）
+
+用户报了一组四连（原文）：
+
+> 双击时，不是全屏播放。全屏播放后，最大化按钮回不到窗口。顶栏没有铺满宽度。
+> 全屏后，esc不能返回窗口模式。
+
+#### 1. 双击 = 全屏播放（不是最大化）
+
+`WM_LBUTTONDBLCLK` 不能指望：叠加窗是 `WS_EX_NOACTIVATE`，系统对"没被激活的窗口"
+只连发两条 `WM_LBUTTONDOWN`。所以双击**自己判**——记上次按下时刻 + 位置，按
+`GetDoubleClickTime()` / `SM_CXDOUBLECLK`(36) / `SM_CYDOUBLECLK`(37) 比对。
+
+坐标必须取**消息 lparam**（`ClientToScreen` 换算），不能用 `GetCursorPos()`：
+合成的 `PostMessage` 输入下真实光标在别处，用它判的话两次点击永远对不上（实测
+日志里两条 `lbuttondown` 的坐标差了半个屏幕，双击永远不成立）。
+
+wndproc 里没有 `App`/`Window`，所以只把事件排进队列（`OverlayEvent::ToggleCinema`
+→ `static Mutex<Vec<_>>`），由 100ms 的 tick 取出来调 `PlayerView::set_cinema`——
+和 `take_dropped()` 同一套路。
+
+`set_cinema(on)` 是唯一入口：`on && video_active` 夹一下、`video_overlay::set_cinema`
+（全屏时叠加窗不再拖窗体）、和 `window.is_fullscreen()` 对齐、记一行
+`cinema -> {on} (fullscreen=…, video_active=…)`。
+
+#### 2. 全屏里的四个出口
+
+`Esc` / 再双击 / 右上角「最大化」/ 胶囊的 `exit-cinema`，全走 `set_cinema(false)`。
+
+`Esc` 走 `App::intercept_keystrokes`（跑在派发**之前**），不是 `bind_keys` + `on_action`：
+没有焦点元素时 GPUI 把按键派发给 dispatch 树的**根**，而那是 gpui-component 的
+`Root`，在我们视图之外——实测 `dispatch_keystroke` 直接返回 `false`，影院状态不动。
+
+「最大化」按钮在全屏时必须先退影院：GPUI 全屏时已经把 `WS_MAXIMIZEBOX/WS_CAPTION`
+摘掉了，这时再 `SW_MAXIMIZE` 只会卡在错乱态（窗口大了、界面还画在旧尺寸上）。
+
+#### 3. 顶栏没铺满宽度 = 客户区没铺满窗口
+
+自绘标题栏的窗口有一圈**隐形外框**（实测 1.5× 缩放下外框比客户区宽 22、高 11，
+即每边 7 逻辑像素）。叠加窗按**外框**铺、GPUI 只画**客户区**，于是标题带左右各缺
+一条，露出的是没被压暗的画面。
+
+解法是接管 `WM_NCCALCSIZE`（子类化窗口过程，先调 GPUI 的再改）：
+
+- `wParam != 0` 时窗口矩形在 `rgrc[1]`，`wParam == 0` 时就是 `lparam` 那个 `RECT`
+  的**初值**（`CallWindowProcW` 会就地把这块改成客户区，所以要先抄一份）；
+- **不能**用 `GetWindowRect` 取窗口矩形：这一刻窗口矩形正在变（尤其进出全屏），
+  读到的还是旧值——实测表现为「窗口已经缩回 1280×731，客户区还报 3840×2010」；
+- 顶边不碰：GPUI 在最大化时会把 `top` 往下让一条边框厚度，那是它刻意做的。
+
+铺满之后那圈边框变成客户区，`DefWindowProc` 不再往里认边框 → 自己补缩放热区
+（`WM_NCHITTEST` 返回 `HTLEFT/HTRIGHT/HTBOTTOM/…`，6 逻辑像素；最大化/最小化/无
+`WS_THICKFRAME`（全屏）时跳过）。
+
+**副作用一**：GPUI 在窗口创建时把边框厚度记进 `border_offset`，并拿它算
+`ptMinTrackSize`（最小客户区 + 厚度）。720p 片子正好等于最小高度 480 逻辑像素 ×
+DPI，于是被顶成 `720 + 11 = 731`——「窗口 = 内容」就差这 11 像素。所以拦
+`WM_GETMINMAXINFO`，把创建时量到的厚度减掉。
+
+**副作用二**：`handle_calc_client_size` 只在 `wParam != 0` 时被 GPUI 处理，单纯改
+尺寸那一路仍退回 `DefWindowProc`（客户区 = 窗口 − 边框），于是每次改尺寸都要等
+tick 里的自愈再补一次 `SetWindowPos`（画面会抖一下）。上面两条路都改之后就没有中间态了。
+
+#### 4. 最费劲的一条：进出全屏时 GPUI 会丢掉自己的尺寸通知
+
+现象：双击进全屏后，画面铺满整屏，但顶栏只在左上角画了 853×34 一小块，右上角的
+窗口按钮**根本不存在**——点「最大化」没反应、点 `Esc` 反而正常（键盘不走命中测试）。
+
+根因：`WM_SIZE` 是在 `SetWindowPos` 里**同步**派发的，此刻 App 正被本轮 `update`
+借用，GPUI resize 回调里的 `handle.update()` 拿不到借用权，`log_err` 之后静默失败。
+于是 `window.bounds()`（平台侧 `logical_size`）已经是 2560×1440，**布局用的
+`viewport_size` 还是旧值**，而命中测试用的是上一帧的布局树 → 整片区域点不到。
+
+试过两条都不行，记下来别再走：
+
+- `window.refresh()`：只标脏，不碰 `viewport_size`，重绘循环里 viewport 一直是旧值；
+- `window.bounds_changed(cx)`（那是平台 resize 回调里干的事）：会把
+  `bounds_observers` 全跑一遍，其中就有对本视图的 `update`，而视图正在被 update
+  → 直接 panic `cannot update PlayerView while it is already being updated`。
+
+可用的是**补一条 `WM_SIZE`**：`window_actions::kick_layout` 用 `PostMessage`
+（不是 `SendMessage`，必须落在消息循环里）把真实客户区尺寸投给主窗口。GPUI 的尺寸
+处理只认 lparam、是幂等的，重放一次布局就按新尺寸重排。tick 里每 100ms 比一次
+`viewport_size` 与 `window.bounds()`，不一致就补（300ms 限流，避免变成无效重绘）。
+
+#### 验收脚本这轮的教训
+
+- **双击不能靠模拟光标**：`SetCursorPos` + `mouse_event` 两次按下之间只要漏进一条
+  `WM_MOUSEMOVE`，叠加窗就当成「按住画面拖窗体」把窗口挪走（实测挪了 12,-16 像素），
+  双击也随之失效。改成把真实双击的那组消息
+  （`DOWN → UP → DBLCLK → UP`）直接 `PostMessage` 给叠加窗。
+- **改尺寸后要等区域追上**：新布局（canvas 报新的 chrome 矩形）→ tick 重建区域，
+  中间那几帧胶囊还不在区域里，点击落到下面的视频窗上（`WindowFromPoint` 直接报
+  `SimpleMediaPlayerVideoOverlay`）。加了 `wait_settled()`：外框对齐 + 顶栏两端/胶囊
+  都回到区域里再取样。
+- **顶栏暗不暗要按三通道之和比**：testsrc2 最左那根色条本来就接近黑（60,0,0），
+  除以 3 之后差值只有 19，卡在阈值边缘会误判「没铺满」。改成
+  `sum(带下) - sum(带内) > 12` 且 `sum(带内) < 200`。
+
+真机最终 14 条全 OK（新增四条）：
+
+```text
+OK: 窗口态顶栏铺到窗口最左/最右一列 ((0, 0, 3), (60, 0, 0), (2, 3, 7), (0, 230, 255))
+OK: 双击画面进全屏 3840x2160，画面铺满 (33, 48, 255)，顶栏也铺满
+OK: Esc 从全屏回窗口 1800x1140（窗口态 1800x1140）
+OK: 全屏态点「最大化」回窗口 1800x1140
+ALL OK
+```
+
+#### 已知限制
+
+- 影院模式下 chrome（标题带 + 胶囊）一直可见，没有做"IINA 那样鼠标静止 2 秒自动隐藏"；
+- 全屏只有"铺满所在显示器"一种，不做"无边框覆盖多屏"。
+
+
+---
+
 ## 4. 里程碑与时间线
 
 | 里程碑 | 内容 | 累计工期 |

@@ -158,6 +158,10 @@ pub struct PlayerView {
     chrome_region: Option<(Vec<ChromeRect>, u32)>,
     /// 主窗口当前是不是圆角状态（视频模式才圆，见 `sync_overlay_rect`）。
     corners_rounded: bool,
+    /// 上一次补算客户区（`refresh_client_area`）的时刻，用来限流
+    client_kick: Option<Instant>,
+    /// 上一次因为布局停在旧尺寸而补 `refresh()` 的时刻，用来限流
+    layout_kick: Option<Instant>,
     /// 是否已经把窗口表面的底色改成透明（见 `Render` 里的说明）
     surface_transparent: bool,
     /// GPUI 主窗口句柄（叠加窗口的 z 序基准）
@@ -321,7 +325,7 @@ impl PlayerView {
         let capsule_rect: VideoRectCell = Rc::new(Cell::new(None));
         let maximized = window.is_maximized();
 
-        let this = Self {
+        let mut this = Self {
             engine,
             playlist,
             seek,
@@ -343,6 +347,8 @@ impl PlayerView {
             capsule_rect,
             chrome_region: None,
             corners_rounded: false,
+            client_kick: None,
+            layout_kick: None,
             surface_transparent: false,
             main_hwnd,
             maximized,
@@ -358,6 +364,66 @@ impl PlayerView {
             status_pill: None,
             status_pill_shown: false,
         };
+
+        // 客户区铺满整窗：系统那圈缩放边框（左右各 7 逻辑像素）会让「画面铺外框、
+        // 标题带只能铺客户区」对不上，看就是「顶栏没铺满宽度」（见 window_actions）。
+        // 和 `fit_to_video` 一样必须放到前台任务里：`SetWindowPos` 会同步回调
+        // `WM_SIZE` → 重新布局，而此刻 App 正被借用。
+        if main_hwnd != 0 {
+            let main = main_hwnd;
+            cx.spawn_in(window, async move |this, cx| {
+                window_actions::make_client_full_bleed(main);
+                // 客户区刚变大了一圈，「外框-客户」那份边框厚度已经作废：把
+                // 一次性的 fit 标记清掉，让下一个 tick 按真实几何重新定一次窗口尺寸
+                // （否则第一支视频会短一条边框的高度，底下多出一条黑边）。
+                let _ = this.update(cx, |view, cx| {
+                    view.fit_done = None;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+
+        // 快捷键（全屏的唯一键盘出口）。
+        //
+        // 为什么不用 `cx.bind_keys` + `on_action`：没有焦点元素时 GPUI 把按键派发给
+        // dispatch tree 的**根**，而那一位是 gpui-component 的 `Root`（在我们视图之外），
+        // 挂在自己根节点上的 `on_action` 永远收不到（实测 `dispatch_keystroke` 返回
+        // false、影院状态不动）。App 级的 keystroke 拦截跑在派发**之前**，没有这个前提。
+        let weak = cx.entity().downgrade();
+        this.subscriptions
+            .push(cx.intercept_keystrokes(move |event, window, cx| {
+                if event.keystroke.modifiers.modified() {
+                    return;
+                }
+                let handled = match event.keystroke.key.as_str() {
+                    "escape" => {
+                        // 只有真的在全屏时才吃这个键——否则会把将来的对话框/弹层的 Esc 挡掉
+                        let in_cinema = weak.read_with(cx, |view, _| view.cinema).unwrap_or(false);
+                        if in_cinema {
+                            let _ = weak.update(cx, |view, cx| view.exit_cinema(window, cx));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    "f11" => {
+                        let video = weak
+                            .read_with(cx, |view, _| view.video_active)
+                            .unwrap_or(false);
+                        if video {
+                            let _ = weak.update(cx, |view, cx| view.toggle_cinema(window, cx));
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if handled {
+                    cx.stop_propagation();
+                }
+            }));
 
         // 100ms 轮询：进度同步 + 自动连播 + 叠加窗口跟随 + 窗口尺寸节流落盘
         cx.spawn_in(window, async move |this, cx| loop {
@@ -439,6 +505,14 @@ impl PlayerView {
             self.import_dropped(dropped.into_iter().map(PathBuf::from).collect(), cx);
         }
 
+        // 双击画面 → 全屏播放。视频窗只能把"发生了一次双击"记进队列（它不在 GPUI 的
+        // 上下文里），真正的切换在这里做。延迟 ≤1 帧。
+        for event in video_overlay::take_events() {
+            match event {
+                video_overlay::OverlayEvent::ToggleCinema => self.toggle_cinema(window, cx),
+            }
+        }
+
         // 拖放提示：`drag_over` 的样式回调拿不到 cx，只能留时间戳。
         // 250ms 内还有时间戳 = 仍在拖；没有 = 拖走了，提示自己熄灭。
         let dragging = self
@@ -477,11 +551,7 @@ impl PlayerView {
         // 影院模式只对视频成立：自动连播切到音频（或无视频可播）时必须退出全屏，
         // 否则影院按钮消失、用户被困在全屏里。
         if self.cinema && !self.video_active {
-            self.cinema = false;
-            if window.is_fullscreen() {
-                window.toggle_fullscreen();
-            }
-            cx.notify();
+            self.set_cinema(false, window, cx);
         }
 
         let video_status = if self.video_active {
@@ -513,6 +583,62 @@ impl PlayerView {
 
         // 叠加窗口跟随窗口移动/缩放
         self.sync_overlay_rect(window);
+
+        // 客户区自愈：进出全屏后系统不重算客户区（实测退全屏后窗口已是 1280×731、
+        // 客户区还停在 3840×2010），界面会整块画在旧尺寸上。每帧比一次，不一致就补
+        // 一次 `SWP_FRAMECHANGED`；两次补之间留 300ms，别把它变成死循环。
+        // 和 z 序自愈（`ensure_below`）同一个套路：只查、不一致才动。
+        const CLIENT_KICK_COOLDOWN: Duration = Duration::from_millis(300);
+        if !window_actions::client_matches_window(self.main_hwnd) {
+            let due = self
+                .client_kick
+                .is_none_or(|at| at.elapsed() >= CLIENT_KICK_COOLDOWN);
+            if due {
+                self.client_kick = Some(Instant::now());
+                let main = self.main_hwnd;
+                // 同样要放到前台任务里：`SetWindowPos` 会同步回调 `WM_SIZE` → 重新布局
+                cx.spawn_in(window, async move |_this, _cx| {
+                    window_actions::refresh_client_area(main);
+                })
+                .detach();
+            }
+        }
+
+        // 布局自愈：进出全屏那一下 GPUI 的布局会停在旧尺寸（画面已经全屏，顶栏却
+        // 只画在左上角 853×34 那一小块里、右上角的窗口按钮根本不存在）。判据用
+        // `viewport_size`（布局真正用的那个）和 `window.bounds()` 比。
+        //
+        // 注意：**不能**在这里调 `window.bounds_changed(cx)`——它会把 `bounds_observers`
+        // 全跑一遍，其中就有对本视图的 `update`，而此刻视图正在被 update，直接 panic
+        // （`cannot update PlayerView while it is already being updated`）。
+        // `refresh()` 只标脏、不碰 viewport，对这个病也治不好（实测重绘循环里
+        // viewport 一直是旧值）。真正有效的办法是给窗口补一条 `WM_SIZE`：GPUI 的
+        // 尺寸处理是**幂等**的（只有 lparam），补完布局就按新尺寸重排。
+        const LAYOUT_KICK_COOLDOWN: Duration = Duration::from_millis(300);
+        let viewport = window.viewport_size();
+        let bounds = window.bounds().size;
+        let viewport_stale = (viewport.width.as_f32() - bounds.width.as_f32()).abs() > 0.5
+            || (viewport.height.as_f32() - bounds.height.as_f32()).abs() > 0.5;
+        if viewport_stale {
+            let due = self
+                .layout_kick
+                .is_none_or(|at| at.elapsed() >= LAYOUT_KICK_COOLDOWN);
+            if due {
+                self.layout_kick = Some(Instant::now());
+                persistence::log_session(&format!(
+                    "layout stale: viewport={:.0}x{:.0} window={:.0}x{:.0} -> kick",
+                    viewport.width.as_f32(),
+                    viewport.height.as_f32(),
+                    bounds.width.as_f32(),
+                    bounds.height.as_f32(),
+                ));
+                let main = self.main_hwnd;
+                cx.spawn_in(window, async move |_this, _cx| {
+                    window_actions::kick_layout(main);
+                })
+                .detach();
+            }
+        }
 
         // 窗口尺寸节流落盘（变化后 ~5s 保存一次）
         // 影院模式下 bounds 是全屏尺寸、最大化时是最大化尺寸，都不能当窗口尺寸存
@@ -1078,12 +1204,40 @@ impl PlayerView {
         cx.notify();
     }
 
-    fn toggle_cinema(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.cinema = !self.cinema;
-        if window.is_fullscreen() != self.cinema {
+    /// 进入 / 退出影院（全屏播放）模式。
+    ///
+    /// 影院 = 全屏 + 收起歌单 + 控件浮在画面上。它是**唯一**的全屏入口：
+    /// 双击画面、胶囊上的全屏按钮、标题带的退出按钮、`F11` 都走这里。
+    ///
+    /// 为什么要有这个封装：`cinema` 这个自己记的布尔值和 `window.is_fullscreen()`
+    /// 是两套状态（后者在 GPUI 的执行器里异步翻），两个入口各写一遍必然对不上。
+    fn set_cinema(&mut self, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // 影院只对视频成立：音频模式没有画面可铺，全屏只是把封面拉大，没有意义。
+        let on = on && self.video_active;
+        if self.cinema == on && window.is_fullscreen() == on {
+            return;
+        }
+        self.cinema = on;
+        // 视频窗要知道这件事：全屏时不能再按住画面拖窗体
+        video_overlay::set_cinema(on);
+        if window.is_fullscreen() != on {
             window.toggle_fullscreen();
         }
+        persistence::log_session(&format!(
+            "cinema -> {on} (fullscreen={}, video_active={})",
+            window.is_fullscreen(),
+            self.video_active
+        ));
         cx.notify();
+    }
+
+    fn toggle_cinema(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_cinema(!self.cinema, window, cx);
+    }
+
+    /// 退出全屏回到窗口（`Esc` / 标题带的退出按钮 / 全屏时的最大化按钮）。
+    fn exit_cinema(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_cinema(false, window, cx);
     }
 
     /// 最大化 / 还原。
@@ -1091,7 +1245,16 @@ impl PlayerView {
     /// 不走 `window.zoom_window()`：Windows 后端那句只有 `ShowWindowAsync(SW_MAXIMIZE)`，
     /// 没有还原分支，所以「最大化之后再点一次」什么都不会发生（用户就是这么发现的）。
     /// 见 `crate::window_actions`。
-    fn toggle_maximize(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// 全屏时这个按钮的语义是**回到窗口**：GPUI 进全屏时把 `WS_MAXIMIZEBOX`
+    /// / `WS_CAPTION` 一起摘掉了，此时再 `ShowWindowAsync(SW_MAXIMIZE)` 会把窗口
+    /// 弄成「铺满工作区、但 GPUI 仍认为自己在全屏」的错乱状态——用户点完的感受
+    /// 就是「回不到窗口」。所以这里先退全屏。
+    fn toggle_maximize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cinema || window.is_fullscreen() {
+            self.exit_cinema(window, cx);
+            return;
+        }
         let target = !self.maximized;
         window_actions::set_zoomed(self.main_hwnd, target);
         persistence::log_session(&format!(
@@ -1540,8 +1703,8 @@ impl PlayerView {
                     .items_center()
                     .window_control_area(WindowControlArea::Drag)
                     // 双击标题栏最大化/还原——同样不能走 `window.zoom_window()`
-                    .on_double_click(cx.listener(|this, _e, _window, cx| {
-                        this.toggle_maximize(cx);
+                    .on_double_click(cx.listener(|this, _e, window, cx| {
+                        this.toggle_maximize(window, cx);
                     }))
                     .child(
                         div()
@@ -1597,7 +1760,7 @@ impl PlayerView {
                         if maximized { "还原" } else { "最大化" },
                         false,
                         self.video_active,
-                        cx.listener(|this, _e, _window, cx| this.toggle_maximize(cx)),
+                        cx.listener(|this, _e, window, cx| this.toggle_maximize(window, cx)),
                         cx,
                     ))
                     .child(caption_button(
@@ -2324,6 +2487,36 @@ impl PlayerView {
     ) {
         self.report_info(message.to_string());
         self.flush_errors(window, cx);
+    }
+
+    /// 测试用：影院状态（`Esc` / 双击画面 / 最大化按钮都要能改它）。
+    pub(crate) fn test_cinema(&self) -> bool {
+        self.cinema
+    }
+
+    /// 测试用：自己记的最大化状态（真值在系统那边，见 `toggle_maximize`）。
+    pub(crate) fn test_maximized(&self) -> bool {
+        self.maximized
+    }
+
+    /// 测试用：走「双击画面」那条路——视频窗把事件排进队列，tick 取走执行。
+    ///
+    /// 队列本身是 Win32 侧的静态量（真窗口才有），无头测试直接调同一条处理路径，
+    /// 覆盖的是「事件 → 切换影院」这段逻辑。
+    pub(crate) fn test_on_overlay_event(
+        &mut self,
+        event: crate::video_overlay::OverlayEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            crate::video_overlay::OverlayEvent::ToggleCinema => self.toggle_cinema(window, cx),
+        }
+    }
+
+    /// 测试用：点「最大化」按钮（全屏时它的语义是回到窗口）。
+    pub(crate) fn test_toggle_maximize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_maximize(window, cx);
     }
 }
 
