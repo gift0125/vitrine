@@ -166,7 +166,28 @@ panel_px = sample(img2, lw - 12 - 160, 120)
 print(f"歌单面板内 (.., 120) = {panel_px}   ← 应为面板底色（浅）")
 print(f"歌单展开后画面中心 = {sample(img2, lw / 2, lh / 2)}")
 
-# ---- 3. 按住画面拖动窗体 ----------------------------------------------
+# ---- 3. 最大化：区域不会跟着 SetWindowPos 自动缩放，必须重算 -------------
+# 三个窗口按钮各 46 宽，从右往左是 close / max / min → 最大化键圆心在 lw-69。
+click(lw - 69, 17)
+time.sleep(0.9)
+cw1, ch1 = client_rect()
+lw, lh = cw1 / scale, ch1 / scale
+img_max = grab(out_dir / "floating-03-maximized.png")
+max_band = sample(img_max, 8, 17)
+max_mid = sample(img_max, lw / 2, lh / 2)
+print(f"最大化后 client = {cw1}x{ch1}；标题带 (8,17) = {max_band}；画面中心 = {max_mid}")
+
+# 还原用 ShowWindow(SW_RESTORE) 而不是再点一次按钮：点按钮会走 GPUI 那层，
+# 时序不稳（上一步就出现过没还原成功、拖动时被系统当成"拖最大化窗口"还原）。
+user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+time.sleep(0.4)
+user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, phys_w, phys_h, SWP_SHOWWINDOW)
+time.sleep(0.8)
+cw0, ch0 = client_rect()
+lw, lh = cw0 / scale, ch0 / scale
+print(f"还原后 client = {cw0}x{ch0}")
+
+# ---- 4. 按住画面拖动窗体 ----------------------------------------------
 before = window_rect()
 ox, oy = client_origin()
 start = (ox + round(lw * 0.5 * scale), oy + round(lh * 0.45 * scale))
@@ -198,6 +219,11 @@ ok = True
 if sum(panel_px[:3]) < 600:
     print(f"FAIL: 歌单面板没展开（取样仍是画面 {panel_px}）")
     ok = False
+if sum(max_band[:3]) > 200:
+    print(f"FAIL: 最大化后标题带没挖出来（取样 {max_band}，区域没重算）")
+    ok = False
+else:
+    print(f"OK: 最大化后标题带仍是挖出来的深色 {max_band}")
 if dx == 0 and dy == 0:
     print("FAIL: 按住画面没有拖动窗口")
     ok = False
