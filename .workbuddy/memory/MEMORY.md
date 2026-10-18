@@ -5,6 +5,7 @@
 | 想知道什么 | 看哪 |
 |---|---|
 | 色板 / 控制栏几何 / UI 样式坑 / 质感三层 / 控制层自动淡出 | `design-spec.md` |
+| **L4 液态玻璃**（实验档，只在 HTML） | `spec.json → texture_layers.L4_liquid_glass` + `2026-10-18.md` 第 26 节 |
 | Win 后端行为 / 窗口过程 / 全屏与尺寸 / 键盘派发 / 无头测试 | `win32-gpui.md` |
 | libmpv 选型 / 线程契约 / **SW render API** / 图集 / 验收竞态 | `libmpv-migration.md` |
 | 构建打包 / `shot.py` / 验收脚本坑 / 设计导出管线 / ps1 编码 | `tooling.md` |
@@ -40,3 +41,8 @@
 - 快捷键必须走 `App::intercept_keystrokes`（`bind_keys` + `on_action` 收不到，无焦点时派发给根）。
 - 字体只取系统自带族（Win `Microsoft YaHei UI`）；浅底面板上的按钮用主题色，别用 `overlay::*`。
 - 验收脚本：胶囊左沿走 `capsule_left()`、每次点击记 `WindowFromPoint` 的类名、有空闲间隔先 `wake()`。
+- **玻璃层与压暗层必须分层**：折射层（canvas / 纹理）是不透明的，会整块盖掉父元素的
+  `background`——染色与自适应压暗要画在它**上面**，否则等于没写。
+- **液态玻璃要进代码前先修采样**：L3 现在是「整块缩略图铺满胶囊」，**不对位**，做折射
+  必须换成矩形区域对位采样；且折射要两份模糊（体部 ≈ 32 / 边圈 ≈ 7）。
+- 并行会话会顺手 `git add -A`：判断「这轮改了多少」看工作区 vs HEAD，别信 `git diff` 行数。
