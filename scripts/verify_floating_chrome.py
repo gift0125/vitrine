@@ -114,35 +114,63 @@ VK_DOWN = 0x28
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 # 控制栏几何（逻辑像素，必须和 crates/app/src/player_view.rs 的常数一致）：
-# 胶囊固定 760×92、距窗口下沿 24、内边距 20/12；ⓘ 在胶囊内左侧，信息卡
-# 240×180 浮在胶囊上方 16。写死这些数字是因为验收脚本按**像素**判定，
-# 拿不到应用的布局树；对不上就说明布局被改过，应该同步这里。
+# 胶囊固定 760×92、距窗口下沿 24、内边距 20/8；进度区两行（时间行 16 + 4 + 轨道 4）；
+# ⓘ 在胶囊内左侧，信息卡 240×180 浮在胶囊上方 16。写死这些数字是因为验收脚本按
+# **像素**判定，拿不到应用的布局树；对不上就说明布局被改过，应该同步这里。
 CAPSULE_WIDTH = 760.0
 CAPSULE_HEIGHT = 92.0
 CAPSULE_INSET = 24.0
 CAPSULE_PAD_X = 20.0
+CAPSULE_PAD_Y = 8.0
+PROGRESS_HEIGHT = 24.0
+CONTROLS_ROW = 44.0
+# 走带行中心距胶囊上沿的距离：8（padding）+ 24（进度区）+ 8（间距）+ 22（半个走带行）
+CONTROLS_Y_OFFSET = CAPSULE_PAD_Y + PROGRESS_HEIGHT + 8 + CONTROLS_ROW / 2
 INFO_WIDTH = 240.0
 INFO_HEIGHT = 180.0
 INFO_GAP = 16.0
+PLAYLIST_WIDTH = 320.0
+PLAYLIST_INSET = 24.0
+
+
+def capsule_left():
+    """胶囊左沿（逻辑 x）。
+
+    歌单展开时控制栏**居中于剩余画面**，不是整窗居中：spec
+    `playlist_panel.expanded_state_control_capsule.x = 88`，即可用区
+    `1280 − 320 − 24 = 936` → `(936 − 760) / 2 = 88`。胶囊左沿跟着面板走，
+    这是"展开态"唯一和静止态不同的地方。
+
+    以前这里写死成整窗居中，于是"再点一次收起歌单"那一下点到胶囊外面去了：
+    面板一直开着，后面每个按钮的坐标都偏 344（= 320 + 24），连着报出
+    "字幕/音轨没反应""ⓘ 没反应"一串假失败——真正的原因只有这一个。
+    """
+    avail = lw - (PLAYLIST_WIDTH + PLAYLIST_INSET) if panel_open() else lw
+    return (avail - CAPSULE_WIDTH) / 2
+
+
+def controls_center_y():
+    """走带行中心（逻辑 y）。胶囊贴窗口下沿 24，行中心距胶囊上沿 62（见常数注释）。"""
+    return lh - (CAPSULE_INSET + CAPSULE_HEIGHT - CONTROLS_Y_OFFSET)
 
 
 def right_group_button(index_from_right):
-    """控制栏右组第 N 个按钮的中心（0 = 主题切换，从右往左数）。
+    """控制栏右组第 N 个按钮的中心（0 = 最右那枚，从右往左数）。
 
-    胶囊固定 760 宽、水平居中，右组从「胶囊右沿 − padding 20」开始往左排：
-    每个按钮 20 宽、间距 20，所以第 N 个的中心是 `右沿 − 10 − N×40`。
-    视频模式下的顺序（右→左）：主题 0、全屏 1、列表 2、音轨 3、字幕 4。
+    右组从「胶囊右沿 − padding 20」开始往左排：按钮盒 24、间距 16 → 中心距 40，
+    所以第 N 个的中心是 `右沿 − 12 − N×40`。
+    视频模式下的顺序（右→左）：全屏 0、列表 1、主题 2、音轨 3、字幕 4。
 
     以前按「胶囊铺满整宽」写成 `lw - 123`：胶囊收窄之后那个点落到胶囊外的
     画面上，点击被叠加窗吃掉——表现为"点列表没反应"，实际是根本没点中。
     """
-    group_right = (lw + CAPSULE_WIDTH) / 2 - CAPSULE_PAD_X
-    return group_right - 10 - index_from_right * 40, lh - (CAPSULE_INSET + 12 + 22)
+    group_right = capsule_left() + CAPSULE_WIDTH - CAPSULE_PAD_X
+    return group_right - 12 - index_from_right * 40, controls_center_y()
 
 
 def playlist_button():
-    """「列表」按钮的中心（逻辑坐标）。"""
-    return right_group_button(2)
+    """「列表」按钮的中心（逻辑坐标）。视频模式下它在最右内侧第二位。"""
+    return right_group_button(1)
 
 # 双击：叠加窗认这一组消息（真实双击就是它们，见 `double_click`）
 WM_LBUTTONDOWN = 0x0201
@@ -302,6 +330,15 @@ def wait_region(lx, ly, want, timeout=3.0):
     return region_contains(lx, ly) == want
 
 
+def panel_open():
+    """歌单面板是否展开。**只能**在 `wait_settled()` 之后问：
+
+    区域还没按视频区算出来时整窗都在区域里，这个判断会假通过。
+    取样点落在面板中线上——展开时那里是浅色面板底，收起时是画面。
+    """
+    return region_contains(lw - PLAYLIST_INSET - PLAYLIST_WIDTH / 2, 120)
+
+
 def wait_settled(timeout=3.0):
     """等一切跟上新的窗口几何：外框对齐 + 顶栏两端/胶囊都回到区域里。
 
@@ -428,8 +465,11 @@ def grab(path=None):
     return img
 
 
+CHROME_MISSES = []
+
+
 def click(lx, ly):
-    """真实光标点击。
+    """真实光标点击（只用于主窗口上的 chrome：标题栏按钮 / 胶囊 / 面板）。
 
     不能只 PostMessage：GPUI 的命中测试用的是光标位置，投递的 lparam 不总被采信
     （这条踩过坑，记在项目备忘里）。这里窗口位置稳定，直接用真实输入。
@@ -442,6 +482,11 @@ def click(lx, ly):
     buf = ctypes.create_unicode_buffer(128)
     user32.GetClassNameW(hit, buf, 128)
     print(f"  点击 逻辑({lx:.0f},{ly:.0f}) → 屏幕({sx},{sy}) 窗口={hit} 类='{buf.value}'")
+    if buf.value != "Zed::Window":
+        # 记下来在判定段汇总：坐标偏出胶囊时点击会落到下层视频叠加窗上，
+        # 界面毫无反应，而截图看不出差别（这一轮就吃了"坐标偏 344"的亏）。
+        CHROME_MISSES.append((round(lx), round(ly), buf.value))
+        print(f"  ⚠ 该点不在主窗（落到 {buf.value}），按钮必然点不中——坐标和布局对不上")
     # 先停在旁边再挪进去：`SetCursorPos` 到**同一个点**不产生 WM_MOUSEMOVE，
     # 光标已经在那儿时窗口就不知道鼠标进来了，随后的 LEFTDOWN 可能被当成
     # 「在窗外按下」而丢掉（实测：歌单"点了没反应"就是这么来的）。
@@ -680,26 +725,18 @@ print(f"胶囊内左侧 (40,{lh - 54:.0f}) = {caps_a}")
 print(f"胶囊内右侧 ({lw * 0.55:.0f},{lh - 54:.0f}) = {caps_b}   ← 两处色差 {spread}（>25 才算透出画面）")
 
 
-def panel_open():
-    """歌单面板是否展开。**只能**在 `wait_settled()` 之后问：
-
-    区域还没按视频区算出来时整窗都在区域里，这个判断会假通过。
-    """
-    return region_contains(lw - 172, 120)
-
-
 def toggle_playlist(want_open, tries=5):
     """把歌单切到目标状态，最多试 `tries` 次。
 
     单次真实点击偶尔会被系统吞掉（`mouse_event` 的 down/up 与 GPUI 的
     激活/命中是两套时序），这不是应用的问题；这里按**结果**重试。
     每次先看当前状态再决定要不要点——盲目连点会在两次点击都成功时互相抵消。
+    按钮位置也必须每次重算：展开态胶囊是左移的（`capsule_left()`）。
     """
-    px, py = playlist_button()
     for _ in range(tries):
         if panel_open() == want_open:
             return True
-        click(px, py)
+        click(*playlist_button())
         deadline = time.time() + 1.0
         while time.time() < deadline:
             if panel_open() == want_open:
@@ -719,11 +756,12 @@ def refresh_geometry():
 # ---- 3. 展开歌单：面板浮在右侧，画面不被挤窄 ---------------------------
 opened = toggle_playlist(True)
 img2 = grab(out_dir / "floating-02-playlist.png")
-panel_px = sample(img2, lw - 12 - 160, 120)
+panel_mid = lw - PLAYLIST_INSET - PLAYLIST_WIDTH / 2
+panel_px = sample(img2, panel_mid, 120)
 print(f"歌单面板内 (.., 120) = {panel_px}   ← 应为面板底色（浅）")
 print(f"歌单展开后画面中心 = {sample(img2, lw / 2, lh / 2)}")
 # 面板浮在画面上，但它**不在**原来的窗口区域里：区域必须把它加回去（否则被剪掉）。
-panel_inside = region_contains(lw - 172, 120)
+panel_inside = region_contains(panel_mid, 120)
 print(f"歌单面板区在窗口区域里 = {panel_inside}   ← 必须是 True，否则面板被剪掉")
 closed = toggle_playlist(False)  # 收起来，别挡住后面的取样
 print(f"再点一次收起歌单 = {closed}")
@@ -942,33 +980,54 @@ print(f"字幕/音轨 → cycle 命令 {cycles_before}→{cycles_after} 条")
 # 盖住。判据用像素而非 `try_find`：区域没减对时节点是在的，只是用户看不见。
 cw4, ch4 = client_rect()
 cw4, ch4 = cw4 / scale, ch4 / scale
-info_pt = (
-    (cw4 - CAPSULE_WIDTH) / 2 + CAPSULE_PAD_X + 10,
-    ch4 - (CAPSULE_INSET + 12 + 22),
-)
+# ⓘ 是左侧组第一枚：胶囊左沿 + padding 20 + 半个 20 盒。胶囊左沿不是 `x = 24`
+# 也不是整窗居中——歌单展开时它会左移（这里面板是收起的，但仍然走同一个函数，
+# 免得以后又写死一份）。
+info_pt = (capsule_left() + CAPSULE_PAD_X + 10, controls_center_y())
 # 胶囊底边 24 + 胶囊高 92 + 间距 16 → 卡片底边，再往上 180 是顶边
 CARD_TOP = ch4 - (CAPSULE_INSET + CAPSULE_HEIGHT + INFO_GAP + INFO_HEIGHT)
 CARD_LEFT = CAPSULE_INSET
 card_probe = (CARD_LEFT + INFO_WIDTH / 2, CARD_TOP + INFO_HEIGHT / 2)  # 卡片正中
 wait_region(*info_pt, True)
-
 info_before = sample(grab(out_dir / "verify-info-0-before.png"), *card_probe)
-click(*info_pt)
+
+
+def info_toggle(want_open, tries=3):
+    """点 ⓘ 直到卡片真的到了目标状态，返回 (是否到位, 最后一次采样)。
+
+    和歌单一样按**结果**重试：单次真实点击偶尔会被系统吞掉（这一轮就漏了第一次，
+    卡片在第二次点击才出来），判据不变——三次都点不动才算应用的问题。
+    """
+    px = info_before
+    for attempt in range(1, tries + 1):
+        click(*info_pt)
+        if want_open:
+            px = wait_darker(card_probe, info_before)
+            if sum(px[:3]) + 80 < sum(info_before[:3]):
+                return True, px
+        else:
+            cleared = wait_region_clear(CARD_LEFT + 10, CARD_TOP + 10)
+            px = sample(grab(), *card_probe)
+            if cleared:
+                return True, px
+        print(f"  第 {attempt} 次点 ⓘ 没{'展开' if want_open else '收起'}卡片，重试")
+    return False, px
+
+
 # 轮询到卡片画上去为止（固定 sleep 会拍到"点击还没被处理"的那一帧）
-info_open_px = wait_darker(card_probe, info_before)
+info_opened, info_open_px = info_toggle(True)
 grab(out_dir / "verify-info-1-open.png")
 # 两个角点都要归主窗口：左上角的文字区 + 右下角的空白玻璃
 info_in_region = region_contains(CARD_LEFT + 10, CARD_TOP + 10) and region_contains(
     CARD_LEFT + INFO_WIDTH - 10, CARD_TOP + INFO_HEIGHT - 10
 )
-click(*info_pt)
 # 收起同理：等那块真的从区域里退出去，别按 0.45s 猜
-info_hole_gone = wait_region_clear(CARD_LEFT + 10, CARD_TOP + 10)
-info_closed_px = sample(grab(out_dir / "verify-info-2-closed.png"), *card_probe)
-info_closed_region = not info_hole_gone
+info_closed_ok, info_closed_px = info_toggle(False)
+info_hole_gone = info_closed_ok
 print(
-    f"信息卡 {card_probe} 采样：之前 {info_before} → 展开 {info_open_px} → "
-    f"收起 {info_closed_px}；区域 展开={info_in_region} 收起={info_closed_region}"
+    f"信息卡 {card_probe} 采样：之前 {info_before} → 展开 {info_open_px}"
+    f"（到位={info_opened}）→ 收起 {info_closed_px}（到位={info_closed_ok}）；"
+    f"区域 展开={info_in_region} 收起={info_hole_gone}"
 )
 
 proc.terminate()
@@ -1024,8 +1083,14 @@ if sum(panel_px[:3]) < 600:
 elif not panel_inside:
     print("FAIL: 面板展开后那块区域没加回主窗口区域，面板会被剪掉")
     ok = False
+elif not closed:
+    print(
+        "FAIL: 再点一次「列表」没收起歌单——展开态胶囊居中于剩余画面"
+        "（`capsule_left()`），坐标按整窗居中算就会点到胶囊外面"
+    )
+    ok = False
 else:
-    print(f"OK: 歌单面板浮在画面右侧 {panel_px}，且区域已把它加回去")
+    print(f"OK: 歌单面板浮在画面右侧 {panel_px}，区域已把它加回去，再点收回")
 if not win_band_ok:
     print(f"FAIL: 窗口态顶栏没铺满宽度（两端取样 {win_band_px}）")
     ok = False
@@ -1101,7 +1166,7 @@ else:
     print("OK: 字幕/音轨按钮各把一条 cycle 发给了 mpv")
 # 深玻璃 ≈ (27,29,20)，彩条那一块和 ≈ 300+：用亮度差而不是颜色值，换素材也不飘
 info_dark = sum(info_open_px[:3]) + 80 < sum(info_before[:3])
-if not info_dark:
+if not info_dark or not info_opened:
     print(f"FAIL: 点 ⓘ 之后那块还是画面（{info_before} → {info_open_px}，卡片没画出来）")
     ok = False
 elif not info_in_region:
@@ -1112,4 +1177,9 @@ elif not info_hole_gone:
     ok = False
 else:
     print(f"OK: ⓘ 信息卡压住画面（{info_before} → {info_open_px}），再点收回 {info_closed_px}")
+if CHROME_MISSES:
+    # 坐标和布局对不上时点击会静默落到叠加窗上，症状是"点了没反应"——先报这个，
+    # 否则上面那些 FAIL 会被误当成功能坏掉。
+    print(f"FAIL: {len(CHROME_MISSES)} 次点击没落在主窗上（首次 {CHROME_MISSES[0]}）")
+    ok = False
 print("ALL OK" if ok else "SOME CHECKS FAILED")

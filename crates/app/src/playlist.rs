@@ -6,11 +6,11 @@
 
 use player_core::TrackMeta;
 
+use crate::persistence::SortOrder;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{ListDelegate, ListItem, ListState};
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, IndexPath, Sizable as _};
+use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, IndexPath};
 use gpui_kit::prelude::*;
 use gpui_kit::{
     div, px, transparent_black, App, Context, FontWeight, SharedString, WeakEntity, Window,
@@ -45,6 +45,8 @@ pub struct PlaylistDelegate {
     selected: Option<IndexPath>,
     /// 当前播放项
     confirmed: Option<IndexPath>,
+    /// 曲目路径的**加入顺序**（第一次排序时拍快照），用于「排序：加入顺序」还原
+    added: Vec<String>,
     view: WeakEntity<PlayerView>,
 }
 
@@ -54,6 +56,7 @@ impl PlaylistDelegate {
             tracks,
             selected: None,
             confirmed: None,
+            added: Vec::new(),
             view,
         }
     }
@@ -70,9 +73,34 @@ impl PlaylistDelegate {
         self.tracks.get(row)
     }
 
+    /// 补一条曲目的时长（秒）。返回是否真的写进去了。
+    ///
+    /// 音频的时长在入列时就能从解码器问出来，视频不能——mpv 要等起播之后才报
+    /// `duration`。所以视频的 `duration_secs` 入列时是 `None`，页脚那行
+    /// 「N 个文件 · 总时长」和行内第二行都会空着；由 tick 在拿到 mpv 的时长后补进来。
+    /// 只在原来是 `None`（或明显不对）时写，避免覆盖已知值、也避免每帧都改。
+    pub fn set_duration(&mut self, row: usize, secs: f64) -> bool {
+        let Some(track) = self.tracks.get_mut(row) else {
+            return false;
+        };
+        if secs <= 0.5 {
+            return false;
+        }
+        if track.duration_secs.is_some_and(|d| (d - secs).abs() < 1.0) {
+            return false;
+        }
+        track.duration_secs = Some(secs);
+        true
+    }
+
     /// 追加曲目；返回新曲目起始下标。
     pub fn append_tracks(&mut self, tracks: Vec<TrackMeta>) -> usize {
         let start = self.tracks.len();
+        // 已经拍过「加入顺序」快照时，新加的也要进快照尾部，否则它们会被当成
+        // 「未知路径」排到所有老曲目后面（排序一次后新拖进来的歌顺序就乱了）
+        if !self.added.is_empty() {
+            self.added.extend(tracks.iter().map(|t| t.path.clone()));
+        }
         self.tracks.extend(tracks);
         start
     }
@@ -80,12 +108,16 @@ impl PlaylistDelegate {
     /// 移除指定曲目。选中/播放中索引由调用方（view）修正。
     pub fn remove_at(&mut self, row: usize) {
         if row < self.tracks.len() {
-            self.tracks.remove(row);
+            let path = self.tracks.remove(row).path;
+            if let Some(pos) = self.added.iter().position(|p| *p == path) {
+                self.added.remove(pos);
+            }
         }
     }
 
     pub fn clear(&mut self) {
         self.tracks.clear();
+        self.added.clear();
         self.selected = None;
         self.confirmed = None;
     }
@@ -97,6 +129,9 @@ impl PlaylistDelegate {
         }
         let track = self.tracks.remove(from);
         self.tracks.insert(to, track);
+        // 手动拖过之后「加入顺序」就该等于用户现在的排列：清掉快照，
+        // 下次 `sort_by(Added)` 会按当前顺序重新拍一张
+        self.added.clear();
         self.selected = self
             .selected
             .map(|ix| IndexPath::new(remap_index(ix.row, from, to)));
@@ -113,6 +148,74 @@ impl PlaylistDelegate {
     /// 当前播放曲目下标。
     pub fn confirmed_row(&self) -> Option<usize> {
         self.confirmed.map(|ix| ix.row)
+    }
+
+    /// 当前键盘/悬停选中行（面板底部「移除」优先删它）。
+    pub fn selected_row(&self) -> Option<usize> {
+        self.selected.map(|ix| ix.row)
+    }
+
+    /// 按指定方式重排，返回**当前播放项**重排后的新下标。
+    ///
+    /// 「加入顺序」靠 `added`（路径的插入顺序）还原：`tracks` 会被原地排序，不留
+    /// 一份路径顺序就再也回不到"我刚拖进来的那个顺序"了。
+    ///
+    /// 同一路径可以出现多次（同一首歌加两次），配对时按出现次序依次消费 `added`
+    /// 里的位置，而不是一律取第一次出现的下标——否则重复项全部并列，稳定性全靠
+    /// 运气。完全相同的路径本来就无法区分「哪个是哪个」，这里只保证不并列。
+    pub fn sort_by(&mut self, order: SortOrder) -> Option<usize> {
+        if order == SortOrder::Added && self.added.is_empty() {
+            return self.confirmed_row();
+        }
+        if self.added.is_empty() {
+            self.added = self.tracks.iter().map(|t| t.path.clone()).collect();
+        }
+
+        let mut used = vec![false; self.added.len()];
+        let ranks: Vec<usize> = self
+            .tracks
+            .iter()
+            .map(
+                |t| match (0..self.added.len()).find(|&i| !used[i] && self.added[i] == t.path) {
+                    Some(i) => {
+                        used[i] = true;
+                        i
+                    }
+                    None => usize::MAX,
+                },
+            )
+            .collect();
+
+        let mut ix: Vec<usize> = (0..self.tracks.len()).collect();
+        match order {
+            SortOrder::Added => ix.sort_by_key(|&i| ranks[i]),
+            SortOrder::Title => ix.sort_by(|&a, &b| {
+                self.tracks[a]
+                    .title
+                    .to_lowercase()
+                    .cmp(&self.tracks[b].title.to_lowercase())
+                    .then(ranks[a].cmp(&ranks[b]))
+            }),
+            SortOrder::Duration => ix.sort_by(|&a, &b| {
+                let da = self.tracks[a].duration_secs.unwrap_or(f64::MAX);
+                let db = self.tracks[b].duration_secs.unwrap_or(f64::MAX);
+                da.total_cmp(&db).then(ranks[a].cmp(&ranks[b]))
+            }),
+        }
+
+        let current_path = self
+            .confirmed
+            .and_then(|i| self.tracks.get(i.row))
+            .map(|t| t.path.clone());
+
+        // 按 `ix` 重排（`Option` take 一遍，避免给 TrackMeta 加 Clone）
+        let mut slots: Vec<Option<TrackMeta>> = self.tracks.drain(..).map(Some).collect();
+        self.tracks = ix.into_iter().filter_map(|i| slots[i].take()).collect();
+
+        let new_row = current_path.and_then(|path| self.tracks.iter().position(|t| t.path == path));
+        self.confirmed = new_row.map(IndexPath::new);
+        self.selected = None;
+        new_row
     }
 }
 
@@ -147,8 +250,9 @@ impl ListDelegate for PlaylistDelegate {
         let theme = cx.theme();
         let view = self.view.clone();
 
-        // 当前曲目的视觉线索按设计稿来：行底色（Mauve 8%）+ 标题 Mauve + 序号位换成
-        // 均衡器图标。**不做左侧强调条**——设计稿的列表行是纯平面，没有装饰条。
+        // 当前曲目的视觉线索按设计稿来：行底色（Mauve 12%）+ 1px Mauve 描边 +
+        // 标题 Mauve + 序号位换成均衡器图标。**不做左侧强调条**——设计稿的列表行
+        // 是一颗圆角胶囊，没有装饰条。
         let accent = theme.primary;
         let title_color = if is_current { accent } else { theme.foreground };
         let row_bg = if is_current {
@@ -175,16 +279,19 @@ impl ListDelegate for PlaylistDelegate {
             title: track.title.clone(),
         };
         let from_row = ix.row;
-        let view_remove = self.view.clone();
-        let remove_label = SharedString::from(format!("从播放列表移除 {}", track.title));
 
         Some(
             ListItem::new(ix)
                 .h(px(48.))
-                .px(px(8.))
+                .px(px(10.))
                 .py(px(0.))
-                .rounded(px(8.))
+                .rounded(px(10.))
                 .bg(row_bg)
+                // 当前项多一圈 1px Mauve 描边：只靠底色在浅底面板上几乎看不出来
+                // （`theme.list_active` 是 Mauve 8%，和 `mantle` 面板底色太近）
+                .when(is_current, |el| {
+                    el.border_1().border_color(accent.opacity(0.35))
+                })
                 .accessibility_label(SharedString::from(format!(
                     "{}{}",
                     track.title,
@@ -247,22 +354,8 @@ impl ListDelegate for PlaylistDelegate {
                                 ),
                         ),
                 )
-                // 行尾删除按钮（设计稿没有这个入口，压到最弱层级，别抢标题）
-                .suffix(move |_, cx| {
-                    let view = view_remove.clone();
-                    Button::new(SharedString::from(format!("remove-{from_row}")))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
-                        .text_color(cx.theme().muted_foreground)
-                        .tooltip("从播放列表移除")
-                        .accessibility_label(remove_label.clone())
-                        .on_click(move |_, _, cx| {
-                            let _ = view.update(cx, |view, cx| {
-                                view.remove_track(from_row, cx);
-                            });
-                        })
-                })
+                // 行内不再放删除按钮：设计稿的行是一条干净的胶囊，删除入口在面板
+                // 底部的「−」。以前那枚 ✕ 每行都在，十行就是十个小叉，把标题压没了。
                 // 拖拽排序
                 .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
                 .drag_over::<DragTrack>(|style, _, _, cx| style.bg(cx.theme().drop_target))
@@ -317,7 +410,9 @@ impl ListDelegate for PlaylistDelegate {
             .child(Icon::new(IconName::ListMusic).size_10())
             .child(Label::new("播放列表为空"))
             .child(
-                Label::new("点击上方 + 添加音频文件，或 +📁 添加文件夹")
+                // 入口在**面板底部**（设计稿把 + / 📁 / − / 清空 放在 footer），
+                // 别再写「上方」——那会把人指到标题栏去
+                Label::new("用底部的 + 添加文件，或 📁 添加文件夹")
                     .text_xs()
                     .text_color(cx.theme().muted_foreground),
             )

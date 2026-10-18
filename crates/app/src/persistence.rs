@@ -14,12 +14,90 @@ pub struct PlaylistFile {
     pub current_index: Option<usize>,
 }
 
+/// 循环模式（设计稿面板底部那一枚「循环」）。
+///
+/// 默认 `All`：旧版 `skip()` 一直用 `rem_euclid` 首尾相接，行为不变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeatMode {
+    /// 播完最后一首就停
+    Off,
+    /// 列表循环
+    #[default]
+    All,
+    /// 单曲循环
+    One,
+}
+
+impl RepeatMode {
+    /// 点一下切到下一档：关 → 列表 → 单曲 → 关。
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::All,
+            Self::All => Self::One,
+            Self::One => Self::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "循环：关",
+            Self::All => "循环：列表",
+            Self::One => "循环：单曲",
+        }
+    }
+
+    pub fn is_on(self) -> bool {
+        self != Self::Off
+    }
+}
+
+/// 播放列表排序方式（设计稿面板底部的「排序」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SortOrder {
+    /// 加入顺序（默认，等价于「不排序」）
+    #[default]
+    Added,
+    /// 按标题（中文按字符序，够用且可预测）
+    Title,
+    /// 按时长从短到长
+    Duration,
+}
+
+impl SortOrder {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Added => Self::Title,
+            Self::Title => Self::Duration,
+            Self::Duration => Self::Added,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Added => "排序：加入顺序",
+            Self::Title => "排序：标题",
+            Self::Duration => "排序：时长",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     /// 0.0 ~ 1.0
     pub volume: f32,
     pub window_width: f32,
     pub window_height: f32,
+    /// 循环模式（老配置文件没有这个字段 → 取 `All`，和旧行为一致）
+    #[serde(default)]
+    pub repeat: RepeatMode,
+    /// 随机播放
+    #[serde(default)]
+    pub shuffle: bool,
+    /// 播放列表排序
+    #[serde(default)]
+    pub sort: SortOrder,
 }
 
 impl Default for Settings {
@@ -28,6 +106,9 @@ impl Default for Settings {
             volume: 0.7,
             window_width: 1040.0,
             window_height: 680.0,
+            repeat: RepeatMode::All,
+            shuffle: false,
+            sort: SortOrder::Added,
         }
     }
 }

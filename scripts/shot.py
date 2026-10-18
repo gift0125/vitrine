@@ -1,11 +1,18 @@
 """启动应用 → 置顶定位 → 截客户区。用于对照设计稿做视觉验收。
 
 用法：python scripts/shot.py <输出png> [--dark] [--w 1040] [--h 680]
-                              [--click "x,y"]... [--wait 2.0] [--keep]
+                              [--click "x,y"]|--real-click "x,y"]...
+                              [--wait 2.0] [--keep]
                               [--margin 16] [-- <透传给应用的参数>]
 
 --click 可以给多次，按顺序投递点击（例如先展开播放列表、再点某一集）。
 `--` 之后的参数原样传给应用（例如 `-- --play D:\\movie.mp4` 直接起播）。
+
+`--click` 走 `PostMessage`（不移动真实光标，截图里不会有悬停态），但 GPUI 的命中
+测试读的是**光标位置**，投递的消息偶发不生效（表现为"点了没反应"，而同一坐标在
+验收脚本里用真实输入点就正常）。要点的东西一旦有状态（展开面板、弹信息卡），
+用 `--real-click`：走真实光标 + `mouse_event`，点完把光标停到标题带左上角，
+免得截图里留下悬停高亮。
 
 --w/--h 是**逻辑**尺寸（与设计稿 1280×800 同一坐标系）；脚本按屏幕缩放比换算成
 物理像素，截完再缩回逻辑尺寸，这样高 DPI 下也是 1:1 的清晰图。
@@ -51,9 +58,12 @@ wait = float(args[args.index("--wait") + 1]) if "--wait" in args else 1.5
 # 只截客户区就看不到它们。
 margin = int(args[args.index("--margin") + 1]) if "--margin" in args else 0
 clicks = []
+real_clicks = []
 for i, a in enumerate(args):
     if a == "--click":
         clicks.append([int(v) for v in args[i + 1].split(",")])
+    elif a == "--real-click":
+        real_clicks.append([int(v) for v in args[i + 1].split(",")])
 # `--` 之后的参数透传给应用（例如 --play 某文件）
 passthrough = args[args.index("--") + 1:] if "--" in args else []
 
@@ -122,6 +132,13 @@ def client_size():
     return cr.right, cr.bottom
 
 
+def origin():
+    """客户区左上角的屏幕坐标（真实光标点击要用）。"""
+    pt = wintypes.POINT(0, 0)
+    user32.ClientToScreen(hwnd, ctypes.byref(pt))
+    return pt.x, pt.y
+
+
 def wait_settled():
     """等客户区尺寸连续两次采样一致——SetWindowPos 之后 WM_SIZE 还没处理完就量，
     会拿到上一次的尺寸，按它算修正量会把窗口越改越大。"""
@@ -173,6 +190,25 @@ for click in clicks:
     time.sleep(0.08)
     user32.PostMessageW(hwnd, 0x0202, 0, lparam)  # WM_LBUTTONUP
     time.sleep(0.35)
+
+# 真实光标点击：先停在旁边再挪进去（同一个点不产生 WM_MOUSEMOVE，随后的
+# LEFTDOWN 可能被当成"在窗外按下"而丢掉）。全部点完把光标停到标题带左上角，
+# 那里没有悬停高亮。
+for click in real_clicks:
+    ox, oy = origin()
+    sx, sy = ox + round(click[0] * scale), oy + round(click[1] * scale)
+    user32.SetCursorPos(sx - 40, sy)
+    time.sleep(0.12)
+    user32.SetCursorPos(sx, sy)
+    time.sleep(0.2)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+    time.sleep(0.08)
+    user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+    time.sleep(0.5)
+if real_clicks:
+    ox, oy = origin()
+    user32.SetCursorPos(ox + round(8 * scale), oy + round(8 * scale))
+    time.sleep(0.25)
 time.sleep(wait)
 
 rect = wintypes.RECT()

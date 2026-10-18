@@ -390,6 +390,35 @@ impl VideoEngine {
         self.status.lock().map(|s| s.clone()).unwrap_or_default()
     }
 
+    /// 当前文件的章节：`(起始秒, 标题)`，按时间升序。
+    ///
+    /// 走 `chapter-list/{i}/time|title` 这种**数组子路径**，而不是把
+    /// `MPV_FORMAT_NODE` 的联合体搬进 Rust（那要多定义 3 个 `#[repr(C)]` 结构 +
+    /// 一个 union，还得自己 `mpv_free_node_contents`）。mpv 属性系统原生支持
+    /// `list/index/field`，数字类还会做格式转换，所以 `chapters`（int64）也能用
+    /// `get_property_f64` 读。
+    ///
+    /// 上限 500：坏文件里章节数可能是垃圾值，别让一次读取把 UI 拖死。
+    pub fn chapters(&self) -> Vec<(f64, String)> {
+        let count = self
+            .mpv
+            .get_property_f64(self.ctx.raw(), "chapters")
+            .unwrap_or(0.0);
+        let count = count.max(0.0).min(500.0) as usize;
+        (0..count)
+            .filter_map(|i| {
+                let time = self
+                    .mpv
+                    .get_property_f64(self.ctx.raw(), &format!("chapter-list/{i}/time"))?;
+                let title = self
+                    .mpv
+                    .get_property_string(self.ctx.raw(), &format!("chapter-list/{i}/title"))
+                    .unwrap_or_default();
+                Some((time, title))
+            })
+            .collect()
+    }
+
     /// 取走并清除「最近一次加载/解码失败」标记（UI 每轮轮询调用一次）。
     pub fn take_error(&self) -> Option<String> {
         let mut st = self.status.lock().ok()?;

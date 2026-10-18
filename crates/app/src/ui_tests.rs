@@ -41,6 +41,11 @@ fn fresh_dir(tag: &str) -> PathBuf {
 
 /// 写一个 `secs` 秒的 8kHz 单声道 16bit 静音 WAV（不产生声音，只为让 rodio 能解码）。
 fn write_silent_wav(dir: &Path, secs: f64) -> PathBuf {
+    write_silent_wav_named(dir, "silence.wav", secs)
+}
+
+/// 同上，但可以指定文件名（同一个用例里要几个**不同路径**的样片时用）。
+fn write_silent_wav_named(dir: &Path, name: &str, secs: f64) -> PathBuf {
     const SAMPLE_RATE: u32 = 8_000;
     let samples = (SAMPLE_RATE as f64 * secs) as u32;
     let data_len = samples * 2;
@@ -58,7 +63,7 @@ fn write_silent_wav(dir: &Path, secs: f64) -> PathBuf {
     bytes.extend_from_slice(b"data");
     bytes.extend_from_slice(&data_len.to_le_bytes());
     bytes.resize(44 + data_len as usize, 0);
-    let path = dir.join("silence.wav");
+    let path = dir.join(name);
     std::fs::write(&path, bytes).expect("写入测试 WAV");
     path
 }
@@ -937,12 +942,13 @@ fn arrow_keys_seek_and_adjust_volume(cx: &mut TestAppContext) {
 // 控制栏 v3：固定 760 宽 + 时间夹滑块 + ⓘ 视频信息卡
 // ----------------------------------------------------------------------
 
-/// 设计稿口径：胶囊**固定 760×92**、居中，进度轨道固定 596，时间码夹在两端。
+/// 设计稿口径：胶囊**固定 760×92**、居中；进度区两行（时间行 16 → 4 → 轨道 714，
+/// 两侧各 3 的光学修正）；右组 6 键中心距 40；走带中心距 42/54。
 ///
 /// 这些都是写死的数字，一旦被 `flex_1`/`fill_container` 带跑，界面上看起来只是
 /// "有点不一样"，很难用手眼发现——所以必须有测试直接量。
 #[gpui_kit::test]
-fn capsule_is_760_by_92_and_time_clamped(cx: &mut TestAppContext) {
+fn capsule_is_760_by_92_and_progress_is_two_rows(cx: &mut TestAppContext) {
     fresh_dir("capsule-v3");
     let (window, view) = open_view(cx, Vec::new());
 
@@ -971,22 +977,31 @@ fn capsule_is_760_by_92_and_time_clamped(cx: &mut TestAppContext) {
             bounds.size.width.as_f32()
         );
 
-        // 时间夹滑块：轨道固定 596，左右两段时间各在轨道外侧
+        // 进度区：轨道满内宽 − 2×3（714），时间行在它**上面**
         let seek = window.find("seek-bar").bounds();
         assert!(
-            (seek.size.width.as_f32() - 596.0).abs() <= 1.0,
-            "进度轨道应固定 596，实际 {}",
+            (seek.size.width.as_f32() - 714.0).abs() <= 1.0,
+            "进度轨道应 714（760 − 2×20 − 2×3），实际 {}",
             seek.size.width.as_f32()
         );
         let left = window.find("time-current").bounds();
         let right = window.find("time-remaining").bounds();
         assert!(
-            left.right().as_f32() <= seek.left().as_f32() + 0.5,
-            "左侧时间码不能压到轨道上：{left:?} vs {seek:?}"
+            left.bottom().as_f32() <= seek.top().as_f32() + 0.5,
+            "时间行必须在轨道上方（设计稿：时间行 16 + 间距 4 + 轨道 4）：{left:?} vs {seek:?}"
         );
         assert!(
-            right.left().as_f32() >= seek.right().as_f32() - 0.5,
-            "右侧剩余时间不能压到轨道上：{right:?} vs {seek:?}"
+            right.bottom().as_f32() <= seek.top().as_f32() + 0.5,
+            "两端时间码都在轨道上方：{right:?} vs {seek:?}"
+        );
+        // 两端对齐：左段贴内左沿，右段贴内右沿
+        assert!(
+            (left.left().as_f32() - seek.left().as_f32()).abs() <= 1.5,
+            "当前时间应贴轨道左端（都带 3px 光学修正）：{left:?} vs {seek:?}"
+        );
+        assert!(
+            (right.right().as_f32() - seek.right().as_f32()).abs() <= 1.5,
+            "剩余时间应贴轨道右端：{right:?} vs {seek:?}"
         );
 
         // 音量条 96（设计稿），ⓘ 在它左边
@@ -999,7 +1014,70 @@ fn capsule_is_760_by_92_and_time_clamped(cx: &mut TestAppContext) {
         let info = window.find("video-info").bounds();
         assert!(
             info.right().as_f32() <= volume.left().as_f32() + 0.5,
-            "ⓘ 应在音量组左侧（设计稿：左组 = ⓘ + gap16 + 音量）"
+            "ⓘ 应在音量组左侧（设计稿：左组 = ⓘ + gap14 + 音量）"
+        );
+
+        // 播放键 44 正圆，而且真的在胶囊中线上
+        let play = window.find("play-pause").bounds();
+        assert_eq!(play.size.width.as_f32(), 44.0, "播放键宽 44");
+        assert_eq!(play.size.height.as_f32(), 44.0, "播放键高 44（正圆）");
+        let play_center = play.left().as_f32() + play.size.width.as_f32() / 2.0;
+        assert!(
+            (play_center - capsule_center).abs() <= 2.0,
+            "播放键必须在胶囊正中：{play_center} vs {capsule_center}"
+        );
+
+        // 走带节奏：播放↔±10 = 54、±10↔上/下一首 = 42（设计稿实测中心距）
+        let back = window.find("seek-back-10").bounds();
+        let fwd = window.find("seek-fwd-10").bounds();
+        let prev = window.find("prev").bounds();
+        let next = window.find("next").bounds();
+        let center =
+            |b: gpui_kit::Bounds<gpui_kit::Pixels>| b.left().as_f32() + b.size.width.as_f32() / 2.0;
+        assert!(
+            (center(back) - (play_center - 54.0)).abs() <= 2.0,
+            "快退键中心距播放键 54，实际 {:.1}",
+            play_center - center(back)
+        );
+        assert!(
+            (center(fwd) - (play_center + 54.0)).abs() <= 2.0,
+            "快进键中心距播放键 54，实际 {:.1}",
+            center(fwd) - play_center
+        );
+        assert!(
+            (center(prev) - (play_center - 96.0)).abs() <= 2.0,
+            "上一首中心距播放键 96，实际 {:.1}",
+            play_center - center(prev)
+        );
+        assert!(
+            (center(next) - (play_center + 96.0)).abs() <= 2.0,
+            "下一首中心距播放键 96，实际 {:.1}",
+            center(next) - play_center
+        );
+
+        // 右组：字幕 / 音轨 / 主题 / 列表 / 全屏，中心距 40，最右贴内右沿
+        let subtitles = center(window.find("subtitles").bounds());
+        let audio = center(window.find("audio-track").bounds());
+        let theme = center(window.find("theme-toggle").bounds());
+        let playlist = center(window.find("toggle-playlist").bounds());
+        let cinema = center(window.find("cinema").bounds());
+        for (name, a, b) in [
+            ("字幕→音轨", subtitles, audio),
+            ("音轨→主题", audio, theme),
+            ("主题→列表", theme, playlist),
+            ("列表→全屏", playlist, cinema),
+        ] {
+            assert!(
+                (b - a - 40.0).abs() <= 1.5,
+                "右组中心距应为 40（{name}），实际 {:.1}",
+                b - a
+            );
+        }
+        // 最右键中心 = 区域右沿 − 1.5（挖洞留白）− 1（描边）− 20（padding）− 12（半个键）
+        assert!(
+            (cinema - (capsule.x + capsule.width - 34.5)).abs() <= 2.5,
+            "右组最右键应贴胶囊内右沿：{cinema} vs {}",
+            capsule.x + capsule.width
         );
     })
     .unwrap();
@@ -1072,4 +1150,173 @@ fn codec_string_keeps_only_its_first_alias() {
     // 单段/空串不能被切断或留下空白
     assert_eq!(short_codec("vp9"), "vp9");
     assert_eq!(short_codec(""), "");
+}
+
+// ----------------------------------------------------------------------
+// 播放列表面板 v2：几何、tab、循环/随机/排序
+// ----------------------------------------------------------------------
+
+/// 设计稿口径：面板 320 宽、贴右 24、顶边 = 标题带 40 + 8。
+///
+/// 之前是 `top: TITLE_BAND+6 / right: 12 / bottom: BOTTOM_BAND`，宽高都靠窗口
+/// 撑，和设计稿的固定 320 差两圈；这类"整体缩进一格"的偏差光看截图很难发现。
+#[gpui_kit::test]
+fn playlist_panel_matches_design_geometry(cx: &mut TestAppContext) {
+    fresh_dir("panel-geo");
+    let (window, _view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-playlist", cx);
+        window.render_frame(cx);
+
+        let panel = window.find("playlist-panel").bounds();
+        let window_bounds = window.bounds();
+        assert_eq!(panel.size.width.as_f32(), 320.0, "面板宽 320");
+        assert_eq!(panel.top().as_f32(), 48.0, "面板顶边 = 标题带 40 + 8");
+        assert_eq!(
+            window_bounds.right().as_f32() - panel.right().as_f32(),
+            24.0,
+            "面板贴右 24"
+        );
+
+        // 头部两枚 tab + 关闭；底部七个入口
+        for id in [
+            "tab-playlist",
+            "tab-chapters",
+            "playlist-close",
+            "repeat-mode",
+            "shuffle-mode",
+            "sort-mode",
+            "add-file",
+            "add-folder",
+            "remove-track",
+            "clear-playlist",
+        ] {
+            assert!(
+                window.try_find(id).is_some(),
+                "面板上应该有 {id}（设计稿的头部/底部都在这一层）"
+            );
+        }
+    })
+    .unwrap();
+}
+
+/// 循环 / 随机 / 排序：点一下真的改状态，排序还会重排列表。
+///
+/// 三个按钮都在面板底部，是设计稿里**唯一**没有对应功能的那一组——不能只画不管。
+#[gpui_kit::test]
+fn repeat_shuffle_and_sort_modes_work(cx: &mut TestAppContext) {
+    let dir = fresh_dir("panel-modes");
+    // 三个**不同**的文件：「加入顺序」是按路径记的，都用同一个样片就没法区分
+    let a = write_silent_wav(&dir, 0.5);
+    let b = write_silent_wav_named(&dir, "b.wav", 0.5);
+    let c = write_silent_wav_named(&dir, "c.wav", 0.5);
+    let (window, view) = open_view(
+        cx,
+        vec![
+            track("Banana", &a, 0.5),
+            track("Apple", &b, 0.5),
+            track("Cherry", &c, 0.5),
+        ],
+    );
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-playlist", cx);
+        window.render_frame(cx);
+
+        use crate::persistence::{RepeatMode, SortOrder};
+        assert_eq!(
+            view.read(cx).test_play_modes(),
+            (RepeatMode::All, false, SortOrder::Added),
+            "默认：列表循环 + 不随机 + 加入顺序"
+        );
+
+        window.click("repeat-mode", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).test_play_modes().0, RepeatMode::One);
+
+        window.click("shuffle-mode", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).test_play_modes().1, "点一下随机要打开");
+
+        window.click("sort-mode", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).test_play_modes().2, SortOrder::Title);
+        assert_eq!(
+            view.read(cx).test_titles(cx),
+            vec![
+                "Apple".to_string(),
+                "Banana".to_string(),
+                "Cherry".to_string()
+            ],
+            "按标题排序后列表要真的重排"
+        );
+
+        // 再点两下：时长 → 加入顺序（还原）
+        window.click("sort-mode", cx);
+        window.render_frame(cx);
+        window.click("sort-mode", cx);
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).test_play_modes().2, SortOrder::Added);
+        assert_eq!(
+            view.read(cx).test_titles(cx),
+            vec![
+                "Banana".to_string(),
+                "Apple".to_string(),
+                "Cherry".to_string()
+            ],
+            "「加入顺序」要能还原成最初拖进来的排列"
+        );
+    })
+    .unwrap();
+}
+
+/// 视频的时长要能补进轨道元数据（入列时问不到，mpv 起播后才报）。
+///
+/// 页脚那行「N 个文件 · 总时长」和行内第二行都读 `duration_secs`；视频轨入列时是
+/// `None`，不补就永远显示「1 个文件」。同一条 tick 每帧都会调，所以「重复调用不能
+/// 反复改」也是判据——否则每帧都要落盘一次。
+#[gpui_kit::test]
+fn video_duration_is_backfilled_once(cx: &mut TestAppContext) {
+    let dir = fresh_dir("duration-backfill");
+    let a = write_silent_wav(&dir, 0.5);
+    let (window, view) = open_view(cx, vec![track("A", &a, 0.5)]);
+
+    cx.update_window(window, |_, _window, cx| {
+        let wrote = view.update(cx, |v, cx| v.test_backfill_duration(0, 116.4, cx));
+        assert!(wrote, "第一次补时长必须写进去");
+        let again = view.update(cx, |v, cx| v.test_backfill_duration(0, 116.4, cx));
+        assert!(!again, "同一个值不该反复写（tick 每帧都会调）");
+        let changed = view.update(cx, |v, cx| v.test_backfill_duration(0, 130.0, cx));
+        assert!(changed, "时长明显变了要以 mpv 为准");
+    })
+    .unwrap();
+}
+
+/// 面板的 tab 要能切到「章节」页，且收面板时回到「播放列表」页。
+#[gpui_kit::test]
+fn chapter_tab_switches_and_resets_on_close(cx: &mut TestAppContext) {
+    fresh_dir("panel-chapters");
+    let (window, view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        window.click("toggle-playlist", cx);
+        window.render_frame(cx);
+        assert!(!view.read(cx).test_chapter_tab());
+
+        window.click("tab-chapters", cx);
+        window.render_frame(cx);
+        assert!(view.read(cx).test_chapter_tab(), "点「章节」应切页");
+
+        window.click("playlist-close", cx);
+        window.render_frame(cx);
+        assert!(
+            !view.read(cx).test_chapter_tab(),
+            "收面板要回到「播放列表」，否则下次展开是一张空页"
+        );
+    })
+    .unwrap();
 }

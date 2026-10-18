@@ -1,0 +1,586 @@
+{
+  "_readme": "Chroma 设计规格（机读）。来源：Ardot 设计稿 737444551354649。不要手改本文件——要改就走画布会话，改完由画布重新导出 frames/icons 并更新本文件。单位：逻辑像素（DP），颜色：hex。",
+  "meta": {
+    "design_file": "https://ardot.tencent.com/file/737444551354649",
+    "file_id": 737444551354649,
+    "exported_at": "2026-10-18T21:16+08:00",
+    "frame_scale": 2,
+    "note": "frames/*.png 已裁到窗口实际内容：2560×1600 = 2x × 1280×800，无投影留白。窗口四角为透明圆角（radius 10）。量坐标可直接除以 2。"
+  },
+  "tokens": {
+    "light": {
+      "base": "#EFF1F5",
+      "mantle": "#E6E9EF",
+      "surface0": "#CCD0DA",
+      "text": "#4C4F69",
+      "subtext0": "#6C6F85",
+      "overlay1": "#8C8FA1",
+      "mauve": "#8839EF",
+      "accent_on_dark": "#CBA6F7"
+    },
+    "dark": {
+      "base": "#1E1E2E",
+      "text": "#D5D9E2",
+      "overlay1": "#A6ADC8",
+      "mauve": "#CBA6F7"
+    },
+    "overlay_glass": {
+      "rgb": "#0B0C10",
+      "alpha_design": 0.65,
+      "alpha_impl": 0.72,
+      "note": "设计稿写 60–65%；Win 侧没有区域级 backdrop blur，实现用 72%（0x0B0C10B8），再淡会让 11px 文字在亮画面上掉到 4:1 以下。",
+      "blur": 32,
+      "border": {
+        "color": "#FFFFFF",
+        "alpha": 0.1
+      }
+    },
+    "osc": {
+      "progress_played": "#CBA6F7",
+      "volume": "#CBA6F7",
+      "play_button": "#8839EF",
+      "icon": "#D5D9E2",
+      "icon_dim": "#A6ADC8",
+      "text_primary": "#D5D9E2",
+      "text_secondary": "#A6ADC8"
+    }
+  },
+  "logo": {
+    "structure": "外盘(100%) + 内盘(80%，每边内缩 10%) + 白色播放三角",
+    "outer_gradient": [
+      "#7321D9",
+      "#5E12B8"
+    ],
+    "inner_gradient": [
+      "#B37AFF",
+      "#8F45F5"
+    ],
+    "gradient_direction": "top->bottom",
+    "triangle": {
+      "width_ratio": 0.388,
+      "height_ratio": 0.48,
+      "color": "#FFFFFF"
+    },
+    "stroke": {
+      "color": "#FFFFFF",
+      "alpha": 0.18,
+      "width": 1
+    },
+    "shadow": {
+      "color": "#8839EF",
+      "alpha": 0.3,
+      "x": 0,
+      "y": 12,
+      "blur": 28
+    },
+    "shadow_win": {
+      "color": "#8839EF",
+      "alpha": 0.22,
+      "x": 0,
+      "y": 8,
+      "blur": 20
+    },
+    "sizes": [
+      256,
+      128,
+      64,
+      32,
+      16
+    ],
+    "tiny_variant": {
+      "node": "2:528",
+      "size": 16,
+      "shape": "rounded-square",
+      "corner_radius": 4,
+      "inner": {
+        "size": 12,
+        "offset": 2,
+        "corner_radius": 2
+      },
+      "note": "画布上留的一个 16px 方块探索稿。**不用于 ico**：实测 16px 下方块 + 小三角比圆盘 + 大三角更难认；尺寸表（2:576）的 16px 本来就是同一图形等比缩。",
+      "used_for_io": false
+    },
+    "app_icon_source": "scripts/make-icon.py —— 16 倍超采样逐档重画，比例取本节的矢量值；**不烤投影**（投影的模糊会被画布边缘裁成方形灰晕，浅色任务栏上很明显，系统自己会给图标做投影）"
+  },
+  "windows": {
+    "mac": {
+      "main": {
+        "width": 1280,
+        "height": 800,
+        "corner_radius": 12
+      },
+      "music_mode": {
+        "width": 400,
+        "height": 780,
+        "corner_radius": 12
+      },
+      "settings": {
+        "width": 960,
+        "height": 680,
+        "corner_radius": 12,
+        "title_band": 0
+      },
+      "first_run": {
+        "width": 560,
+        "height": 440,
+        "corner_radius": 12
+      },
+      "window_controls": "左侧红绿灯"
+    },
+    "win": {
+      "main": {
+        "width": 1280,
+        "height": 800,
+        "corner_radius": 8
+      },
+      "music_mode": {
+        "width": 400,
+        "height": 780,
+        "corner_radius": 8
+      },
+      "settings": {
+        "width": 960,
+        "height": 720,
+        "corner_radius": 12,
+        "title_band": 40
+      },
+      "first_run": {
+        "width": 560,
+        "height": 440,
+        "corner_radius": 12
+      },
+      "window_controls": "右上 最小化+关闭 92x32，x462 y6（首屏 560 宽时）"
+    }
+  },
+  "title_band": {
+    "height": 34,
+    "note": "mac 自绘 34；Win 主窗自绘 40（与设置窗标题带一致）。窗口控件图标在深色画面上用 #E6E9EF，搬到浅底必须改 #4C4F69。"
+  },
+  "control_bar": {
+    "capsule": {
+      "width": 760,
+      "height": 92,
+      "x": 260,
+      "y": 684,
+      "distance_to_bottom": 24,
+      "corner_radius": 14,
+      "padding": {
+        "left": 20,
+        "right": 20,
+        "top": 8,
+        "bottom": 8
+      },
+      "background": "L3 染色玻璃：linear-gradient(180deg, rgba(50,103,134,.24) 0%, rgba(50,103,134,.06) 48%, rgba(11,12,16,.48) 100%) + backdrop blur(56px) saturate(175%) brightness(1.05)",
+    "stroke": "1px rgba(255,255,255,.18)",
+    "effects": "inset 0 1px 0 rgba(255,255,255,.20) / inset 0 -1px 0 rgba(0,0,0,.26) / 0 2px 8px rgba(0,0,0,.24) / 0 18px 48px rgba(0,0,0,.34)",
+    "texture_layer": "L3（见 texture_layers.L3_real_blur；定稿）",
+      "note": "760 居中于 1280；窄窗用 max-width:100% 防溢出。"
+    },
+    "progress_row": {
+      "layout": "vertical",
+      "height": 24,
+      "gap": 4,
+      "side_padding": 3,
+      "side_padding_note": "光学修正：图标在 20x20 盒里图形只占 13.2（内缩 3.3），轨道贴盒子边会比图标两端各宽 3px。",
+      "time_row": {
+        "height": 16,
+        "align": "space-between",
+        "font": "mono",
+        "size": 11
+      },
+      "track": {
+        "width": 714,
+        "height": 4,
+        "handle": 10,
+        "chapter_dot": 2
+      }
+    },
+    "left_group": {
+      "order": [
+        "video_info",
+        "volume"
+      ],
+      "gap_between": 16,
+      "video_info_icon": 20,
+      "volume": {
+        "track_width": 96,
+        "fill_ratio": 0.7,
+        "icon": 20
+      }
+    },
+    "right_group": {
+      "order": [
+        "subtitle",
+        "audio_track",
+        "settings",
+        "pip",
+        "playlist",
+        "fullscreen"
+      ],
+      "icon": 20,
+      "gap": 20,
+      "width_note": "6×20 + 5×20 = 220，可用列宽 240；不要再加第 7 个（会 260 溢出）。"
+    },
+    "icon_box": {
+      "size": 20,
+      "glyph_inset": 3.3
+    }
+  },
+  "playlist_panel": {
+    "width": 320,
+    "height": 633,
+    "corner_radius": 14,
+    "mac": {
+      "x": 936,
+      "y": 16
+    },
+    "win": {
+      "x": 936,
+      "y": 48,
+      "note": "Win 要让开 40 高标题带"
+    },
+    "header": {
+      "height": 48,
+      "tabs": [
+        "播放列表",
+        "章节"
+      ]
+    },
+    "row": {
+      "height": 48,
+      "layout": "双行"
+    },
+    "footer": {
+      "items": [
+        "循环",
+        "随机",
+        "排序",
+        "总时长",
+        "添加",
+        "移除",
+        "清空"
+      ],
+      "gap": 4
+    },
+    "expanded_state_control_capsule": {
+      "x": 88,
+      "note": "展开态控制栏居中于剩余画面，不是整窗居中"
+    }
+  },
+  "first_run": {
+    "size": {
+      "width": 560,
+      "height": 440
+    },
+    "icon": 68,
+    "row_height": 28,
+    "states": [
+      "recent",
+      "empty",
+      "drop"
+    ],
+    "continue_last": {
+      "height": 32,
+      "note": "过滤掉最后播放项，避免重复"
+    }
+  },
+  "osd_video_info": {
+    "width": 240,
+    "height": 180,
+    "x": 24,
+    "y": 488,
+    "distance_to_control_bar": 16,
+    "corner_radius": 12,
+    "padding": {
+      "left": 14,
+      "right": 14,
+      "top": 12,
+      "bottom": 12
+    },
+    "row_height": 22,
+    "rows": [
+      "分辨率",
+      "编码",
+      "码率",
+      "帧率",
+      "色彩",
+      "音频"
+    ],
+    "label_color": "#A6ADC8",
+    "value_color": "#D5D9E2",
+    "value_font": "mono"
+  },
+  "frames": [
+    {
+      "file": "frames/mac-main-player.png",
+      "node": "2:7",
+      "platform": "mac",
+      "size": [
+        1280,
+        800
+      ],
+      "desc": "主播放窗（音乐）"
+    },
+    {
+      "file": "frames/mac-music-mode.png",
+      "node": "2:103",
+      "platform": "mac",
+      "size": [
+        400,
+        780
+      ],
+      "desc": "音乐模式（mini）"
+    },
+    {
+      "file": "frames/mac-settings.png",
+      "node": "2:139",
+      "platform": "mac",
+      "size": [
+        960,
+        680
+      ],
+      "desc": "设置窗"
+    },
+    {
+      "file": "frames/mac-firstrun-recent.png",
+      "node": "21:1",
+      "platform": "mac",
+      "size": [
+        560,
+        440
+      ],
+      "desc": "首屏 · 最近打开"
+    },
+    {
+      "file": "frames/mac-firstrun-empty.png",
+      "node": "21:58",
+      "platform": "mac",
+      "size": [
+        560,
+        440
+      ],
+      "desc": "首屏 · 空状态"
+    },
+    {
+      "file": "frames/mac-firstrun-drop.png",
+      "node": "21:483",
+      "platform": "mac",
+      "size": [
+        560,
+        440
+      ],
+      "desc": "首屏 · 拖入中（投放区 512x212 @24,204）"
+    },
+    {
+      "file": "frames/mac-playlist-expanded.png",
+      "node": "21:162",
+      "platform": "mac",
+      "size": [
+        1280,
+        800
+      ],
+      "desc": "主窗 · 播放列表展开"
+    },
+    {
+      "file": "frames/mac-osd-video-info.png",
+      "node": "21:928",
+      "platform": "mac",
+      "size": [
+        1280,
+        800
+      ],
+      "desc": "主窗 · 视频信息 OSD"
+    },
+    {
+      "file": "frames/win-main-player.png",
+      "node": "2:258",
+      "platform": "win",
+      "size": [
+        1280,
+        800
+      ],
+      "desc": "主播放窗（音乐）"
+    },
+    {
+      "file": "frames/win-music-mode.png",
+      "node": "2:369",
+      "platform": "win",
+      "size": [
+        400,
+        780
+      ],
+      "desc": "音乐模式（mini）"
+    },
+    {
+      "file": "frames/win-settings.png",
+      "node": "21:807",
+      "platform": "win",
+      "size": [
+        960,
+        720
+      ],
+      "desc": "设置窗（680 + 40 标题带）"
+    },
+    {
+      "file": "frames/win-firstrun-recent.png",
+      "node": "21:587",
+      "platform": "win",
+      "size": [
+        560,
+        440
+      ],
+      "desc": "首屏 · 最近打开"
+    },
+    {
+      "file": "frames/win-firstrun-empty.png",
+      "node": "21:644",
+      "platform": "win",
+      "size": [
+        560,
+        440
+      ],
+      "desc": "首屏 · 空状态"
+    },
+    {
+      "file": "frames/win-firstrun-drop.png",
+      "node": "21:710",
+      "platform": "win",
+      "size": [
+        560,
+        440
+      ],
+      "desc": "首屏 · 拖入中"
+    },
+    {
+      "file": "frames/win-playlist-expanded.png",
+      "node": "21:317",
+      "platform": "win",
+      "size": [
+        1280,
+        800
+      ],
+      "desc": "主窗 · 播放列表展开（面板 y=48）"
+    },
+    {
+      "file": "frames/win-osd-video-info.png",
+      "node": "21:1108",
+      "platform": "win",
+      "size": [
+        1280,
+        800
+      ],
+      "desc": "主窗 · 视频信息 OSD"
+    }
+  ],
+  "icons": [
+    {
+      "file": "icons/chroma-256.png",
+      "node": "2:564",
+      "size": 256
+    },
+    {
+      "file": "icons/chroma-128.png",
+      "node": "2:567",
+      "size": 128
+    },
+    {
+      "file": "icons/chroma-64.png",
+      "node": "2:570",
+      "size": 64
+    },
+    {
+      "file": "icons/chroma-32.png",
+      "node": "2:573",
+      "size": 32
+    },
+    {
+      "file": "icons/chroma-16.png",
+      "node": "2:576",
+      "size": 16
+    }
+  ],
+  "known_gaps": [
+    "静态导出画不出真模糊：L3 的 backdrop blur 在 PNG 里只体现为一块均匀染色玻璃。要看真效果请开 design/preview/index.html（默认即 L3）。",
+    "设置窗同时存在旧版 2:406（960x680 无标题带），以 21:807 为准。",
+    "OSD 行文案取自设计稿示例（HEVC Main 10 / 42.8 Mb/s / BT.2020·HDR10 / AAC 5.1），代码里应取 mpv 实际值；video-bitrate 不可用时显示 —，不要补假数。",
+    "L2/L3 的染色在画布上是用素材当前一帧手工算出的固定色（rgb(50,103,134)）。代码里必须运行时取样，换片要重算。"
+  ],
+  "texture_layers": {
+    "status": "已定稿 L3（2026-10-18）。画布 6 个视频帧的控制栏 + 底部遮罩均按 L3 落地；HTML 原型默认档位 = L3。",
+    "note": "控制栏质感的三个层次，按依赖顺序叠加。L1 纯样式即可（GPUI 今天就能做）；L2 需要一次画面取色；L3 依赖架构改造。HTML 原型里用 ?layers=enh,tint,realblur 逐层预览，或点工具条切档。",
+    "L1_directional_light": {
+      "capsule_background": "linear-gradient(180deg, rgba(26,28,40,.60) 0%, rgba(11,12,16,.74) 100%)",
+      "border": "1px rgba(255,255,255,.14)",
+      "inset_top_highlight": "inset 0 1px 0 rgba(255,255,255,.16)",
+      "inset_bottom_shade": "inset 0 -1px 0 rgba(0,0,0,.30)",
+      "contact_shadow": "0 2px 6px rgba(0,0,0,.26)",
+      "ambient_shadow": "0 16px 40px rgba(0,0,0,.32)",
+      "backdrop_blur": 40,
+      "backdrop_saturate": 1.5,
+      "bottom_vignette": {
+        "height": 240,
+        "from": "rgba(11,12,16,.55)",
+        "to": 0,
+        "end_stop": 0.78,
+        "why": "设计稿只有顶部遮罩；补底部这层，控制栏才有稳定底，玻璃不用靠加深保可读"
+      },
+      "track_hover": {
+        "height": [
+          4,
+          6
+        ],
+        "handle": [
+          10,
+          12
+        ]
+      },
+      "icon_hover": {
+        "background": "rgba(255,255,255,.10)",
+        "radius": 6,
+        "active_scale": 0.92
+      },
+      "play_button": "radial-gradient(120% 120% at 32% 18%, #A05BF5 0%, #8839EF 46%, #6E24D8 100%) + inset 0 1px 0 rgba(255,255,255,.35)",
+      "numeric": "font-variant-numeric: tabular-nums（时间不抖）",
+      "cost": "纯样式，不动几何；GPUI 侧用 shadow + 双层矩形实现"
+    },
+    "L2_frame_tint": {
+      "what": "从画面取色给玻璃染色，伪造 vibrancy",
+      "sample_region": "画面底部中间 60%×38%（控制栏背后那块）",
+      "rule": "只取 HSL 的色相；饱和度固定 46%、明度固定 36% —— 不取明度",
+      "why_no_luminance": "实测这张素材底部均值只有 rgb(46,62,71)，直接混进去等于把玻璃染得更黑；固定明度才能保证暗画面也有稳定色温",
+      "mix_alpha": {
+        "top": 0.26,
+        "mid": 0.08,
+        "bottom": "base .70"
+      },
+      "example": "rgb(46,62,71) → hsl(197,46%,36%) = rgb(50,103,123)",
+      "impl_note": "切歌 / seek 后截一帧小图算一次并缓存，不要每帧算；mpv 用 screenshot-to-memory 缩到 48×30 足够",
+      "cost": "低：一次缩略图 + 一次均值"
+    },
+    "L3_real_blur": {
+      "what": "真正的区域级背景模糊（浏览器/ macOS 原生能力，Win 现在的叠加窗拿不到）",
+      "backdrop_blur": 56,
+      "backdrop_saturate": 1.75,
+      "backdrop_brightness": 1.05,
+      "capsule_alpha_bottom": 0.48,
+      "mix_alpha": {
+        "top": 0.24,
+        "mid": 0.06
+      },
+      "border": "1px rgba(255,255,255,.18)",
+      "requires": "libmpv render API 把画面画进自己的合成树（见 libmpv-migration 备忘）；未改造前 Win 只能停在 L1+L2",
+      "cost": "高：架构级",
+      "canvas_canonical": {
+        "tint_rgb": "50,103,134",
+        "stops": ["rgba(50,103,134,.24) @0", "rgba(50,103,134,.06) @0.48", "rgba(11,12,16,.48) @1"],
+        "gradientTransform": [[0, 1, 0], [-1, 0, 1]],
+        "note": "画布上控制栏 = GRADIENT_LINEAR + strokes 白 18% + effects BACKGROUND_BLUR 56 / DROP_SHADOW 0,18,48 @34%"
+      },
+      "bottom_vignette_canvas": {
+        "geometry": "x0 y560 1280×240（窗口底部，在视频画面之上、字幕/控制栏之下）",
+        "fill": "linear-gradient(180deg, rgba(11,12,16,0) → rgba(11,12,16,.55))",
+        "why": "静态图里玻璃只有染色看不出来，底部压一层才有'玻璃浮在画面上'的层次；同时保证底部 11px 小字在亮画面上仍 ≥4.5:1"
+      }
+    }
+  }
+}

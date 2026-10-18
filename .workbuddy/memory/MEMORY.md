@@ -43,12 +43,16 @@
 - **字体必须系统自带**：Inter / Noto Sans SC 在 Win 不预装。`theme::ui_font_family()`（Win `Microsoft YaHei UI` / mac `PingFang SC` / 其他 `Noto Sans SC`）+ `mono_font_family()`；`ThemeConfig.font_family` 铺整棵树（`root.rs`）。
 - 换肤：`ThemeConfig`(#\[serde(default)\]) + `Theme::update` + `apply_config`。**`ThemeConfigColors` 的 blue/red/green/cyan/magenta/yellow(±`_light`) 是私有字段** → 只能 `default()` 后逐字段赋值。别在同一 closure 里既换 mode 又换 config。
 - 布局铁律：一组控件居中，左右两栏必须**等宽**（都 `flex_1`），否则 `justify_between` 把中间顶偏。
-- **控制栏 v3 几何（改任一条同步 `verify_floating_chrome.py` 常数）**：胶囊 **760×92** 水平居中（`max_w_full` 防窄窗溢出）、距下 24、圆角 14、padding 20/12；轨道 596、时间夹两端（各 `flex_1`）；左组 ⓘ + 音量 96（gap 16），右组 5–7 个 20px 键（gap 20）；信息卡 **240×180** 浮胶囊上方 16、贴 x24；`BOTTOM_BAND` 118。按钮从右数中心 = `胶囊右沿 − 20 − 10 − i×40`（0 主题、1 全屏、2 列表、3 音轨、4 字幕）。
-- **`overlay::glass()` 实际 72%（`0x0B0C10B8`）**，设计稿写 60–65%：验收色差判据在 72% 下过的，改淡会让 11px 文字在亮画面掉到 4:1。
+- **控制栏 v3 几何（数字来自 `design/spec.json`，改任一条同步 `verify_floating_chrome.py` 的常数）**：胶囊 **760×92**、距下 24、圆角 14、padding **20/8**；进度区**两行**（时间行 16 → gap 4 → 轨道 4px 714 宽，`PROGRESS_SIDE_PAD=2` = spec 3 扣掉 1px 边框）；走带行 44，播放键 **44 圆**（Mauve 发光 0/4/18 35%）、走带键盒 28/图标 22，中心 −96/−54/0/+54/+96；左组 ⓘ + 音量 96；右组盒 24/gap 16 → 中心距 **40**，从右往左 全屏 0、列表 1、主题 2、音轨 3、字幕 4（设计稿 6 个含画中画，未接）；信息卡 240×180 浮胶囊上方 16、贴 x24；`BOTTOM_BAND` 118。
+- **展开歌单时胶囊居中于剩余画面**（x=88 = (1280−320−24−760)/2），不是整窗居中；面板 320 宽、`top = 标题带+8`、`right 24`、`bottom 119`、头 48/行 48/尾 44。
+- **浅底面板上的按钮必须用主题色**（`panel_button(fg, primary)`）：`overlay::fg()`（#D5D9E2）在 Latte 浅底上几乎看不见——页脚的循环/随机/排序踩过。面板列表容器要有 `overflow_hidden`，只给 `min_h_0` 会让最后一行画到页脚上面。
+- **`overlay::glass()` 实际 72%（`0x0B0C10B8`）**，本地导出帧已是 L3（48% + backdrop blur 56）：这条渲染路径拿不到区域级 backdrop blur，48% 不糊就会糊字，所以维持平 72%。验收色差判据（两处 > 25）在 72% 下过。
 - 画在画面上的东西（胶囊 / 歌单 / 信息卡）**都必须进 `chrome_rects`**：漏了 = 节点在、看不见、点不到（三次各踩一次，用户看到"点了没反应"）。
 - mpv 编码名是**并列别名**（`h264 (High) / AVC / …`）→ 取第一段（`short_codec`）；`video-bitrate` 对部分容器报 `unavailable`（合成 mp4 就是），显示 `—` 是对的，别补假数。
 - `cycle sid/aid` **无返回值**、单轨不做事 → 记切换前轨号 + 时间戳，tick 比对 observed 值，800ms 超时就说"没有其他轨可切"。
 - 验收脚本**永远别按"胶囊铺满整宽"算坐标**：胶囊 760 居中后那些点落在画面上，点击被叠加窗吃掉，像"应用 bug"；`wait_settled()` 探针同理（每次白等 3s）。素材要 **120s**（`target/verify-long.mp4` 自动生成）：40s 片子播完 → 叠加窗隐藏 → 取样全变 `#EFF1F5`，多项假失败。
+- **脚本里的胶囊左沿必须走 `capsule_left()`**（跟随面板展开态）。写死整窗居中 → 收起歌单那一下点到胶囊外 → 面板一直开着 → 后面所有按钮坐标偏 344，报出「字幕/音轨没反应」「ⓘ 没反应」两条**假失败**（应用一直是对的）。同理：每次点击都要记 `WindowFromPoint` 的窗口类名，非主窗就判 FAIL —— 坐标偏了点击会静默落到叠加窗上，截图看不出来。
+- 合成输入（`mouse_event`）下的**第一次点击偶尔被吞**：验收里凡是有状态的点击都按**结果**重试（歌单 / Esc / 双击 / ⓘ 最多 3 次），判据不放松。
 - **`h_flex()` 默认 `items_center`**：子元素全绝对定位（内容高 0）交叉轴塌成 0 → `canvas` bounds `Wx0`。视频区要 `.self_stretch()`，回归 `stage_fills_space_between_title_band_and_bottom_band`。
 - **`height:100%` 在不定高父级退化成 auto** → `.h_full()` 解析不出（按钮只剩图标高）。写死 `.h(px(..))`，父级补 `.h_full()`。
 - 自绘标题带：`appears_transparent = true` 后**只有左侧拖动区**能设 `WindowControlArea::Drag`（整条都设会让右侧按钮变非客户区）。窗口按钮 `IconName::Window*` 是 24 网格 + 2px 描边，缩 10px 会糊 → 手写 10×10、1px SVG；46 宽 × 标题栏高，关闭键悬停 `#C42B1C`。

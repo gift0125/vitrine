@@ -33,7 +33,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use crate::persistence::{self, Settings};
+use crate::persistence::{self, RepeatMode, Settings};
 use crate::playlist::PlaylistDelegate;
 use crate::theme::overlay;
 use crate::video_overlay::{self, ChromeRect, Hwnd, VideoOverlay};
@@ -45,8 +45,12 @@ const SEEK_FALLBACK_MAX: f32 = 600.0;
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
 /// 顶部标题带高度（系统标题栏已关闭，这一段是自绘拖拽区 + 窗口按钮）。
 ///
-/// `theme::install` 也读它来给 toast 让位，所以是 `pub(crate)`。
-pub(crate) const TITLE_BAND: f32 = 34.0;
+/// 设计稿分平台：mac 自绘 34，**Windows 主窗 40**（和设置窗标题带一致，也是
+/// Win10/11 原生标题栏高度）；窗口按钮 46×40 正好是一块标准热区。
+///
+/// `theme::install` 也读它来给 toast 让位，`video_overlay` 读它算顶栏挖洞，
+/// 所以是 `pub(crate)`。
+pub(crate) const TITLE_BAND: f32 = 40.0;
 /// 底部悬浮胶囊的内缩。
 const CAPSULE_INSET: f32 = 24.0;
 /// 胶囊**固定宽度**（设计稿 760）。
@@ -57,17 +61,39 @@ const CAPSULE_INSET: f32 = 24.0;
 const CAPSULE_WIDTH: f32 = 760.0;
 /// 胶囊左右内边距（设计稿 20）。
 const CAPSULE_PAD_X: f32 = 20.0;
-/// 胶囊上下内边距（设计稿 12）。
+/// 胶囊上下内边距（设计稿 8）。
 ///
-/// 12×2 + 进度行 16 + 间距 8 + 走带 44 = 92，正好是设计稿的胶囊高度。
-const CAPSULE_PAD_Y: f32 = 12.0;
+/// 8×2 + 进度区 24 + 间距 8 + 走带 44 = 92，正好是设计稿的胶囊高度。
+/// 旧版写 12，靠「进度行 16 + 间距 8」凑到 92，但那样时间行和轨道挤在同一行，
+/// 和设计稿的两行进度区差一个数量级。
+const CAPSULE_PAD_Y: f32 = 8.0;
 /// 胶囊圆角（设计稿 14）。
 const CAPSULE_RADIUS: f32 = 14.0;
-/// 进度轨道固定宽度（设计稿 596）。
+/// 进度区总高（设计稿 24）= 时间行 16 + 间距 4 + 轨道 4。
+const PROGRESS_HEIGHT: f32 = 24.0;
+/// 进度区里的时间行高度（设计稿 16，两端对齐）。
+const PROGRESS_TIME_ROW: f32 = 16.0;
+/// 时间行与轨道之间的间距（设计稿 4）。
+const PROGRESS_GAP: f32 = 4.0;
+/// 进度区左右**光学修正**（设计稿 `side_padding: 3`）。
 ///
-/// **不能用 `fill_container`**：那样两段时间码会被挤到胶囊最边上，和设计稿的
-/// 「时间夹滑块」不是一个东西；固定宽度以后，时间码自然各占两侧剩余空间。
-const SEEK_TRACK_WIDTH: f32 = 596.0;
+/// 轨道两端要和上面的图标字形对齐：图标在 20×20 盒子里图形只占 ~15（内缩
+/// 2.5），轨道贴盒子边就会比图标两端各宽 3px，看着像"轨道戳出来一截"。
+///
+/// 这里写 2 而不是 3：胶囊自己还有 1px 描边，20 + 1 + 2 = 23 正好等于设计稿量到的
+/// 「时间码左沿 − 胶囊左沿 = 23」，轨道也就是 760 − 2×1 − 2×20 − 2×2 = 714。
+const PROGRESS_SIDE_PAD: f32 = 2.0;
+/// 走带（播放控制）中点与相邻按钮的间距（设计稿实测 14）。
+///
+/// 设计稿的节奏：播放键两侧各留 4 的呼吸（44 的圆 + 4 = 52 的视觉盒），
+/// 再往外每 14 一个 28 宽按钮 → 中心距 42（±10s↔上/下一首）、54（播放↔±10s）。
+const TRANSPORT_GAP: f32 = 14.0;
+/// 播放键直径（设计稿实测 44 正圆）。
+const PLAY_BUTTON: f32 = 44.0;
+/// 播放键两侧额外的呼吸宽度：设计稿里圆和 ±10 按钮之间比图标间宽 8。
+const PLAY_BREATH: f32 = 4.0;
+/// 走带行高度（设计稿 44，正好装下 44 的播放键）。
+const CONTROLS_ROW: f32 = 44.0;
 /// 时间码字号（设计稿 11，等宽）。
 const TIME_SIZE: f32 = 11.0;
 /// 音量条宽度（设计稿 96）。
@@ -79,7 +105,7 @@ const INFO_HEIGHT: f32 = 180.0;
 const INFO_GAP: f32 = 16.0;
 /// 底部为悬浮胶囊预留的高度。
 ///
-/// 胶囊实高 92（见 `CAPSULE_PAD_Y`：12 + 16 + 8 + 44 + 12），加上 24 内缩再留
+/// 胶囊实高 92（见 `CAPSULE_PAD_Y`：8 + 24 + 8 + 44 + 8），加上 24 内缩再留
 /// 2px 余量。留多了窗口下方会空出一条死气沉沉的黑带，留少了 mpv 叠加窗会啃掉
 /// 胶囊上沿。
 const BOTTOM_BAND: f32 = 118.0;
@@ -95,6 +121,19 @@ const CAPTION_BUTTON_WIDTH: f32 = 46.0;
 const STATUS_PILL_DURATION: Duration = Duration::from_secs(4);
 /// 悬浮播放列表面板宽度（设计稿 320）。
 const PLAYLIST_WIDTH: f32 = 320.0;
+/// 播放列表面板到窗口右沿的距离（设计稿 Win `x: 936` → 1280 − 936 − 320 = 24）。
+const PLAYLIST_INSET: f32 = 24.0;
+/// 面板顶边与标题带之间的距离（设计稿 Win `y: 48`，即标题带 40 + 8）。
+const PLAYLIST_TOP_GAP: f32 = 8.0;
+/// 面板底边距窗口底的距离：设计稿面板高 633 = 800 − 48 − 119，而 119 正是
+/// 「胶囊 92 + 内缩 24 + 3 余量」——所以这里锚底而不是写死 633，小窗口才不溢出。
+const PLAYLIST_BOTTOM: f32 = 119.0;
+/// 面板头部高度（设计稿 48，装「播放列表 / 章节」两个 tab 与关闭键）。
+const PLAYLIST_HEADER: f32 = 48.0;
+/// 面板底部工具条高度（循环 / 随机 / 排序 · 计数 · 添加 / 移除 / 清空）。
+const PLAYLIST_FOOTER: f32 = 44.0;
+/// 列表行高（设计稿 48，双行：标题 + 「规格 · 时长」）。
+const PLAYLIST_ROW: f32 = 48.0;
 /// 时间码字体（设计稿用等宽）：跟主题走，取平台原生的等宽族。
 ///
 /// 写死 "Consolas" 在 macOS/Linux 上不存在，会退到非等宽字体，
@@ -120,6 +159,94 @@ const ICON_CLOSE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0
 /// （不是把同一个图标翻转，否则箭头的切线方向会反）。
 const ICON_REWIND_10: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M12 3A9 9 0 1 0 21 12" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M11.9 3.1L15.6 0.6 15.6 5.6Z" fill="currentColor"/></svg>"#;
 const ICON_FORWARD_10: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"><path d="M12 3A9 9 0 1 1 3 12" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M12.1 3.1L8.4 0.6 8.4 5.6Z" fill="currentColor"/></svg>"#;
+
+/// 走带与右组图标（**20 格**，图形尽量铺满 viewBox）。
+///
+/// 这里全部手写而不是取图标库：设计稿用的是**实心**跳过键、带内嵌小窗的画中画、
+/// 五根声柱的音轨键、「CC」字幕键、左对齐三条线的列表键——`IconName` 里没有
+/// 这几枚（`Captions` 是矩形加两条线、`ListMusic` 是音符列表、`SkipBack` 是描边
+/// 三角），形状对不上就别硬套。
+///
+/// 尺寸约定：按钮盒 20 → `Button` 把图标渲染成 20×0.75 = 15，所以图形按
+/// 「1..19」铺满，渲染后正好 ~15（设计稿字形 15~17）。描边 1.9 → 15/20 渲染后
+/// ≈1.4，和设计稿的线条粗细一致。
+const ICON_PREV: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><rect x="4.3" y="2.9" width="1.9" height="14.2" rx="0.7" fill="currentColor"/><path d="M15.7 2.9v14.2L8.1 10Z" fill="currentColor"/></svg>"#;
+const ICON_NEXT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><rect x="13.8" y="2.9" width="1.9" height="14.2" rx="0.7" fill="currentColor"/><path d="M4.3 2.9v14.2L11.9 10Z" fill="currentColor"/></svg>"#;
+/// 字幕：圆角矩形 + 两个 C（用两段弧画，避免 SVG `<text>` 挑字体）。
+const ICON_CC: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none"><rect x="1" y="3.6" width="18" height="12.8" rx="3.4" stroke="currentColor" stroke-width="1.9"/><path d="M8.3 8.1a2.2 2.2 0 1 0 0 3.8M14.7 8.1a2.2 2.2 0 1 0 0 3.8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>"#;
+/// 音轨：五根声柱（中间最高）。
+const ICON_AUDIO_BARS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M2.2 8.2v3.6M6.1 5.6v8.8M10 3.2v13.6M13.9 5.6v8.8M17.8 7.2v5.6"/></svg>"#;
+/// 画中画：屏幕框 + 右下内嵌实心小窗。
+///
+/// 暂时只有图形、没有按钮：真正的画中画要一个独立的置顶小窗（视频铺满整窗、
+/// 腾掉标题带与胶囊），是下一轮的事；图形先留着，别让下一个人再画一遍。
+#[allow(dead_code)]
+const ICON_PIP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="none"><rect x="1" y="3.6" width="18" height="12.8" rx="3.4" stroke="currentColor" stroke-width="1.9"/><rect x="10.6" y="8.8" width="6.2" height="5.2" rx="1.2" fill="currentColor"/></svg>"#;
+/// 播放列表：三条左对齐横线（长度递减再回一点，和设计稿一致）。
+const ICON_LIST_LINES: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M2 5.5h16M2 10h11M2 14.5h13.4"/></svg>"#;
+
+/// 面板底部工具条图标（24 格、1.6 描边，16px 渲染后 ≈1.1 的细线）。
+const ICON_REPEAT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/></svg>"#;
+const ICON_SHUFFLE: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h5v5"/><path d="M4 20L21 3"/><path d="M21 16v5h-5"/><path d="M15 15l6 6"/><path d="M4 4l5 5"/></svg>"#;
+const ICON_SORT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v16"/><path d="M4 7l3-3 3 3"/><path d="M17 20V4"/><path d="M14 17l3 3 3-3"/></svg>"#;
+const ICON_MINUS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M5 12h14"/></svg>"#;
+
+/// 播放 / 暂停：**33 格**（= 44 圆 × 0.75，`Button` 把图标渲染成盒子的 0.75）。
+///
+/// 图形尺寸按设计稿实测反推：白色三角 14 宽 × 18 高、双竖条各 4 宽 × 18 高。
+/// 直接用 `IconName::Play` 不行——那是 24 格满画布的三角，缩到 33 会有 ~26 高，
+/// 把 44 的圆塞满，和设计稿的"小三角 + 留白"完全两回事。
+const ICON_PLAY_FILL: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 33 33"><path d="M12 9.8v12.7l10.5-6.35Z" fill="currentColor"/></svg>"#;
+const ICON_PAUSE_FILL: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 33 33"><rect x="11.6" y="9.4" width="3.7" height="14.2" rx="1.1" fill="currentColor"/><rect x="18" y="9.4" width="3.7" height="14.2" rx="1.1" fill="currentColor"/></svg>"#;
+
+/// 20 盒 / 24 盒 / 28 盒的通用图标按钮（走带与右组共用）。
+///
+/// 为什么不用 `IconName` 一把梭：设计稿的跳过键是**实心**三角、音轨键是五根声柱、
+/// 字幕键是「CC」、列表键是三条左对齐横线，图标库里没有对应的画法（`SkipBack`
+/// 是描边、`Captions` 是矩形加两横、`ListMusic` 带音符）。这几枚在
+/// `ICON_*` 里手绘，`active` 只改颜色不改形状。
+fn chrome_button(
+    id: &'static str,
+    icon: Icon,
+    label: &'static str,
+    size: f32,
+    active: bool,
+) -> Button {
+    Button::new(id)
+        .ghost()
+        .with_size(px(size))
+        .icon(icon)
+        .text_color(if active {
+            overlay::accent()
+        } else {
+            overlay::fg()
+        })
+        .tooltip(label)
+        .accessibility_label(label)
+}
+
+/// 浅底面板上的图标按钮（页脚 / 面板头）。
+///
+/// `chrome_button` 用的是浮层前景 `overlay::fg()`（≈ #D5D9E2），那是给**深玻璃**
+/// 胶囊用的。面板是主题浅底（Latte #EFF1F5），同一枚近白色图标放上去几乎看不见
+/// ——页脚的循环/随机/排序就是这样糊成一团的。面板上的东西必须跟主题色走。
+fn panel_button(
+    id: &'static str,
+    icon: Icon,
+    label: &'static str,
+    size: f32,
+    active: bool,
+    fg: gpui::Hsla,
+    accent: gpui::Hsla,
+) -> Button {
+    Button::new(id)
+        .ghost()
+        .with_size(px(size))
+        .icon(icon)
+        .text_color(if active { accent } else { fg })
+        .tooltip(label)
+        .accessibility_label(label)
+}
 
 /// 窗口尺寸变化后多久落盘一次（tick 计数，50 ≈ 5s）。
 const WINDOW_SAVE_TICKS: usize = 50;
@@ -226,6 +353,10 @@ pub struct PlayerView {
     subscriptions: Vec<Subscription>,
     /// 当前进度条量程（切换曲目/时长更新时重建）
     seek_max: f32,
+    /// 播放列表面板当前在「章节」页而不是「播放列表」页
+    chapter_tab: bool,
+    /// 当前视频的章节 `(起始秒, 标题)`：打开列表时按需读取，换片时清空
+    chapters: Vec<(f64, String)>,
 
     // ---- 视频链路 ----
     video: VideoRuntime,
@@ -447,6 +578,8 @@ impl PlayerView {
             settings,
             subscriptions,
             seek_max: SEEK_FALLBACK_MAX,
+            chapter_tab: false,
+            chapters: Vec::new(),
             video: VideoRuntime::default(),
             video_active: false,
             video_error: None,
@@ -696,15 +829,7 @@ impl PlayerView {
             self.tick_video(status, window, cx);
         } else if let Some(engine) = &mut self.engine {
             if engine.track_finished() {
-                // 自动连播：到列表末尾则停止
-                let count = self.playlist.read(cx).delegate().track_count();
-                match self.current {
-                    Some(i) if i + 1 < count => self.play_track(i + 1, cx),
-                    _ => {
-                        engine.stop();
-                        cx.notify();
-                    }
-                }
+                self.advance_after_end(cx);
             } else if !self.user_seeking {
                 let pos = engine.position_secs();
                 self.seek.update(cx, |state, cx| {
@@ -853,12 +978,30 @@ impl PlayerView {
         if status.duration > 0.5 && (status.duration as f32 - self.seek_max).abs() > 1.0 {
             self.rebuild_seek(status.duration as f32, cx);
         }
+        // 视频入列时问不到时长（mpv 要起播才报），补进轨道元数据：页脚
+        // 「N 个文件 · 总时长」和行内第二行都读它，不补就一直是空的。
+        if status.duration > 0.5 {
+            if let Some(row) = self.current {
+                self.backfill_track_duration(row, status.duration, cx);
+            }
+        }
 
         // 窗体大小 = 内容大小：画面尺寸一报到就把窗口调成同样的尺寸/比例
         self.fit_to_video_source(status.width, status.height, window, cx);
 
         if status.finished {
             let count = self.playlist.read(cx).delegate().track_count();
+            // 单曲循环：同一部片子重新起播（`start_video` 会重新 load，不是空操作）
+            if self.settings.repeat == RepeatMode::One && count > 0 {
+                if let Some(i) = self.current {
+                    self.play_track(i, cx);
+                    return;
+                }
+            }
+            if count > 0 && (self.settings.repeat.is_on() || self.settings.shuffle) {
+                self.skip(1, cx);
+                return;
+            }
             match self.current {
                 Some(i) if i + 1 < count => self.play_track(i + 1, cx),
                 _ => {
@@ -1041,19 +1184,41 @@ impl PlayerView {
         }
 
         // 歌单：展开时浮在画面右侧
+        //
+        // 这里的四个数必须和 `render_playlist_panel` 里的定位**逐像素一致**
+        // （top/right/bottom/width）：区域是"主窗负责画哪块"的声明，比面板大一圈
+        // 就等于把一段画面也算给主窗（拖窗的热区错位）；小一圈则面板边缘被叠加窗
+        // 盖住。以前写的是 `width - 12` / `TITLE_BAND + 6`，那是最早一版面板的
+        // 位置，改面板时漏了这里。
         if self.playlist_open && !self.cinema {
-            let panel_x = width - 12. - PLAYLIST_WIDTH;
-            let panel_y = TITLE_BAND + 6.;
-            let panel_h = (height - panel_y - BOTTOM_BAND).max(0.);
+            let panel_x = width - PLAYLIST_INSET - PLAYLIST_WIDTH;
+            let panel_y = TITLE_BAND + PLAYLIST_TOP_GAP;
+            let panel_h = (height - panel_y - PLAYLIST_BOTTOM).max(0.);
             chrome.push(ChromeRect::rounded(
                 panel_x - PAD,
                 panel_y - PAD,
                 PLAYLIST_WIDTH + PAD * 2.,
                 panel_h + PAD * 2.,
-                12. + PAD,
+                CAPSULE_RADIUS + PAD,
             ));
         }
         chrome
+    }
+
+    /// 把 mpv 报的时长补进轨道元数据（同时落盘）。
+    ///
+    /// 音频入列时就能问到时长，视频不能——mpv 要起播之后才报 `duration`，所以视频
+    /// 轨的 `duration_secs` 一直是 `None`：页脚「N 个文件 · 总时长」和行内第二行
+    /// 就永远空着（截图里只有「1 个文件」）。拿到就补一次，`set_duration` 自己会
+    /// 挡住重复写，所以每帧调用也不会反复落盘。
+    fn backfill_track_duration(&mut self, row: usize, secs: f64, cx: &mut Context<Self>) {
+        let wrote = self.playlist.update(cx, |state, _cx| {
+            state.delegate_mut().set_duration(row, secs)
+        });
+        if wrote {
+            let tracks = self.playlist.read(cx).delegate().tracks().to_vec();
+            persistence::save_playlist(&tracks, self.current);
+        }
     }
 
     /// 重建进度条量程（SliderState 不支持运行时改 max）。
@@ -1198,7 +1363,9 @@ impl PlayerView {
                 self.video_active = false;
                 self.video_error =
                     Some("未找到 libmpv-2.dll（可用环境变量 SMP_LIBMPV_PATH 指定路径）".into());
-                self.report_error("视频不可用：未找到 libmpv-2.dll（设置 SMP_LIBMPV_PATH 可指定路径）");
+                self.report_error(
+                    "视频不可用：未找到 libmpv-2.dll（设置 SMP_LIBMPV_PATH 可指定路径）",
+                );
                 return;
             };
             match VideoEngine::spawn(SpawnOptions {
@@ -1295,17 +1462,76 @@ impl PlayerView {
         }
     }
 
-    /// 上一首/下一首（手动触发：列表末尾循环回开头）。
+    /// 上一首/下一首。
+    ///
+    /// 三种模式都在这里分叉（面板底部的「随机 / 循环」真正生效的地方就是这里）：
+    /// - **随机**：从「除当前这一首」里抽一个，抽不到（只有一首）就不动；
+    /// - **单曲循环**：手动按「下一首」仍然要换歌，否则按了没反应——单曲只影响
+    ///   自动连播（`tick` 里播完那一下）；
+    /// - **循环关闭**：到头就停住（不换、不回到第一首）。
     fn skip(&mut self, delta: i32, cx: &mut Context<Self>) {
         let count = self.playlist.read(cx).delegate().track_count();
         if count == 0 {
             return;
         }
+        if self.settings.shuffle && count > 1 {
+            let cur = self.current.unwrap_or(0) % count;
+            // 用纳秒做种子：`rand` 不在依赖里，而这里只需要「别总是同一首」
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as usize)
+                .unwrap_or(0);
+            let next = (cur + 1 + now % (count - 1)) % count;
+            self.play_track(next, cx);
+            return;
+        }
         let idx = match self.current {
-            Some(i) => (i as i32 + delta).rem_euclid(count as i32) as usize,
+            Some(i) => {
+                let raw = i as i32 + delta;
+                let last = count as i32 - 1;
+                if raw < 0 || raw > last {
+                    // 越界只可能是「循环关闭」，否则绕到另一端
+                    if !self.settings.repeat.is_on() {
+                        return;
+                    }
+                    raw.rem_euclid(count as i32) as usize
+                } else {
+                    raw as usize
+                }
+            }
             None => 0,
         };
         self.play_track(idx, cx);
+    }
+
+    /// 一曲播完之后做什么：单曲循环 / 列表循环 / 随机 / 停止。
+    ///
+    /// 和 `skip()` 分开是因为语义不同：手动按「下一首」时**单曲循环也要换歌**
+    /// （否则按了没反应），只有自动连播才把「单曲」当回事。
+    fn advance_after_end(&mut self, cx: &mut Context<Self>) {
+        let count = self.playlist.read(cx).delegate().track_count();
+        if count == 0 {
+            return;
+        }
+        if self.settings.repeat == RepeatMode::One {
+            if let Some(i) = self.current {
+                self.play_track(i, cx);
+            }
+            return;
+        }
+        if self.settings.repeat.is_on() || self.settings.shuffle {
+            self.skip(1, cx);
+            return;
+        }
+        match self.current {
+            Some(i) if i + 1 < count => self.play_track(i + 1, cx),
+            _ => {
+                if let Some(engine) = &mut self.engine {
+                    engine.stop();
+                }
+                cx.notify();
+            }
+        }
     }
 
     /// 进度跳转：按当前模式路由到音频/视频引擎。
@@ -1427,7 +1653,92 @@ impl PlayerView {
             return;
         }
         self.info_open = !self.info_open;
+        persistence::log_session(&format!("debug: info_open -> {}", self.info_open));
         cx.notify();
+    }
+
+    /// 切换面板的两个 tab（播放列表 / 章节）。
+    ///
+    /// 章节是**按需**从 mpv 读的：`chapter-list` 只在视频模式下有意义，音频模式下
+    /// 切过去也只会看到「章节只在视频里才有」。切到章节页时刷新一次，避免换片后
+    /// 还挂着上一部的章节。
+    fn set_chapter_tab(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.chapter_tab = on;
+        if on {
+            self.refresh_chapters();
+        }
+        cx.notify();
+    }
+
+    /// 从当前视频内核读章节（没有内核/没章节就是空表）。
+    fn refresh_chapters(&mut self) {
+        self.chapters = self
+            .video
+            .engine
+            .as_ref()
+            .map(|e| e.chapters())
+            .unwrap_or_default();
+    }
+
+    /// 点章节 → 跳到它的起点。
+    fn seek_to_chapter(&mut self, start: f64, _window: &mut Window, cx: &mut Context<Self>) {
+        // `seek_to` 已经按「视频 / 音频」路由到对应引擎；进度条位置由 tick 下一帧跟上
+        self.seek_to(start);
+        cx.notify();
+    }
+
+    /// 循环模式切下一档（关 → 列表 → 单曲 → 关）并落盘。
+    fn cycle_repeat(&mut self, cx: &mut Context<Self>) {
+        self.settings.repeat = self.settings.repeat.next();
+        persistence::save_settings(&self.settings);
+        cx.notify();
+    }
+
+    /// 随机播放开关。
+    fn toggle_shuffle(&mut self, cx: &mut Context<Self>) {
+        self.settings.shuffle = !self.settings.shuffle;
+        persistence::save_settings(&self.settings);
+        cx.notify();
+    }
+
+    /// 排序方式切下一档（加入顺序 → 标题 → 时长）并重排列表。
+    ///
+    /// 重排会把「当前播放项」挪到别的位置，所以必须拿 delegate 回报的新下标把
+    /// `current` 修正过来——否则界面高亮的是 A、实际在放的是 B。
+    fn cycle_sort(&mut self, cx: &mut Context<Self>) {
+        self.settings.sort = self.settings.sort.next();
+        let order = self.settings.sort;
+        let new_row = self.playlist.update(cx, |state, cx| {
+            let row = state.delegate_mut().sort_by(order);
+            cx.notify();
+            row
+        });
+        if let Some(row) = new_row {
+            self.current = Some(row);
+        }
+        persistence::save_settings(&self.settings);
+        self.persist_playlist(cx);
+        cx.notify();
+    }
+
+    /// 底部「移除」删哪一条：优先列表里选中的那行，没选中就删当前播放项。
+    ///
+    /// 为什么不是「删当前播放」优先：用户点了一行（选中）再点移除，删的必须是
+    /// 他刚点的那行；只看 `current` 的话会删掉正在播的那首，看起来像删错了。
+    fn remove_selected(&mut self, cx: &mut Context<Self>) {
+        let row = self
+            .playlist
+            .read(cx)
+            .delegate()
+            .selected_row()
+            .or(self.current);
+        if let Some(row) = row {
+            self.remove_track(row, cx);
+        }
+    }
+
+    fn can_remove_selected(&self, cx: &Context<Self>) -> bool {
+        self.playlist.read(cx).delegate().selected_row().is_some() || self.current.is_some()
     }
 
     /// 循环切换字幕轨。
@@ -1436,7 +1747,9 @@ impl PlayerView {
     /// 就是"点了没反应"。这里记下切换前的轨号，下一轮 tick 比对观测值：变了报新轨，
     /// 800ms 还没变就明说"没有其他字幕轨"。
     fn cycle_subtitles(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = &self.video.engine else { return };
+        let Some(engine) = &self.video.engine else {
+            return;
+        };
         let before = engine.status().sub_track;
         engine.cycle_subtitles();
         self.pending_track = Some((TrackKind::Subtitle, before, Instant::now()));
@@ -1445,7 +1758,9 @@ impl PlayerView {
 
     /// 循环切换音轨（同上）。
     fn cycle_audio_track(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = &self.video.engine else { return };
+        let Some(engine) = &self.video.engine else {
+            return;
+        };
         let before = engine.status().audio_track;
         engine.cycle_audio_track();
         self.pending_track = Some((TrackKind::Audio, before, Instant::now()));
@@ -2185,12 +2500,9 @@ impl PlayerView {
                             .text_color(overlay::fg())
                             .child(err.clone()),
                     )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(overlay::dim())
-                            .child("提示：把 libmpv-2.dll 放到程序目录，或用 SMP_LIBMPV_PATH 指定路径"),
-                    ),
+                    .child(div().text_size(px(11.)).text_color(overlay::dim()).child(
+                        "提示：把 libmpv-2.dll 放到程序目录，或用 SMP_LIBMPV_PATH 指定路径",
+                    )),
             );
         }
 
@@ -2213,92 +2525,355 @@ impl PlayerView {
     }
 
     /// 悬浮播放列表面板：320 宽、Latte 底、浮在画面上（默认可收起）。
-    fn render_playlist_panel(&self, cx: &Context<Self>) -> impl gpui_kit::IntoElement {
-        let theme = cx.theme();
+    /// 悬浮播放列表面板：320 宽、贴右 24、顶边让开标题带。
+    ///
+    /// 设计稿 Win 口径：`x: 936, y: 48, w: 320, h: 633`。这里不写死高度——48 是
+    /// 「标题带 40 + 8」、633 是「800 − 48 − 119」，而 119 正是胶囊占的那条带
+    /// （92 + 24 + 3）。用 `top + bottom` 锚定，换窗口尺寸时面板自然跟着变长变短，
+    /// 而不是在 720 高的窗口里戳出屏幕。
+    ///
+    /// 结构：头部 48（tab 切换 + 关闭）→ 分隔线 → 列表 → 分隔线 → 底部工具条 44。
+    fn render_playlist_panel(&self, cx: &mut Context<Self>) -> impl gpui_kit::IntoElement {
+        // 主题色先拷成局部量：下面要 `&mut cx` 建监听器，借着 `cx.theme()` 不放会冲突
+        let (bg, border) = {
+            let t = cx.theme();
+            (t.background, t.border)
+        };
         let count = self.playlist.read(cx).delegate().track_count();
+        let chapter_tab = self.chapter_tab;
 
         v_flex()
             .id("playlist-panel")
             .test_support()
             .absolute()
-            .top(px(TITLE_BAND + 6.))
-            .right(px(12.))
-            .bottom(px(BOTTOM_BAND))
+            .top(px(TITLE_BAND + PLAYLIST_TOP_GAP))
+            .right(px(PLAYLIST_INSET))
+            .bottom(px(PLAYLIST_BOTTOM))
             .w(px(PLAYLIST_WIDTH))
-            .rounded(px(12.))
-            .bg(theme.background)
+            .rounded(px(CAPSULE_RADIUS))
+            .bg(bg)
             .border_1()
-            .border_color(theme.border)
+            .border_color(border)
             .shadow_lg()
             .overflow_hidden()
-            .px(px(16.))
-            .pt(px(14.))
-            .pb(px(10.))
-            .gap(px(8.))
+            .child(self.render_playlist_header(cx))
+            .child(div().w_full().h(px(1.)).flex_shrink_0().bg(border))
+            // List 默认带 8px 左右内边距；设计稿行胶囊离面板边 12，所以这里给 12。
+            //
+            // `overflow_hidden` 不能省：面板本身裁了圆角，但中间这层是个 flex 容器，
+            // 列表超出高度时会**画到页脚上面**（截图里最后一排和「循环/随机/排序」
+            // 叠在一起）。`min_h_0` 只保证它能被压扁，不保证裁切。
+            .child(
+                div()
+                    .id("playlist-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .when(chapter_tab, |el| el.child(self.render_chapter_list(cx)))
+                    .when(!chapter_tab, |el| {
+                        el.child(List::new(&self.playlist).px(px(12.)))
+                    }),
+            )
+            .child(div().w_full().h(px(1.)).flex_shrink_0().bg(border))
+            .child(self.render_playlist_footer(count, cx))
+    }
+
+    /// 面板头部：「播放列表 / 章节」两枚 tab + 关闭。
+    ///
+    /// tab 是**药丸**（选中态 Mauve 12% 底 + Mauve 字），不是下划线——设计稿里
+    /// 它和胶囊、信息卡一样都是圆角块，下划线那套在深色玻璃上太重。
+    fn render_playlist_header(&self, cx: &mut Context<Self>) -> Div {
+        let muted_fg = cx.theme().muted_foreground;
+        let active = self.chapter_tab;
+
+        h_flex()
+            .h(px(PLAYLIST_HEADER))
+            .flex_shrink_0()
+            .w_full()
+            .items_center()
+            .px(px(14.))
+            .gap(px(4.))
+            .child(self.render_panel_tab("tab-playlist", "播放列表", !active, cx))
+            .child(self.render_panel_tab("tab-chapters", "章节", active, cx))
+            .child(div().flex_1())
+            .child(
+                Button::new("playlist-close")
+                    .ghost()
+                    .with_size(px(24.))
+                    .icon(IconName::Close)
+                    .text_color(muted_fg)
+                    .tooltip("关闭播放列表")
+                    .accessibility_label("关闭播放列表")
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.playlist_open = false;
+                        // 收面板=回到「播放列表」页，下次展开不会突然停在空的章节页
+                        this.chapter_tab = false;
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// 单枚 tab（选中态：Mauve 12% 底 + Mauve 字；未选中：次要前景色）。
+    fn render_panel_tab(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (accent, muted, muted_fg) = {
+            let t = cx.theme();
+            (t.primary, t.muted, t.muted_foreground)
+        };
+        div()
+            .id(id)
+            .test_support()
+            .h(px(24.))
+            .px(px(10.))
+            .rounded(px(8.))
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .when(selected, |el| el.bg(accent.opacity(0.12)))
+            .when(!selected, |el| el.hover(move |s| s.bg(muted.opacity(0.6))))
+            .text_size(px(13.))
+            .when(selected, |el| {
+                el.text_color(accent)
+                    .font_weight(gpui_kit::FontWeight::MEDIUM)
+            })
+            .when(!selected, |el| el.text_color(muted_fg))
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                this.set_chapter_tab(label == "章节", cx);
+            }))
+            .child(label)
+    }
+
+    /// 「章节」页：mpv 的 `chapter-list`（没有章节时给一句实话）。
+    fn render_chapter_list(&self, cx: &mut Context<Self>) -> AnyElement {
+        let (muted, muted_fg, fg) = {
+            let t = cx.theme();
+            (t.muted, t.muted_foreground, t.foreground)
+        };
+        if self.chapters.is_empty() {
+            return v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .p(px(16.))
+                .text_color(muted_fg)
+                .child(Icon::new(IconName::ListMusic).size_10())
+                .child(div().text_size(px(12.)).child(if self.video_active {
+                    "这个片子没有章节信息"
+                } else {
+                    "章节只在视频里才有"
+                }))
+                .into_any_element();
+        }
+
+        let rows: Vec<_> = self
+            .chapters
+            .iter()
+            .enumerate()
+            .map(|(i, (start, title))| {
+                let label = if title.is_empty() {
+                    format!("章节 {}", i + 1)
+                } else {
+                    title.clone()
+                };
+                let start = *start;
+                h_flex()
+                    .id(SharedString::from(format!("chapter-{i}")))
+                    .h(px(PLAYLIST_ROW))
+                    .w_full()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(12.))
+                    .rounded(px(10.))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(muted.opacity(0.6)))
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.seek_to_chapter(start, window, cx);
+                    }))
+                    .child(
+                        div()
+                            .w(px(46.))
+                            .flex_shrink_0()
+                            .font_family(mono_font())
+                            .text_size(px(11.))
+                            .text_color(muted_fg)
+                            .child(fmt_time(start)),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(13.))
+                            .text_color(fg)
+                            .child(label),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .size_full()
+            .px(px(8.))
+            .py(px(4.))
+            .gap(px(0.))
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// 面板底部工具条：循环 / 随机 / 排序 ·「N 个文件 · 总时长」· 添加 / 移除 / 清空。
+    ///
+    /// 三段都是 `flex_1`（等宽），中间那段才真的在面板正中——和胶囊一个道理，
+    /// 只有 `justify_between` 会让中段被两侧宽度带偏。
+    fn render_playlist_footer(&self, count: usize, cx: &mut Context<Self>) -> Div {
+        let muted_fg = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let accent = cx.theme().primary;
+        let repeat = self.settings.repeat;
+        let shuffle = self.settings.shuffle;
+        let sort = self.settings.sort;
+        let total: f64 = self
+            .playlist
+            .read(cx)
+            .delegate()
+            .tracks()
+            .iter()
+            .filter_map(|t| t.duration_secs)
+            .sum();
+        let summary = if total > 0.5 {
+            format!("{} 个文件 · {}", count, fmt_time(total))
+        } else {
+            format!("{count} 个文件")
+        };
+        let can_remove = self.can_remove_selected(cx);
+
+        h_flex()
+            .h(px(PLAYLIST_FOOTER))
+            .flex_shrink_0()
+            .w_full()
+            .items_center()
+            .px(px(12.))
+            .gap(px(4.))
             .child(
                 h_flex()
-                    .w_full()
+                    .flex_1()
+                    .min_w_0()
                     .items_center()
                     .gap(px(2.))
                     .child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(theme.foreground)
-                            .child("播放列表"),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .pr(px(4.))
-                            .text_size(px(12.))
-                            .text_color(theme.muted_foreground)
-                            .child(format!("{count} 个文件")),
-                    )
-                    // 设计稿没有这三个入口，但功能上必须有；收成 xsmall ghost 图标，
-                    // 颜色交给 muted 层级，不抢「播放列表」标题的视觉权重。
-                    .child(
-                        Button::new("add-file")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Plus)
-                            .tooltip("添加文件")
-                            .accessibility_label("添加文件")
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.add_files(cx);
-                            })),
+                        panel_button(
+                            "repeat-mode",
+                            Icon::default().data(ICON_REPEAT),
+                            repeat.label(),
+                            24.,
+                            repeat.is_on(),
+                            fg,
+                            accent,
+                        )
+                        .on_click(cx.listener(|this, _e, _w, cx| this.cycle_repeat(cx))),
                     )
                     .child(
-                        Button::new("add-folder")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::FolderOpen)
-                            .tooltip("添加文件夹")
-                            .accessibility_label("添加文件夹")
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.add_folder(cx);
-                            })),
+                        panel_button(
+                            "shuffle-mode",
+                            Icon::default().data(ICON_SHUFFLE),
+                            if shuffle {
+                                "随机：开"
+                            } else {
+                                "随机：关"
+                            },
+                            24.,
+                            shuffle,
+                            fg,
+                            accent,
+                        )
+                        .on_click(cx.listener(|this, _e, _w, cx| this.toggle_shuffle(cx))),
                     )
                     .child(
-                        Button::new("clear-playlist")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Delete)
-                            .tooltip("清空播放列表")
-                            .accessibility_label("清空播放列表")
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.clear_playlist(cx);
-                            })),
+                        panel_button(
+                            "sort-mode",
+                            Icon::default().data(ICON_SORT),
+                            sort.label(),
+                            24.,
+                            sort != crate::persistence::SortOrder::Added,
+                            fg,
+                            accent,
+                        )
+                        .on_click(cx.listener(|this, _e, _w, cx| this.cycle_sort(cx))),
                     ),
             )
-            // 1px Surface0 分隔线（设计稿唯一的分隔方式）
-            .child(div().w_full().h(px(1.)).flex_shrink_0().bg(theme.border))
-            // List 默认带 8px 左右内边距（会把条目挤得比标题缩进一格），压成 0
             .child(
                 div()
                     .flex_1()
-                    .min_h_0()
-                    .child(List::new(&self.playlist).px(px(0.))),
+                    .min_w_0()
+                    .flex()
+                    .justify_center()
+                    .truncate()
+                    .text_size(px(11.))
+                    .text_color(muted_fg)
+                    .child(summary),
+            )
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(2.))
+                    .child(
+                        panel_button(
+                            "add-file",
+                            Icon::new(IconName::Plus),
+                            "添加文件",
+                            24.,
+                            false,
+                            fg,
+                            accent,
+                        )
+                        .on_click(cx.listener(|this, _e, _w, cx| this.add_files(cx))),
+                    )
+                    .child(
+                        panel_button(
+                            "add-folder",
+                            Icon::new(IconName::FolderOpen),
+                            "添加文件夹",
+                            24.,
+                            false,
+                            fg,
+                            accent,
+                        )
+                        .on_click(cx.listener(|this, _e, _w, cx| this.add_folder(cx))),
+                    )
+                    .child(
+                        panel_button(
+                            "remove-track",
+                            Icon::default().data(ICON_MINUS),
+                            "从播放列表移除",
+                            24.,
+                            false,
+                            fg,
+                            accent,
+                        )
+                        // 没有可删的行时压成次要色（`Button` 没有 `disabled` builder）
+                        .text_color(if can_remove { fg } else { muted_fg })
+                        .on_click(cx.listener(|this, _e, _w, cx| this.remove_selected(cx))),
+                    )
+                    .child(
+                        panel_button(
+                            "clear-playlist",
+                            Icon::new(IconName::Delete),
+                            "清空播放列表",
+                            24.,
+                            false,
+                            fg,
+                            accent,
+                        )
+                        .on_click(cx.listener(|this, _e, _w, cx| this.clear_playlist(cx))),
+                    ),
             )
     }
 
@@ -2332,6 +2907,11 @@ impl PlayerView {
                     .w_full()
                     .px(px(CAPSULE_INSET))
                     .justify_center()
+                    // 设计稿：播放列表展开时胶囊居中于**剩余画面**（x=88 / 中心 468），
+                    // 不是继续整窗居中——否则胶囊会被面板压掉右半边。
+                    .when(self.playlist_open, |el| {
+                        el.pl(px(0.)).pr(px(PLAYLIST_WIDTH + PLAYLIST_INSET))
+                    })
                     .child(self.render_capsule(cx)),
             )
     }
@@ -2365,9 +2945,8 @@ impl PlayerView {
         };
 
         let bitrate = status.video_bitrate + status.audio_bitrate;
-        let has_audio = !status.audio_codec.is_empty()
-            || status.audio_channels > 0
-            || status.audio_rate > 0;
+        let has_audio =
+            !status.audio_codec.is_empty() || status.audio_channels > 0 || status.audio_rate > 0;
         let audio = if !has_audio {
             // 一个音轨都没有时说「无音轨」，而不是留个 `—`：`—` 会被读成
             // "还没读到"，而这件事其实是确定的
@@ -2441,46 +3020,44 @@ impl PlayerView {
                             .text_color(overlay::fg())
                             .child("视频信息"),
                     )
-                    .child(
-                        v_flex()
-                            .gap(px(0.))
-                            .children(rows.into_iter().map(|(label, value)| {
-                                h_flex()
-                                    .h(px(22.))
-                                    .w_full()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap(px(8.))
-                                    .child(
-                                        div()
-                                            .flex_shrink_0()
-                                            .text_size(px(11.))
-                                            .text_color(overlay::label())
-                                            .child(label),
-                                    )
-                                    .child(
-                                        // 值必须能收窄 + 省略号：mpv 的编码名是
-                                        // `h264 / AVC / MPEG-4 AVC / MPEG-4` 这种并列
-                                        // 别名串，不截断会直接冲出卡片右边
-                                        div()
-                                            .min_w_0()
-                                            .flex_shrink(1.)
-                                            .truncate()
-                                            .font_family(mono_font())
-                                            .text_size(px(11.))
-                                            .text_color(overlay::fg())
-                                            .child(value),
-                                    )
-                            })),
-                    ),
+                    .child(v_flex().gap(px(0.)).children(rows.into_iter().map(
+                        |(label, value)| {
+                            h_flex()
+                                .h(px(22.))
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(8.))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(11.))
+                                        .text_color(overlay::label())
+                                        .child(label),
+                                )
+                                .child(
+                                    // 值必须能收窄 + 省略号：mpv 的编码名是
+                                    // `h264 / AVC / MPEG-4 AVC / MPEG-4` 这种并列
+                                    // 别名串，不截断会直接冲出卡片右边
+                                    div()
+                                        .min_w_0()
+                                        .flex_shrink(1.)
+                                        .truncate()
+                                        .font_family(mono_font())
+                                        .text_size(px(11.))
+                                        .text_color(overlay::fg())
+                                        .child(value),
+                                )
+                        },
+                    ))),
             )
     }
 
-    /// 悬浮胶囊：时间夹进度条 + 控制行，深色玻璃，**固定 760 宽**。
+    /// 悬浮胶囊：两行进度区 + 控制行，深色玻璃，**固定 760 宽**。
     ///
-    /// 高度是算出来的：12 + 16（进度行）+ 8 + 44（走带）+ 12 = 92，正好是设计稿的
-    /// 92。所有尺寸都是常数，不随窗口拉伸——设计稿里它是画面下方的一条窄带，
-    /// 两侧留出画面，不是铺满整宽的黑条。
+    /// 高度是算出来的：8 + 24（进度区：时间行 16 + 4 + 轨道 4）+ 8 + 44（走带）
+    /// + 8 = 92，正好是设计稿的 92。所有尺寸都是常数，不随窗口拉伸——设计稿里它
+    /// 是画面下方的一条窄带，两侧留出画面，不是铺满整宽的黑条。
     fn render_capsule(&self, cx: &mut Context<Self>) -> Div {
         // 外框负责定位/底色/圆角，内层负责 padding —— 夹在中间的 canvas 量到的
         // 就是胶囊的真实外框（含 padding），算区域时不会差一圈。
@@ -2520,7 +3097,12 @@ impl PlayerView {
             )
     }
 
-    /// 进度：轨道在上、时间行在下（左当前 / 右剩余）。
+    /// 进度区：**时间行在上、轨道在下**（左当前 / 右剩余），整块 24 高。
+    ///
+    /// 设计稿是一行「时间–轨道–时间」的老布局的下一版：时间挪到轨道上方两端，
+    /// 轨道因此能拿到整宽（714 = 760 − 2×20 − 2×side_pad − 4）。`side_pad` 是
+    /// 光学修正：图标在 20 盒里只占 13.2（内缩 3.3），轨道贴盒子边会比图标两端
+    /// 各宽出一截，所以往里收 2（spec 写 3，再扣掉胶囊那 1px 边框）。
     fn render_seek_row(&self, cx: &Context<Self>) -> Div {
         let track = self.current_track(cx);
         let duration = match &track {
@@ -2556,83 +3138,94 @@ impl PlayerView {
         };
         let remaining = (duration - position).max(0.0);
 
-        // 「时间夹滑块」：`42:17 | 8 | 轨道 596 | 8 | -1:26:27`。
+        // 设计稿的进度区是**两行**：上面一行两段时间码（两端对齐），下面一整条轨道。
         //
-        // 左右两段时间各占剩余空间（`flex_1` + 贴向轨道那一侧），轨道固定 596。
-        // 以前是"轨道一行、时间一行"，高度多占 16px 不说，眼睛还得上下跳着看；
-        // 夹在两端就能一边看进度一边看时间。
-        h_flex()
+        //   `42:17                                       -1:26:27`
+        //   `===============●───────────────────────────────────`
+        //
+        // 以前是「时间夹滑块」的单行（`42:17 | 轨道 596 | -1:26:27`）：轨道被时间码
+        // 挤到中间 596，两边留出两条空带，视觉上既不像设计稿，也让「轨道两端就是
+        // 作品的头尾」这条最基础的空间隐喻失效。
+        v_flex()
             .w_full()
-            .h(px(16.))
-            .items_center()
-            .gap(px(8.))
+            .h(px(PROGRESS_HEIGHT))
+            .gap(px(PROGRESS_GAP))
             .child(
-                div()
-                    .id("time-current")
-                    // 普通 div 不进命中测试树，`window.find(id)` 查不到 → 测试要用它
-                    .test_support()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .justify_end()
+                h_flex()
+                    .w_full()
+                    .h(px(PROGRESS_TIME_ROW))
+                    .px(px(PROGRESS_SIDE_PAD))
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
+                            .id("time-current")
+                            // 普通 div 不进命中测试树，`window.find(id)` 查不到 → 测试要用它
+                            .test_support()
                             .font_family(mono_font())
                             .text_size(px(TIME_SIZE))
                             .text_color(overlay::fg())
                             // 等宽数字：时间跳动时整行宽度不能跟着抖
                             .child(fmt_time(position)),
-                    ),
-            )
-            // Slider 自身没有 id / 无障碍信息（上游未实现），用带 id 的容器承载，
-            // 既给读屏软件一个可命名的分组，也让 UI 测试能定位到进度条几何。
-            .child(
-                div()
-                    .id("seek-bar")
-                    .aria_label("播放进度")
-                    .w(px(SEEK_TRACK_WIDTH))
-                    .h(px(16.))
-                    // 窄窗口（< 808）时允许收窄，否则 760 的胶囊会溢出被裁掉
-                    .flex_shrink(1.)
-                    .flex()
-                    .items_center()
-                    .test_support()
-                    .child(
-                        Slider::new(&self.seek)
-                            .bg(overlay::accent())
-                            .w_full()
-                            .disabled(self.current.is_none()),
-                    ),
-            )
-            .child(
-                div()
-                    .id("time-remaining")
-                    .test_support()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .justify_start()
+                    )
                     .child(
                         div()
+                            .id("time-remaining")
+                            .test_support()
                             .font_family(mono_font())
                             .text_size(px(TIME_SIZE))
                             .text_color(overlay::dim())
                             .child(format!("-{}", fmt_time(remaining))),
                     ),
             )
+            // 轨道带只有 4 高（设计稿），**点击热区**不能跟着变成 4：Slider 自己那层
+            // 是 24 高，绝对定位铺在轨道带正中，命中测试走的是它，手感还是 24。
+            //
+            // Slider 自身没有 id / 无障碍信息（上游未实现），用带 id 的容器承载，
+            // 既给读屏软件一个可命名的分组，也让 UI 测试能定位到进度条几何。
+            .child(
+                div().w_full().h(px(4.)).px(px(PROGRESS_SIDE_PAD)).child(
+                    div()
+                        .id("seek-bar")
+                        .aria_label("播放进度")
+                        .test_support()
+                        .relative()
+                        .w_full()
+                        .h(px(4.))
+                        // 窄窗口（< 808）时允许收窄，否则 760 的胶囊会溢出被裁掉
+                        .child(
+                            div()
+                                .absolute()
+                                .left(px(0.))
+                                .right(px(0.))
+                                .top(px(-10.))
+                                .h(px(24.))
+                                .flex()
+                                .items_center()
+                                .child(
+                                    Slider::new(&self.seek)
+                                        .bg(overlay::accent())
+                                        // 圆点用白色（设计稿）；不给 text_color 时
+                                        // 取的是主题的 slider_thumb，跟着皮肤漂
+                                        .text_color(gpui_kit::rgb(0xFFFFFF))
+                                        .w_full()
+                                        .disabled(self.current.is_none()),
+                                ),
+                        ),
+                ),
+            )
     }
 
     /// 控制行：左音量 · 中走带（上一首 / -10s / 播放 / +10s / 下一首）· 右功能。
     ///
     /// 左、右两栏都是 `flex_1`（`flex: 1 1 0%`，等宽），中间那栏才落在窗口正中。
+    /// 设计稿实测（1280 宽、胶囊 760 居中）：左组 158（ⓘ 20 + 14 + 喇叭 20 + 8 +
+    /// 音量 96）、走带 220（28/28/52/28/28 + 4×14）、右组 224（6×24 + 5×16）——
+    /// 两侧各剩 249，中间才真的居中。右组的**中心距 40** 是设计稿的节奏，别改成
+    /// 「图标 20 + 间距 20」了：那样字形只有 15，比设计稿的 15~17 小一圈。
     fn render_controls_row(&self, cx: &mut Context<Self>) -> Div {
         let is_dark = cx.theme().mode.is_dark();
         let playing = self.playback_state().is_playing();
-        let play_icon = if playing {
-            IconName::Pause
-        } else {
-            IconName::Play
-        };
         let volume_icon = match self.volume_pct {
             0 => IconName::VolumeX,
             v if v < 50 => IconName::Volume1,
@@ -2645,19 +3238,18 @@ impl PlayerView {
 
         h_flex()
             .w_full()
-            .h(px(44.))
+            .h(px(CONTROLS_ROW))
             .items_center()
-            .gap(px(12.))
             // ---- 左：信息（ⓘ）+ 音量 ----
             //
             // 设计稿把 ⓘ 放在左侧控制组的**最左**、音量图标之前；右组已经塞了
-            // 六个键（6×20 + 5×20 = 220），再挪进去就超宽了。
+            // 六个键（6×24 + 5×16 = 224），再挪进去就超宽了。
             .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
                     .items_center()
-                    .gap(px(16.))
+                    .gap(px(14.))
                     .when(is_video, |el| {
                         el.child(
                             Button::new("video-info")
@@ -2683,7 +3275,7 @@ impl PlayerView {
                             .gap(px(8.))
                             .child(
                                 Icon::new(volume_icon)
-                                    .size(px(16.))
+                                    .size(px(20.))
                                     .text_color(overlay::fg()),
                             )
                             .child(
@@ -2693,163 +3285,182 @@ impl PlayerView {
                                     .w(px(VOLUME_WIDTH))
                                     .flex()
                                     .test_support()
-                                    .child(Slider::new(&self.volume).bg(overlay::accent())),
+                                    .child(
+                                        Slider::new(&self.volume)
+                                            .bg(overlay::accent())
+                                            // 白圆点（设计稿）：不给 text_color 时取主题的
+                                            // `slider_thumb`，换个皮肤连圆点颜色都跟着漂
+                                            .text_color(gpui_kit::rgb(0xFFFFFF)),
+                                    ),
                             ),
                     ),
             )
-            // ---- 中：走带控制（不参与伸缩，恒在窗口正中） ----
+            // ---- 中：走带控制（不参与伸缩，恒在胶囊正中） ----
             .child(
                 h_flex()
                     .flex_shrink_0()
                     .items_center()
-                    .gap(px(20.))
+                    .gap(px(TRANSPORT_GAP))
                     .child(
-                        Button::new("prev")
-                            .ghost()
-                            .with_size(px(28.))
-                            .icon(IconName::SkipBack)
-                            .text_color(overlay::fg())
-                            .tooltip("上一首")
-                            .accessibility_label("上一首")
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.skip(-1, cx);
-                            })),
+                        chrome_button(
+                            "prev",
+                            Icon::default().data(ICON_PREV),
+                            "上一首",
+                            28.,
+                            false,
+                        )
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.skip(-1, cx);
+                        })),
                     )
                     .child(self.render_skip_button("seek-back-10", false, cx))
-                    // 设计稿：44 正圆、品牌 Mauve 实心、白色图标
+                    // 播放键：44 正圆 + 两侧各 4 的呼吸垫（设计稿圆和 ±10 之间比
+                    // 图标之间宽 8），外圈再压一层 Mauve 辉光——设计稿那颗圆是
+                    // 「亮着的」，纯色实心在深玻璃上会显得比周围图标还平。
                     .child(
-                        Button::new("play-pause")
-                            .primary()
-                            .with_size(px(44.))
-                            .rounded(px(22.))
-                            .bg(overlay::play())
-                            .text_color(gpui_kit::rgb(0xFFFFFF))
-                            .icon(play_icon)
-                            .tooltip(if playing { "暂停" } else { "播放" })
-                            .accessibility_label(if playing { "暂停" } else { "播放" })
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.toggle_play(cx);
-                            })),
+                        div().flex_shrink_0().p(px(PLAY_BREATH)).child(
+                            Button::new("play-pause")
+                                .primary()
+                                .with_size(px(PLAY_BUTTON))
+                                .rounded(px(PLAY_BUTTON / 2.))
+                                .bg(overlay::play())
+                                .text_color(gpui_kit::rgb(0xFFFFFF))
+                                .icon(Icon::default().data(if playing {
+                                    ICON_PAUSE_FILL
+                                } else {
+                                    ICON_PLAY_FILL
+                                }))
+                                .shadow(vec![BoxShadow {
+                                    color: overlay::play().opacity(0.35),
+                                    offset: point(px(0.), px(4.)),
+                                    blur_radius: px(18.),
+                                    spread_radius: px(0.),
+                                    inset: false,
+                                }])
+                                .tooltip(if playing { "暂停" } else { "播放" })
+                                .accessibility_label(if playing { "暂停" } else { "播放" })
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.toggle_play(cx);
+                                })),
+                        ),
                     )
                     .child(self.render_skip_button("seek-fwd-10", true, cx))
                     .child(
-                        Button::new("next")
-                            .ghost()
-                            .with_size(px(28.))
-                            .icon(IconName::SkipForward)
-                            .text_color(overlay::fg())
-                            .tooltip("下一首")
-                            .accessibility_label("下一首")
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.skip(1, cx);
-                            })),
+                        chrome_button(
+                            "next",
+                            Icon::default().data(ICON_NEXT),
+                            "下一首",
+                            28.,
+                            false,
+                        )
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.skip(1, cx);
+                        })),
                     ),
             )
-            // ---- 右：字幕 / 音轨 / 列表 / 全屏 / 换肤（设计稿 gap 20） ----
+            // ---- 右：字幕 / 音轨 / 主题 / 列表 / 全屏（设计稿顺序，间距 16） ----
+            //
+            // 设计稿还有第 4 个「画中画」，见本轮改动说明：它要一个独立的置顶小窗
+            // （视频要铺满整窗、腾掉标题带与胶囊），不是加个按钮的事，本轮先不挂
+            // 死按钮上去。
             .child(
                 h_flex()
                     .flex_1()
                     .min_w_0()
                     .items_center()
                     .justify_end()
-                    .gap(px(20.))
+                    .gap(px(16.))
                     .when(is_video, |el| {
                         el.child(
-                            Button::new("subtitles")
-                                .ghost()
-                                .with_size(px(20.))
-                                .icon(IconName::Captions)
-                                .text_color(overlay::fg())
-                                .tooltip("切换字幕轨")
-                                .accessibility_label("切换字幕轨")
-                                .on_click(cx.listener(|this, _e, _w, cx| {
+                            chrome_button(
+                                "subtitles",
+                                Icon::default().data(ICON_CC),
+                                "切换字幕轨",
+                                24.,
+                                false,
+                            )
+                            .on_click(cx.listener(
+                                |this, _e, _w, cx| {
                                     this.cycle_subtitles(cx);
-                                })),
+                                },
+                            )),
                         )
                         .child(
-                            Button::new("audio-track")
-                                .ghost()
-                                .with_size(px(20.))
-                                .icon(IconName::Volume2)
-                                .text_color(overlay::fg())
-                                .tooltip("切换音轨")
-                                .accessibility_label("切换音轨")
-                                .on_click(cx.listener(|this, _e, _w, cx| {
+                            chrome_button(
+                                "audio-track",
+                                Icon::default().data(ICON_AUDIO_BARS),
+                                "切换音轨",
+                                24.,
+                                false,
+                            )
+                            .on_click(cx.listener(
+                                |this, _e, _w, cx| {
                                     this.cycle_audio_track(cx);
-                                })),
+                                },
+                            )),
                         )
                     })
                     .child(
-                        Button::new("toggle-playlist")
-                            .ghost()
-                            .with_size(px(20.))
-                            .icon(IconName::ListMusic)
-                            .text_color(if playlist_open {
-                                overlay::accent()
-                            } else {
-                                overlay::fg()
-                            })
-                            .tooltip(if playlist_open {
-                                "收起播放列表"
-                            } else {
-                                "展开播放列表"
-                            })
-                            .accessibility_label(if playlist_open {
-                                "收起播放列表"
-                            } else {
-                                "展开播放列表"
-                            })
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.toggle_playlist(cx);
-                            })),
-                    )
-                    .when(is_video, |el| {
-                        el.child(
-                            Button::new("cinema")
-                                .ghost()
-                                .with_size(px(20.))
-                                .icon(if cinema {
-                                    IconName::Minimize
-                                } else {
-                                    IconName::Maximize
-                                })
-                                .text_color(overlay::fg())
-                                .tooltip(if cinema { "退出全屏" } else { "全屏" })
-                                .accessibility_label(if cinema {
-                                    "退出全屏"
-                                } else {
-                                    "进入全屏"
-                                })
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.toggle_cinema(window, cx);
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("theme-toggle")
-                            .ghost()
-                            .with_size(px(20.))
-                            .icon(if is_dark {
+                        chrome_button(
+                            "theme-toggle",
+                            Icon::new(if is_dark {
                                 IconName::Sun
                             } else {
                                 IconName::Moon
-                            })
-                            .text_color(overlay::fg())
-                            .tooltip("明暗主题切换")
-                            .accessibility_label(if is_dark {
+                            }),
+                            if is_dark {
                                 "切换到浅色主题"
                             } else {
                                 "切换到深色主题"
-                            })
-                            .on_click(cx.listener(|_this, _e, _w, cx| {
-                                let next = if cx.theme().mode.is_dark() {
-                                    ThemeMode::Light
+                            },
+                            24.,
+                            false,
+                        )
+                        .on_click(cx.listener(|_this, _e, _w, cx| {
+                            let next = if cx.theme().mode.is_dark() {
+                                ThemeMode::Light
+                            } else {
+                                ThemeMode::Dark
+                            };
+                            Theme::change(next, None, cx);
+                        })),
+                    )
+                    .child(
+                        chrome_button(
+                            "toggle-playlist",
+                            Icon::default().data(ICON_LIST_LINES),
+                            if playlist_open {
+                                "收起播放列表"
+                            } else {
+                                "展开播放列表"
+                            },
+                            24.,
+                            playlist_open,
+                        )
+                        .on_click(cx.listener(|this, _e, _w, cx| {
+                            this.toggle_playlist(cx);
+                        })),
+                    )
+                    .when(is_video, |el| {
+                        el.child(
+                            chrome_button(
+                                "cinema",
+                                Icon::new(if cinema {
+                                    IconName::Minimize
                                 } else {
-                                    ThemeMode::Dark
-                                };
-                                Theme::change(next, None, cx);
-                            })),
-                    ),
+                                    IconName::Maximize
+                                }),
+                                if cinema { "退出全屏" } else { "全屏" },
+                                24.,
+                                false,
+                            )
+                            .on_click(cx.listener(
+                                |this, _e, window, cx| {
+                                    this.toggle_cinema(window, cx);
+                                },
+                            )),
+                        )
+                    }),
             )
     }
 
@@ -2878,6 +3489,12 @@ impl PlayerView {
         Button::new(id)
             .ghost()
             .with_size(px(28.))
+            // 带子元素的 Button 会退回「普通按钮」分支，自己加 `px(size*0.2)`
+            // 的左右内边距（28 → 35.2），走带的中心距就全歪了。这里显式压掉
+            // padding 并钉死 28×28：走带总宽才是设计稿的 220。
+            .p(px(0.))
+            .w(px(28.))
+            .h(px(28.))
             .text_color(overlay::fg())
             .tooltip(label)
             .accessibility_label(label)
@@ -2888,11 +3505,12 @@ impl PlayerView {
             .child(
                 div()
                     .relative()
-                    .size(px(20.))
+                    .size(px(24.))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(Icon::default().data(svg).size(px(18.)))
+                    // 24 格视图缩到 22：弧线直径 ≈ 18，设计稿字形 20（±1 是描边）
+                    .child(Icon::default().data(svg).size(px(22.)))
                     .child(
                         // 绝对定位必须给四边，否则它按"静态位置"排在图标后面，
                         // 数字会跑到圆弧右边去。
@@ -3020,6 +3638,55 @@ impl PlayerView {
     /// 测试用：视频信息卡是否展开。
     pub(crate) fn test_info_open(&self) -> bool {
         self.info_open
+    }
+
+    /// 测试用：面板是否停在「章节」页。
+    pub(crate) fn test_chapter_tab(&self) -> bool {
+        self.chapter_tab
+    }
+
+    /// 测试用：循环 / 随机 / 排序三档的当前值（面板底部那一排按钮）。
+    pub(crate) fn test_play_modes(&self) -> (RepeatMode, bool, persistence::SortOrder) {
+        (
+            self.settings.repeat,
+            self.settings.shuffle,
+            self.settings.sort,
+        )
+    }
+
+    /// 测试用：列表里每一行的标题（排序后就靠它验顺序）。
+    pub(crate) fn test_titles(&self, cx: &App) -> Vec<String> {
+        self.playlist
+            .read(cx)
+            .delegate()
+            .tracks()
+            .iter()
+            .map(|t| t.title.clone())
+            .collect()
+    }
+
+    /// 测试用：走 tick 的同一条路径补时长，返回是否真的写进去了。
+    ///
+    /// 无头环境起不了 mpv，视频时长只能这样喂进来。
+    pub(crate) fn test_backfill_duration(
+        &mut self,
+        row: usize,
+        secs: f64,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let before = self
+            .playlist
+            .read(cx)
+            .delegate()
+            .track(row)
+            .and_then(|t| t.duration_secs);
+        self.backfill_track_duration(row, secs, cx);
+        self.playlist
+            .read(cx)
+            .delegate()
+            .track(row)
+            .and_then(|t| t.duration_secs)
+            != before
     }
 
     /// 测试用：影院状态（`Esc` / 双击画面 / 最大化按钮都要能改它）。
