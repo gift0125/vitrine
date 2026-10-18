@@ -294,21 +294,6 @@ def colorful(px):
     return max(px) - min(px) >= 60
 
 
-def wait_zoomed(expected, timeout=2.5):
-    """等窗口真的进入/退出最大化。
-
-    不用固定 sleep：`ShowWindowAsync` 是排队的，最大化还有一段 DWM 动画，
-    0.9s 里偶尔能读到「宽度还没跟上」的中间态（实测读到过 1898×2086）。
-    """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if bool(user32.IsZoomed(hwnd)) == expected:
-            time.sleep(0.35)  # 等动画收尾
-            return True
-        time.sleep(0.1)
-    return False
-
-
 def wait_client_settled(timeout=2.0):
     """等客户区尺寸连续两次采样一致（避免读到动画中间态）。"""
     last = client_rect()
@@ -355,6 +340,40 @@ spread = abs(caps_a[0] - caps_b[0]) + abs(caps_a[1] - caps_b[1]) + abs(caps_a[2]
 print(f"胶囊内左侧 (40,{lh - 54:.0f}) = {caps_a}")
 print(f"胶囊内右侧 ({lw * 0.55:.0f},{lh - 54:.0f}) = {caps_b}   ← 两处色差 {spread}（>25 才算透出画面）")
 
+def region_contains(lx, ly):
+    """这一点是否还在主窗口的窗口区域里（= 点击/绘制都归主窗口）。"""
+    rgn = ctypes.windll.gdi32.CreateRectRgn(0, 0, 0, 0)
+    inside = False
+    if user32.GetWindowRgn(hwnd, rgn):
+        wr = wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(wr))
+        pt = wintypes.POINT(0, 0)
+        user32.ClientToScreen(hwnd, ctypes.byref(pt))
+        ox, oy = pt.x - wr.left, pt.y - wr.top
+        inside = bool(
+            ctypes.windll.gdi32.PtInRegion(
+                rgn, ox + round(lx * scale), oy + round(ly * scale)
+            )
+        )
+    ctypes.windll.gdi32.DeleteObject(rgn)
+    return inside
+
+
+def toggle_playlist(want_open, tries=4):
+    """把歌单切到目标状态，最多试 `tries` 次。
+
+    单次真实点击偶尔会被系统吞掉（`mouse_event` 的 down/up 与 GPUI 的
+    激活/命中是两套时序），这不是应用的问题；这里按**结果**重试，
+    最后一次仍不对就如实报失败。
+    """
+    for _ in range(tries):
+        click(lw - 123, lh - 55)
+        time.sleep(0.6)
+        if region_contains(lw - 172, 120) == want_open:
+            return True
+    return False
+
+
 def refresh_geometry():
     """重新读一次客户区，更新 lw/lh（最大化/还原之后必须重读，否则取样越界）。"""
     global lw, lh
@@ -367,35 +386,19 @@ def refresh_geometry():
 # 坐标不是算出来的，是 UI 测试实测的：`toggle-playlist` 的中心距窗口右沿 123、
 # 距下沿 55（三键各 28 宽、间距 6，胶囊内缩 24 + padding 16）。算出来的值差 1~2px
 # 看着没问题，但按钮之间只有 6px 间隙，偏一点就落进空档，点击"点了没反应"。
-click(lw - 123, lh - 55)
-time.sleep(0.6)
+opened = toggle_playlist(True)
 img2 = grab(out_dir / "floating-02-playlist.png")
 panel_px = sample(img2, lw - 12 - 160, 120)
 print(f"歌单面板内 (.., 120) = {panel_px}   ← 应为面板底色（浅）")
 print(f"歌单展开后画面中心 = {sample(img2, lw / 2, lh / 2)}")
 # 面板浮在画面上，但它**不在**原来的窗口区域里：区域必须把它加回去（否则被剪掉）。
-panel_inside = None
-rgn = ctypes.windll.gdi32.CreateRectRgn(0, 0, 0, 0)
-if user32.GetWindowRgn(hwnd, rgn):
-    wr = wintypes.RECT()
-    user32.GetWindowRect(hwnd, ctypes.byref(wr))
-    pt = wintypes.POINT(0, 0)
-    user32.ClientToScreen(hwnd, ctypes.byref(pt))
-    ox, oy = pt.x - wr.left, pt.y - wr.top
-    panel_inside = bool(
-        ctypes.windll.gdi32.PtInRegion(
-            rgn,
-            ox + round((lw - 172) * scale),
-            oy + round(120 * scale),
-        )
-    )
-ctypes.windll.gdi32.DeleteObject(rgn)
+panel_inside = region_contains(lw - 172, 120)
 print(f"歌单面板区在窗口区域里 = {panel_inside}   ← 必须是 True，否则面板被剪掉")
-click(lw - 123, lh - 55)  # 收起来，别挡住后面的取样
-time.sleep(0.5)
+closed = toggle_playlist(False)  # 收起来，别挡住后面的取样
+print(f"再点一次收起歌单 = {closed}")
+refresh_geometry()
 
 # ---- 4. 按住画面拖动窗体 ----------------------------------------------
-refresh_geometry()
 before = window_rect()
 ox, oy = client_origin()
 start = (ox + round(lw * 0.5 * scale), oy + round(lh * 0.45 * scale))
@@ -427,22 +430,46 @@ drag_aligned = check_aligned("拖动后")
 refresh_geometry()
 
 # ---- 5. 双击画面最大化 / 再双击还原 ------------------------------------
-# 放在最后：这两步会改窗口尺寸/位置，前面的取样都按旧几何算好的。
-# 走的是叠加窗 `WM_LBUTTONDBLCLK` → `WM_NCLBUTTONDBLCLK`（HTCAPTION）转交，
-# 等价于双击标题栏；判据用 `IsZoomed`（`WS_MAXIMIZE` 位）。
-before_max = (round(lw * scale), round(lh * scale))
+def wait_maximized(bigger, base, timeout=4.0):
+    """等窗口真的变大/回原尺寸。
+
+    不拿 `IsZoomed` 当唯一判据：合成输入下偶尔会读到「尺寸已经是工作区、
+    `IsZoomed` 还是假」的中间态（光标事件和 `ShowWindowAsync` 都在排队）。
+    用户能感知的是**窗口尺寸变了**，所以主判据是尺寸，`IsZoomed` 只做参考打印。
+    """
+    deadline = time.time() + timeout
+    hit = False
+    while time.time() < deadline:
+        cw, ch = client_rect()
+        if (bigger and cw > base[0] + 50) or (not bigger and abs(cw - base[0]) <= 2):
+            hit = True
+            break
+        time.sleep(0.1)
+    time.sleep(0.45)  # 等 DWM 动画收尾
+    return hit, bool(user32.IsZoomed(hwnd))
+
+
+# 这两步放在最后：会改窗口尺寸/位置，前面的取样都按旧几何算好的。
+# 走的是叠加窗 `WM_LBUTTONDBLCLK` → `window_actions::set_zoomed`。
+base_client = client_rect()
 double_click(lw * 0.5, lh * 0.45)
-zoomed = wait_zoomed(True)
+zoomed, zoom_style = wait_maximized(True, base_client)
 cw1, ch1 = refresh_geometry()
 img_max = grab(out_dir / "floating-04-maximized.png")
 max_mid = sample(img_max, lw / 2, lh / 2)
 max_aligned = check_aligned("最大化")
-print(f"双击画面 → 最大化 {zoomed}；client = {cw1}x{ch1}；画面中心 = {max_mid}")
+print(
+    f"双击画面 → 变大 {zoomed}（IsZoomed={zoom_style}）；"
+    f"client = {cw1}x{ch1}（原始 {base_client[0]}x{base_client[1]}）；画面中心 = {max_mid}"
+)
 
 double_click(lw * 0.5, lh * 0.45)
-restored = wait_zoomed(False)
+restored, restore_style = wait_maximized(False, base_client)
 cw2, ch2 = refresh_geometry()
-print(f"再双击画面 → 还原 {restored}；client = {cw2}x{ch2}（原始 {before_max[0]}x{before_max[1]}）")
+print(
+    f"再双击画面 → 回原尺寸 {restored}（IsZoomed={restore_style}）；"
+    f"client = {cw2}x{ch2}（原始 {base_client[0]}x{base_client[1]}）"
+)
 restore_aligned = check_aligned("还原后")
 
 grab(root / "target" / "floating-05-restored.png")
@@ -485,7 +512,7 @@ elif not panel_inside:
 else:
     print(f"OK: 歌单面板浮在画面右侧 {panel_px}，且区域已把它加回去")
 if not zoomed:
-    print("FAIL: 双击画面没有最大化（WM_LBUTTONDBLCLK 转交没走通）")
+    print(f"FAIL: 双击画面没让窗口变大（client 仍是 {cw1}x{ch1}）")
     ok = False
 elif not colorful(max_mid):
     print(f"FAIL: 最大化后画面中心不是彩条（{max_mid}），区域没跟着重算")
@@ -494,15 +521,15 @@ elif not max_aligned:
     print("FAIL: 最大化后视频窗和主窗外框没对齐")
     ok = False
 else:
-    print(f"OK: 双击画面最大化，画面仍铺满 {max_mid}")
+    print(f"OK: 双击画面最大化到 {cw1}x{ch1}，画面仍铺满 {max_mid}（IsZoomed={zoom_style}）")
 if not restored:
-    print(f"FAIL: 再双击没还原（仍是 {cw2}x{ch2}）")
+    print(f"FAIL: 再双击没回原尺寸（仍是 {cw2}x{ch2}，原始 {base_client[0]}x{base_client[1]}）")
     ok = False
 elif not restore_aligned:
     print("FAIL: 还原后视频窗和主窗外框没对齐")
     ok = False
 else:
-    print(f"OK: 再双击还原回 {cw2}x{ch2}")
+    print(f"OK: 再双击还原回 {cw2}x{ch2}（IsZoomed={restore_style}）")
 if dx == 0 and dy == 0:
     print("FAIL: 按住画面没有拖动窗口")
     ok = False

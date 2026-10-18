@@ -203,6 +203,7 @@ mod win {
         fn ReleaseCapture() -> i32;
         fn SetCapture(hwnd: Hwnd) -> Hwnd;
         fn GetCursorPos(point: *mut Point) -> i32;
+        fn SetForegroundWindow(hwnd: Hwnd) -> i32;
         fn IsZoomed(hwnd: Hwnd) -> i32;
         fn SetWindowRgn(hwnd: Hwnd, region: Hwnd, redraw: i32) -> i32;
     }
@@ -318,6 +319,10 @@ mod win {
             // 画面这块不在主窗口的区域里，按下来的是我们：自己开一轮拖动。
             let main = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
             if main != 0 && unsafe { IsIconic(main) } == 0 && unsafe { IsZoomed(main) } == 0 {
+                // 先激活主窗口。这块窗口是 `WS_EX_NOACTIVATE`（点了不抢焦点才不闪），
+                // 所以系统不会替我们把主窗提到前台——不显式做一次，用户点画面
+                // 既不会激活窗口、第一次双击还会被系统当成「激活」吃掉。
+                activate(main);
                 let mut cursor = Point::default();
                 let mut rect = Rect::default();
                 unsafe {
@@ -379,6 +384,7 @@ mod win {
             // 位弄丢（窗口撑到工作区、`IsZoomed` 却是假，标题带图标和"再点还原"全乱）。
             let main = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
             if main != 0 {
+                activate(main);
                 let zoomed = unsafe { IsZoomed(main) } != 0;
                 crate::window_actions::set_zoomed(main, !zoomed);
             }
@@ -399,6 +405,18 @@ mod win {
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// 把主窗口提到前台。
+    ///
+    /// 这一下鼠标事件是投给本进程的，系统因此允许我们调 `SetForegroundWindow`
+    /// （前台权限的判定规则之一），不会像纯后台进程那样被静默忽略。
+    fn activate(main: Hwnd) {
+        if main != 0 {
+            unsafe {
+                SetForegroundWindow(main);
+            }
+        }
     }
 
     /// 外框矩形（物理屏幕像素）：x, y, w, h。
