@@ -13,6 +13,11 @@ serde_json = { workspace = true }
 rfd = "0.15"
 directories = "6"
 raw-window-handle = "0.6"
+# 把 mpv 的软件渲染帧包成 GPUI 纹理：`RenderImage` 的入参是 `image::Frame`，
+# 必须和 gpui-pre 用同一个 `image` 版本（0.25），否则类型对不上。
+image = "0.25"
+# mpv 的「有新帧了」回调跑在它自己的线程上，只能用一条线程安全的信号通道叫醒 UI。
+async-channel = "2"
 
 [target.'cfg(windows)'.build-dependencies]
 # 把图标 + 版本信息写进 exe 的 PE 资源（GPUI 只认 ID=1 的图标组，见 build.rs）

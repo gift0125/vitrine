@@ -1,9 +1,12 @@
 """启动应用 → 置顶定位 → 截客户区。用于对照设计稿做视觉验收。
 
-用法：python scripts/shot.py <输出png> [--dark] [--w 1040] [--h 680]
+用法：python scripts/shot.py <输出png> [--dark] [--w 1040] [--h 680] [--no-resize]
                               [--click "x,y"]|--real-click "x,y"]...
                               [--wait 2.0] [--keep]
                               [--margin 16] [-- <透传给应用的参数>]
+
+--no-resize 不碰窗口尺寸，只拍当前客户区（缩回逻辑像素）。视频模式下窗口是应用
+按画面尺寸自己长出来的，外部改尺寸会和 `fit_to_video` 打架（它在首帧之后才跑）。
 
 --click 可以给多次，按顺序投递点击（例如先展开播放列表、再点某一集）。
 `--` 之后的参数原样传给应用（例如 `-- --play D:\\movie.mp4` 直接起播）。
@@ -40,6 +43,7 @@ except Exception:  # noqa: BLE001 - 老系统没有 shcore
 
 HWND_TOPMOST = -1
 SWP_SHOWWINDOW = 0x0040
+SWP_NOSIZE = 0x0001
 
 root = Path(__file__).resolve().parent.parent
 # 默认拍 debug 构建；验发布包时用 SMP_EXE=target/release/simple-media-player.exe
@@ -78,14 +82,6 @@ user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
 user32.GetDpiForWindow.argtypes = [wintypes.HWND]
 user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.GetWindowLongW.restype = ctypes.c_long
-try:
-    user32.AdjustWindowRectExForDpi.argtypes = [
-        ctypes.POINTER(wintypes.RECT), ctypes.c_uint32, wintypes.BOOL,
-        ctypes.c_uint32, ctypes.c_uint32,
-    ]
-    HAS_ADJUST_DPI = True
-except AttributeError:  # Win10 1607 之前没有这个 API
-    HAS_ADJUST_DPI = False
 
 cmd = [str(exe)] + (["--dark"] if dark else []) + passthrough
 log = root / "target" / "shot-stderr.log"
@@ -107,22 +103,33 @@ if not hwnd:
 scale = user32.GetDpiForWindow(hwnd) / 96.0
 phys_w, phys_h = round(width * scale), round(height * scale)
 margin_px = round(margin * scale)
+# `--no-resize`：不碰窗口尺寸，只拍当前客户区（按 DPI 缩回逻辑像素）。
+# 视频模式下窗口是应用自己按画面尺寸长出来的，外部改尺寸会和它打架
+# （fit_to_video 在首帧之后才跑，晚于这里的 SetWindowPos）。
+no_resize = "--no-resize" in args
 
-# SetWindowPos 设的是**窗口**尺寸，客户区会少掉边框和标题栏（实测 1560 的外框
-# 只给出 1538 的客户区），截完再拉伸就会让 1px 的边距对不上。这里先按目标客户区
-# 反推外框尺寸，保证截图是严格的 1:1 逻辑像素。
-outer_w, outer_h = phys_w, phys_h
-if HAS_ADJUST_DPI:
-    style = user32.GetWindowLongW(hwnd, -16)  # GWL_STYLE
-    exstyle = user32.GetWindowLongW(hwnd, -20)  # GWL_EXSTYLE
-    frame = wintypes.RECT(0, 0, phys_w, phys_h)
-    if user32.AdjustWindowRectExForDpi(
-        ctypes.byref(frame), style, False, exstyle, round(scale * 96)
-    ):
-        outer_w = frame.right - frame.left
-        outer_h = frame.bottom - frame.top
+# SetWindowPos 设的是**窗口**尺寸，客户区可能比它小一圈。这里不用
+# `AdjustWindowRectExForDpi` 反推——那是按「标准外框」算的，而本应用子类化了
+# `WM_NCCALCSIZE`（客户区铺满窗口矩形），照它反推会**多减一圈边框**：
+# 请求 1920×1080 只得到 1898×1024 的客户区，截图再拉回去就把画面拉扁了。
+# 直接量一次「当前窗口矩形 − 当前客户区」，这个差值在任何 DPI 下都成立。
+wr0 = wintypes.RECT()
+user32.GetWindowRect(hwnd, ctypes.byref(wr0))
+cr0 = wintypes.RECT()
+user32.GetClientRect(hwnd, ctypes.byref(cr0))
+frame_w = (wr0.right - wr0.left) - cr0.right
+frame_h = (wr0.bottom - wr0.top) - cr0.bottom
+outer_w, outer_h = phys_w + frame_w, phys_h + frame_h
 
-user32.SetWindowPos(hwnd, HWND_TOPMOST, margin_px, margin_px, outer_w, outer_h, SWP_SHOWWINDOW)
+if no_resize:
+    # 只置顶 + 归位，尺寸交给应用（0 + SWP_NOSIZE）
+    user32.SetWindowPos(
+        hwnd, HWND_TOPMOST, margin_px, margin_px, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW
+    )
+else:
+    user32.SetWindowPos(
+        hwnd, HWND_TOPMOST, margin_px, margin_px, outer_w, outer_h, SWP_SHOWWINDOW
+    )
 user32.SetForegroundWindow(hwnd)
 
 
@@ -152,16 +159,17 @@ def wait_settled():
     return last
 
 
-# 关掉系统标题栏后客户区比 AdjustWindowRect 估出来的高一截（它按标准外框算），
-# 所以用实测客户区再修正外框，保证截出来是严格的 1:1。
-for _ in range(4):
-    cw, ch = wait_settled()
-    dx, dy = phys_w - cw, phys_h - ch
-    if abs(dx) <= 1 and abs(dy) <= 1:
-        break
-    outer_w += dx
-    outer_h += dy
-    user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, outer_w, outer_h, SWP_SHOWWINDOW)
+# 万一客户区还差一两像素（DWM 边距、最小尺寸夹取），再修一次外框。`--no-resize`
+# 时跳过这一切，按应用自己给的客户区截。
+if not no_resize:
+    for _ in range(4):
+        cw, ch = wait_settled()
+        dx, dy = phys_w - cw, phys_h - ch
+        if abs(dx) <= 1 and abs(dy) <= 1:
+            break
+        outer_w += dx
+        outer_h += dy
+        user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, outer_w, outer_h, SWP_SHOWWINDOW)
 
 
 def window_rect():
@@ -222,7 +230,12 @@ box = (
     pt.y + rect.bottom + margin_px,
 )
 img = ImageGrab.grab(bbox=box)
-want = (width + margin * 2, height + margin * 2)
+if no_resize:
+    # 按**物理像素**原样输出：视频模式 1:1 时客户区正好等于画面像素数
+    # （720p 片子 = 1280×720 物理），缩回逻辑像素反而会把画面压扁。
+    want = img.size
+else:
+    want = (width + margin * 2, height + margin * 2)
 if img.size != want:
     img = img.resize(want, Image.LANCZOS)
 out.parent.mkdir(parents=True, exist_ok=True)

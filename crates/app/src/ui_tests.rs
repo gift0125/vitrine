@@ -22,7 +22,6 @@ use smallvec::SmallVec;
 
 use crate::persistence::{self, Settings};
 use crate::player_view::{chrome_visible_target, seek_target, short_codec, PlayerView};
-use crate::video_overlay::OverlayEvent;
 
 /// 每个用例一个独立临时目录，避免并行执行时互相踩。
 fn fresh_dir(tag: &str) -> PathBuf {
@@ -672,10 +671,10 @@ fn chrome_region_covers_capsule_and_panel(cx: &mut TestAppContext) {
         // 注意：`covered` 必须显式收 rects。写成闭包捕获的话，后面 `let rects = ...`
         // 重新绑定只会遮蔽外层变量，闭包仍然指着**第一版**（还没含面板），
         // 断言就会假失败——这条踩过一次。
-        fn covered(rects: &[crate::video_overlay::ChromeRect], x: f32, y: f32) -> bool {
+        fn covered(rects: &[crate::ui_state::Rect], x: f32, y: f32) -> bool {
             rects
                 .iter()
-                .any(|r| x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height)
+                .any(|r| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
         }
 
         // 标题带左端（拖动区）和窗口按钮都在里面
@@ -747,7 +746,7 @@ fn double_click_enters_cinema_and_escape_returns_to_window(cx: &mut TestAppConte
 
         // 画面上的双击：视频窗把事件排队，tick 取走 → 切全屏
         view.update(cx, |view, cx| {
-            view.test_on_overlay_event(OverlayEvent::ToggleCinema, window, cx);
+            view.test_toggle_cinema(window, cx);
         });
         assert!(view.read(cx).test_cinema(), "双击画面应进入全屏播放");
         assert!(
@@ -782,7 +781,7 @@ fn maximize_button_leaves_cinema(cx: &mut TestAppContext) {
         view.update(cx, |view, _| view.test_set_video_mode(true));
         window.render_frame(cx);
         view.update(cx, |view, cx| {
-            view.test_on_overlay_event(OverlayEvent::ToggleCinema, window, cx);
+            view.test_toggle_cinema(window, cx);
         });
         assert!(view.read(cx).test_cinema());
 
@@ -830,8 +829,8 @@ fn title_band_spans_full_width(cx: &mut TestAppContext) {
             assert!(
                 rects.iter().any(|rect| rect.x <= 0.5
                     && rect.y <= 0.5
-                    && (rect.width - bounds.size.width.as_f32()).abs() <= 1.0
-                    && rect.height >= 30.0),
+                    && (rect.w - bounds.size.width.as_f32()).abs() <= 1.0
+                    && rect.h >= 30.0),
                 "标题带在窗口区域里必须覆盖整宽（video={video}）：{rects:?} vs 窗口宽 {}",
                 bounds.size.width.as_f32()
             );
@@ -961,16 +960,16 @@ fn capsule_is_760_by_92_and_progress_is_two_rows(cx: &mut TestAppContext) {
         // 顺序：0 标题带、1 底部渐隐遮罩、2 胶囊（挖洞时各自带 1.5 的抗锯齿留白）
         let capsule = rects.get(2).expect("视频模式必须有胶囊的窗口区域");
         assert!(
-            (capsule.width - 760.0).abs() <= 3.5,
+            (capsule.w - 760.0).abs() <= 3.5,
             "胶囊宽应贴设计稿 760（含留白），实际 {}",
-            capsule.width
+            capsule.w
         );
         assert!(
-            (capsule.height - 92.0).abs() <= 3.5,
+            (capsule.h - 92.0).abs() <= 3.5,
             "胶囊高应贴设计稿 92（含留白），实际 {}",
-            capsule.height
+            capsule.h
         );
-        let capsule_center = capsule.x + capsule.width / 2.0;
+        let capsule_center = capsule.x + capsule.w / 2.0;
         assert!(
             (capsule_center - bounds.size.width.as_f32() / 2.0).abs() <= 2.0,
             "胶囊必须水平居中：中心 {capsule_center} vs 窗口 {}",
@@ -1075,9 +1074,9 @@ fn capsule_is_760_by_92_and_progress_is_two_rows(cx: &mut TestAppContext) {
         }
         // 最右键中心 = 区域右沿 − 1.5（挖洞留白）− 1（描边）− 20（padding）− 12（半个键）
         assert!(
-            (cinema - (capsule.x + capsule.width - 34.5)).abs() <= 2.5,
+            (cinema - (capsule.x + capsule.w - 34.5)).abs() <= 2.5,
             "右组最右键应贴胶囊内右沿：{cinema} vs {}",
-            capsule.x + capsule.width
+            capsule.x + capsule.w
         );
     })
     .unwrap();
@@ -1122,7 +1121,7 @@ fn info_card_toggles_and_is_carved_out(cx: &mut TestAppContext) {
         assert!(
             rects.iter().any(|rect| {
                 (rect.x - card.left().as_f32()).abs() <= 3.0
-                    && (rect.width - card.size.width.as_f32()).abs() <= 3.0
+                    && (rect.w - card.size.width.as_f32()).abs() <= 3.0
             }),
             "信息卡必须进窗口区域，否则会被叠加窗盖住：{rects:?}"
         );
@@ -1357,13 +1356,14 @@ fn chrome_fades_only_when_a_video_is_playing_and_idle() {
     assert!(chrome_visible_target(false, true, false, IDLE * 4));
 }
 
-/// 淡到 0 之后，主窗口的区域必须**整块让给画面**。
+/// 淡到 0 之后，`chrome_rects` 必须**一个都不留**。
 ///
-/// 只把元素画成透明是不够的：那几块还留在区域里，鼠标移过去会落在看不见的按钮上
-/// （点击被吃掉、拖不动画面），画面也少了一块"能点的区域"。反过来，淡出/淡入的
-/// 中途（alpha 0.5）区域还得留着，否则玻璃会闪一下才回来。
+/// 它现在是验收脚本与测试共用的几何真相：脚本凭它算「控件在哪」，测试凭它断言
+/// 「淡出后不该再有控件」。所以「淡掉」必须同时体现为「布局里没有 chrome」——
+/// 只画成透明会让探针继续报告一组看不见的按钮，脚本照着点就会点空。
+/// 反过来，淡出/淡入的中途（alpha 0.5）还得留着，否则玻璃会闪一下才回来。
 #[gpui_kit::test]
-fn hidden_chrome_leaves_no_window_region(cx: &mut TestAppContext) {
+fn hidden_chrome_leaves_no_rects(cx: &mut TestAppContext) {
     fresh_dir("chrome-fade-region");
     let (window, view) = open_view(cx, Vec::new());
     cx.update_window(window, |_, window, cx| {
@@ -1371,7 +1371,7 @@ fn hidden_chrome_leaves_no_window_region(cx: &mut TestAppContext) {
         window.render_frame(cx);
         assert!(
             !view.read(cx).test_chrome_rects(window).is_empty(),
-            "亮着的时候区域里必须有 chrome"
+            "亮着的时候必须报告 chrome"
         );
 
         // 淡到一半：还在区域里（玻璃正在变透明，但整块仍是主窗口画的）
@@ -1379,7 +1379,7 @@ fn hidden_chrome_leaves_no_window_region(cx: &mut TestAppContext) {
         window.render_frame(cx);
         assert!(
             !view.read(cx).test_chrome_rects(window).is_empty(),
-            "淡出途中区域不能提前收缩，否则会看到一块「闪掉」的画面"
+            "淡出途中不能提前清空，否则玻璃会闪一下才回来"
         );
 
         // 完全淡掉：一个矩形都不留
@@ -1387,10 +1387,10 @@ fn hidden_chrome_leaves_no_window_region(cx: &mut TestAppContext) {
         window.render_frame(cx);
         assert!(
             view.read(cx).test_chrome_rects(window).is_empty(),
-            "淡出完成后必须把整窗让出去，否则看不见的按钮还会吃点击"
+            "淡出完成后必须一块都不留，否则探针会报告一组看不见的按钮"
         );
 
-        // 鼠标一动 → 淡回来 → 区域跟着回来
+        // 鼠标一动 → 淡回来 → 布局跟着回来
         view.update(cx, |view, _| view.test_set_chrome_alpha(1.0));
         window.render_frame(cx);
         assert!(!view.read(cx).test_chrome_rects(window).is_empty());

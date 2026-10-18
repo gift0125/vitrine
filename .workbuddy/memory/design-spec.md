@@ -29,16 +29,18 @@
 - 帧上实测（逻辑像素）：播放键直径 **44**、中心距胶囊左沿 **379.75**；走带键中心 **−96/−54/0/+54/+96**；
   轨道 **283..997 @ y28..32**（4px）、已播放 `#CBA6F7`；时间墨迹字高 **8**、左上 **(24,12)**；
   右组 6 枚中心距 **40**、最右距右沿 **30**；展开态胶囊 **x=88**、面板 **936..1255 / y48**。
-- 实现侧两处**有意偏差**：右组盒子 20→**24**（点击热区），图标居中所以离右沿多 3.3px；玻璃维持
-  **平 72%** 而非 L3（拿不到区域级 backdrop blur）。
+- 实现侧两处**有意偏差**：右组盒子 20→**24**（点击热区），图标居中所以离右沿多 3.3px。
 - 面板是 Latte 浅底 → 面板上的图标/文字**一律走主题色**，`overlay::*` 那套是给深玻璃胶囊的。
+
+> 2026-10-18 第十五轮之后：**L3 已落地**（画面进 GPUI 合成树，模糊底 = 同一帧降到 48×20 再拉伸），
+> 「平 72% 玻璃」这条偏差只对信息卡/标题带成立（用的是同一张模糊图 + 72% 平铺）。
 
 
 ## 控制栏质感（2026-10-18 定稿 L3）
 
 - 三层：L1 方向光（纯样式，现在就能做）→ L2 画面染色（只取 HSL hue，S 46% / L 36%，切歌算一次缓存）→ L3 真模糊（`backdrop blur 56 + saturate 175% + brightness 1.05`，底色降 `.48`，**依赖 libmpv render API 进合成树**）。
 - 已定稿 **L3**，精确数值在 `design/spec.json` → `texture_layers` 与 `control_bar.capsule`；HTML 原型 `?layers=enh,tint,realblur` 即默认档。
-- 画布落地：6 个视频帧（`2:7` / `21:162` / `21:928` / `2:258` / `21:317` / `21:1108`）控制栏统一染色玻璃 `rgba(50,103,134,.24→.06→#0B0C10 .48)` + 白 18% 描边 + `BACKGROUND_BLUR 56`；每帧另加「底部遮罩」`0,560 1280×240` `#0B0C10` 0→55%（index 2，压在字幕/控制栏之下）。
+- 画布落地：~~6 个视频帧~~ → **这 6 帧已于 2026-10-18 删除**（和 HTML 原型重复、改一次质感要同步 6 份）。参数仍然有效，但 L3 现在只在 `preview/index.html` + `spec.json → texture_layers` 里：控制栏染色玻璃 `rgba(50,103,134,.24→.06→#0B0C10 .48)` + 白 18% 描边 + `BACKGROUND_BLUR 56`；底部遮罩 `0,560 1280×240` `#0B0C10` 0→55%。结构快照 `design/archive/video-frames-2026-10-18.jsonl`。
 - 音乐模式 / 设置 / 首屏没有视频底，不适用 L2/L3。
 - **静态导出表达不了真模糊**：PNG 里只有均匀染色玻璃，色相是素材那一帧的固定值；代码必须运行时取样。
 
@@ -53,4 +55,75 @@
 - 标题栏 = `NSVisualEffectView(material: .titlebar, blendingMode: .withinWindow)`，**糊的是同窗口内的视频**（这正是 Win 叠加窗拿不到的那种 blur）。栏高 32/28pt（macOS 26+/旧），标题容器 +8。
 - 唯一一条线：标题栏底 `NSBox.boxType = .separator`、高 1pt、色 `NSColor.titleBarBorder`。另有标题文字黑 shadow（blur 8）保可读。
 - 流量灯进 `fadeableViews`，闲置时 `alphaValue = 1e-100`（**不是 isHidden**，保留命中区）；窗口模式 `titleVisibility = .hidden`。
-- 对照我们：Chroma 窗口有**一圈 1px 内描边**（左右 #747E88、顶 (75,84,90)、底 (75,77,80)），标题带独立 40/48 高、按钮常驻、无分隔线（`标题栏下边线` visible:false）。这圈描边是「描边感」的主要来源。
+- ~~对照我们：Chroma 窗口有一圈 1px 内描边~~ → **2026-10-18 晚上已删掉**（16 个帧 `strokes: []`，代码根节点本来就没有 border）。这圈线正是「贴图感」的来源，去掉后画面直通边缘、只靠投影托起窗口，和 iina 的口径一致。仍保留的差异：标题带独立 40/48 高、按钮常驻、无分隔线。
+- iina 的「闲置淡出」是 `fadeableViews` + `alphaValue = 1e-100`（保留命中区）；我们的口径不同：**淡出后连区域一起让出去**（`chrome_rects()` 返回空），否则看不见的按钮照样吃点击。代价是底部遮罩要自己补 `on_double_click`。
+
+## UI / 样式坑（从 MEMORY.md 拆出）
+
+- `ListItem::confirmed()` 无视觉、默认 `primary` 与正文色重合 → 用 `list_active` / `list_active_border`。
+- **字体必须系统自带**：Inter / Noto Sans SC 在 Win 不预装。`theme::ui_font_family()`（Win
+  `Microsoft YaHei UI` / mac `PingFang SC` / 其他 `Noto Sans SC`）+ `mono_font_family()`；
+  `ThemeConfig.font_family` 铺整棵树（`root.rs`）。
+- 换肤：`ThemeConfig`(#\[serde(default)\]) + `Theme::update` + `apply_config`。
+  **`ThemeConfigColors` 的 blue/red/green/cyan/magenta/yellow(±`_light`) 是私有字段** → 只能
+  `default()` 后逐字段赋值。别在同一 closure 里既换 mode 又换 config。
+- 布局铁律：一组控件居中，左右两栏必须**等宽**（都 `flex_1`），否则 `justify_between` 把中间顶偏。
+- **控制栏 v3 几何（数字来自 `design/spec.json`，改任一条同步 `verify_floating_chrome.py` 的常数）**：
+  胶囊 **760×92**、距下 24、圆角 14、padding **20/8**；进度区**两行**（时间行 16 → gap 4 → 轨道 4px
+  714 宽，`PROGRESS_SIDE_PAD=2` = spec 3 扣掉 1px 边框）；走带行 44，播放键 **44 圆**（Mauve 发光
+  0/4/18 35%）、走带键盒 28/图标 22，中心 −96/−54/0/+54/+96；左组 ⓘ + 音量 96；右组盒 24/gap 16
+  → 中心距 **40**，从右往左 全屏 0、列表 1、主题 2、音轨 3、字幕 4（设计稿 6 个含画中画，未接）；
+  信息卡 240×180 浮胶囊上方 16、贴 x24；`BOTTOM_BAND` 118。
+- **展开歌单时胶囊居中于剩余画面**（x=88 = (1280−320−24−760)/2），不是整窗居中；面板 320 宽、
+  `top = 标题带+8`、`right 24`、`bottom 119`、头 48/行 48/尾 44。
+- **浅底面板上的按钮必须用主题色**（`panel_button(fg, primary)`）：`overlay::fg()`（#D5D9E2）在
+  Latte 浅底上几乎看不见。列表容器要 `overflow_hidden`，只给 `min_h_0` 会让最后一行画到页脚上面。
+- **质感三层**：L1 胶囊 `v_gradient(#1A1C28 60%, #0B0C10 74%)` + 白 14% 描边 `edge()` + 两条 1px
+  绝对定位矩形当内描边（上白 16% / 下黑 30%）+ 双层阴影（`contact 0 2 6 @26%`、`ambient 0 16 40 @32%`）
+  + 240 高底部渐隐。L2 画面取色**只取色相**（S 46% / L 36%），染 α .26/.08，8° 迟滞。
+  L3 = 同一帧降到 **48×20** 拉伸当模糊底（GPU 双线性 ≈ 大半径 box blur），**别再伪造**。
+- **`v_gradient()` 是必需的**：`linear_gradient(angle, from, to)` 只收两个 `LinearColorStop`，
+  `Hsla`/`Rgba` 都没有 `From` → 必须 `linear_color_stop(color, pct)` 包一层。没有径向渐变：
+  播放键用「竖向渐变 `#A05BF5→#6E24D8` + `inset 0 1px 0 rgba(255,255,255,.35)`」凑球面。
+- **悬停白 10% 只能用 `ButtonCustomVariant`**：`ghost` 的悬停色写死在 `ButtonVariant::hovered`
+  （= `theme.accent` 亮 Lavender）。`chrome_button(cx, …)` 用 `.color/.foreground/.hover/.active`
+  + `.rounded(6)`；`.active()` 收的是**颜色**，没有按下缩放。`panel_button` 仍走主题色（浅底）。
+- **`Div::bg()` 先于子节点绘制** → 整幅模糊 `img` 之上再 `.bg(渐变)` 会被盖住（胶囊变白板）。
+  渐变要作为 `absolute` 子层，顺序：模糊图 → 玻璃 → 染色 → 内描边 → 内容。
+- **`overlay::glass()` 是 72%（`0x0B0C10B8`）平铺**：信息卡/标题带用它；胶囊走「模糊图 + 渐变」。
+- 画在画面上的东西（胶囊 / 歌单 / 信息卡 / 底部遮罩 / 状态胶囊）**都必须进 `chrome_layout()`**：
+  一是淡出时一起让位（透明但仍在的节点照样吃点击），二是验收脚本按它取点。
+- mpv 编码名是**并列别名**（`h264 (High) / AVC / …`）→ 取第一段（`short_codec`）；
+  `video-bitrate` 对部分容器报 `unavailable`（合成 mp4 就是），显示 `—` 是对的，别补假数。
+- `cycle sid/aid` **无返回值**、单轨不做事 → 记切换前轨号 + 时间戳，tick 比对 observed 值，
+  800ms 超时就说"没有其他轨可切"。
+- **`h_flex()` 默认 `items_center`**：子元素全绝对定位（内容高 0）交叉轴塌成 0 → `canvas` bounds
+  `Wx0`。视频区要 `.self_stretch()`。
+- **`height:100%` 在不定高父级退化成 auto** → `.h_full()` 解析不出。写死 `.h(px(..))`，父级补 `.h_full()`。
+- 自绘标题带：`appears_transparent = true` 后**只有左侧拖动区**能设 `WindowControlArea::Drag`
+  （整条都设会让右侧按钮变非客户区）。窗口按钮 `IconName::Window*` 是 24 网格 + 2px 描边，
+  缩 10px 会糊 → 手写 10×10、1px SVG；46 宽 × 标题栏高，关闭键悬停 `#C42B1C`。
+- **chrome 前景色跟底色走不跟主题走**：视频模式整块深画布，浅色主题 `muted_foreground` 只 ≈3:1
+  → 用 `chrome_fg` / `chrome_dim`。
+- 提示分流（`flush_errors`）：`video_active` → 标题带 `status_pill`（4s 退场，tick 比对）；
+  否则 `push_notification`。通知层位置/宽度在 `theme::install` 改（`margins.top = TITLE_BAND+12`、
+  `width=320`），`apply_config`/`change` 不重置。`push_notification` 要 `&mut Window` → 入队 + 100ms tick flush。
+- 窗口外缘**不画描边**（`spec.json → window_edge.stroke = null`）：一圈亮线把画面「封」在框里，
+  去掉后画面直通边缘、只靠投影托起来（iina 同口径）。别和胶囊内部那圈白 14–18% 混为一谈。
+  浅底窗口压白台面边缘会偏软 → 台面用 `#F5F6FA`。**别为看清把描边加回来。**
+- 圆角交给 DWM：`DwmSetWindowAttribute(hwnd, 33, &2, 4)`（Win11）；别用 `SetWindowRgn`（1bit 必锯齿），
+  验收读回属性值别用像素。
+
+## 控制层自动淡出（标题带 / 胶囊 / 底部遮罩 / 窗口按钮）
+
+- 判据是纯函数 `chrome_visible_target(video_active, playing, busy, idle)`：**只有「视频 + 在播 +
+  没在碰控件」才淡**；暂停 / 面板 / 信息卡 / 拖放提示 / 状态胶囊 / 正在拖进度一律留着。
+  `CHROME_IDLE` 2500ms、`CHROME_FADE_STEP` 0.25/100ms tick、`CHROME_HIDDEN_EPS` 0.01。
+- **不用 `with_animation`**：那个动画只在有帧驱动时推进，而这里的帧是 tick 拉起来的。
+- 「用户还在」三个来源：根节点 `on_mouse_move`、视频舞台 `on_mouse_move`（render API 之后事件能
+  直达，不再靠 wndproc 的 `WM_MOUSEMOVE`）、`intercept_keystrokes`。鼠标移动只写时间戳**不 notify**
+  （每帧 notify = 整窗重绘）。
+- 淡掉的另一半是**几何**：`chrome_layout()` 在 `alpha ≤ EPS` 时返回空 Vec，让透明区块不吃点击。
+- 诊断开关 `SMP_CHROME_TRACE=1` 打 `[chrome] alpha/target/idle/...`（500ms 限流）。
+- HTML 原型同步同一套判据：`preview/index.html` 播放后 2.5s 不动 → 淡三层 + `pointer-events:none`；
+  `?idle=1` 冻结该态、`?bare=1` 去页面留白和工具条。对照图 `docs/chrome-fade.png`。

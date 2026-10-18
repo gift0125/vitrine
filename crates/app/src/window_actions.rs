@@ -20,7 +20,11 @@
 //! 代价：调用返回时窗口状态还没变，`IsZoomed` 读到的是旧值——
 //! 所以调用方要「先乐观地假设切换成功」，再让 100ms 的 tick 去校正。
 
-use crate::video_overlay::Hwnd;
+/// 窗口句柄（Win32 `HWND` 当作整数传递；非 Windows 上恒为 0）。
+///
+/// 放在这里而不是某个平台模块里：整个 app 只把句柄当不透明整数用，跨平台 stub
+/// 也全是空实现，没必要为它引入一个平台类型。
+pub type Hwnd = isize;
 
 const SW_MAXIMIZE: i32 = 3;
 const SW_RESTORE: i32 = 9;
@@ -90,6 +94,15 @@ pub fn refresh_client_area(hwnd: Hwnd) {
     imp::refresh_client_area(hwnd)
 }
 
+/// 当前**真实**客户区尺寸（物理像素）。
+///
+/// 用来和 GPUI 自己的 `window.bounds()` 对账：进出全屏那一下 GPUI 会漏掉尺寸
+/// 通知，`bounds()` 也会跟着停在旧值（`logical_size` 只在处理 `WM_SIZE` 时更新），
+/// 所以「viewport ≠ bounds」这条判据发现不了它——只能问系统要真实值。
+pub fn client_size(hwnd: Hwnd) -> (i32, i32) {
+    imp::client_size(hwnd)
+}
+
 /// 把「客户区已经铺满、布局却还停在旧尺寸」这个状态踢醒。
 ///
 /// GPUI 进出全屏那一下会丢掉自己的一次尺寸通知（`WM_SIZE` 在 `SetWindowPos` 里同步
@@ -102,6 +115,27 @@ pub fn refresh_client_area(hwnd: Hwnd) {
 /// `SendMessage`：必须落在消息循环里，不能在别人的 `update` 栈里重入。
 pub fn kick_layout(hwnd: Hwnd) {
     imp::kick_layout(hwnd)
+}
+
+/// 光标在屏幕上的位置（物理像素）。
+///
+/// 拖动窗体用它而不用 GPUI 的鼠标坐标：窗口跟着光标移动之后，光标在**窗口内**的
+/// 相对位置几乎不变（每帧都是 0 位移），只有屏幕坐标才看得出「人在往哪拖」。
+pub fn cursor_pos() -> (i32, i32) {
+    imp::cursor_pos()
+}
+
+/// 窗口外框左上角（物理像素）。
+pub fn window_origin(hwnd: Hwnd) -> (i32, i32) {
+    imp::window_origin(hwnd)
+}
+
+/// 把窗口外框挪到指定位置（尺寸不变）。
+///
+/// 拖动过程中每帧调一次，所以只用 `SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE`：
+/// 不碰 z 序、不抢焦点，也不触发重排（尺寸没变）。
+pub fn move_window(hwnd: Hwnd, x: i32, y: i32) {
+    imp::move_window(hwnd, x, y)
 }
 
 /// 客户区的最小尺寸（逻辑像素）：和 `main.rs` 的 `window_min_size` 保持一致。
@@ -335,6 +369,7 @@ mod imp {
             wparam: usize,
             lparam: isize,
         ) -> isize;
+        fn GetCursorPos(point: *mut Point) -> i32;
     }
 
     #[link(name = "dwmapi")]
@@ -515,6 +550,17 @@ mod imp {
         ));
     }
 
+    pub fn client_size(hwnd: Hwnd) -> (i32, i32) {
+        if hwnd == 0 {
+            return (0, 0);
+        }
+        let mut client = Rect::default();
+        if unsafe { GetClientRect(hwnd, &mut client) } == 0 {
+            return (0, 0);
+        }
+        (client.right, client.bottom)
+    }
+
     pub fn client_matches_window(hwnd: Hwnd) -> bool {
         if hwnd == 0 {
             return true;
@@ -566,6 +612,46 @@ mod imp {
                 ((height << 16) | width) as isize,
             )
         };
+    }
+
+    pub fn cursor_pos() -> (i32, i32) {
+        let mut point = Point::default();
+        if unsafe { GetCursorPos(&mut point) } == 0 {
+            return (0, 0);
+        }
+        (point.x, point.y)
+    }
+
+    pub fn window_origin(hwnd: Hwnd) -> (i32, i32) {
+        if hwnd == 0 {
+            return (0, 0);
+        }
+        let mut rect = Rect::default();
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return (0, 0);
+        }
+        (rect.left, rect.top)
+    }
+
+    pub fn move_window(hwnd: Hwnd, x: i32, y: i32) {
+        if hwnd == 0 {
+            return;
+        }
+        // 尺寸参数传 0 + `SWP_NOSIZE`：只移动不改尺寸，系统就不会发 `WM_SIZE`，
+        // 也就不会在拖动每帧里触发一次重排（GPUI 的尺寸处理只认 `WM_SIZE`）。
+        // `SWP_NOZORDER` 保住 z 序（`SetWindowPos` 默认会把窗口提到最前），
+        // `SWP_NOACTIVATE` 不抢焦点——拖动时窗口本来就该是当前活动的。
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                0,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
     }
 
     pub fn set_zoomed(hwnd: Hwnd, zoomed: bool) {
@@ -682,9 +768,26 @@ mod imp {
         true
     }
 
+    pub fn client_size(_hwnd: Hwnd) -> (i32, i32) {
+        (0, 0)
+    }
+
     pub fn refresh_client_area(_hwnd: Hwnd) {}
 
     pub fn kick_layout(_hwnd: Hwnd) {}
+
+    /// macOS / Linux 上拖动直接用 `Window::start_window_move()`（那边后端实现的是
+    /// 系统标准拖动），这三个函数只为 Windows 的 `--wid` 迁移后「鼠标按住画面拖窗口」
+    /// 提供同一套签名，非 Windows 下没人调用。
+    pub fn cursor_pos() -> (i32, i32) {
+        (0, 0)
+    }
+
+    pub fn window_origin(_hwnd: Hwnd) -> (i32, i32) {
+        (0, 0)
+    }
+
+    pub fn move_window(_hwnd: Hwnd, _x: i32, _y: i32) {}
 
     pub fn fit_to_video(_hwnd: Hwnd, _video: (u32, u32)) -> bool {
         false

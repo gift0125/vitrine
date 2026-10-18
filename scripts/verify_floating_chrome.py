@@ -2,35 +2,35 @@
 
 用法：python scripts/verify_floating_chrome.py
 
-第七轮（视频窗挪到主窗下面）之后的判据：
+第十轮（mpv 软件渲染 → 画面进主窗口）之后的判据：
 0. **窗体大小 = 内容大小** —— 起播后窗口按画面像素 1:1 调整（`dwidth/dheight`
    → `window_actions::fit_to_video`），客户区比例等于画面比例，右缘不是黑边。
 1. **画面区露出来了** —— 主窗口把自己的画面区从窗口区域里减掉了。没减的话，
-   被整块盖住的视频窗会停止出帧，屏幕中心就不是彩条而是主窗口的底色；
+   软件渲染没出帧的话，屏幕中心就不是彩条而是画布底色；
    同时用 `GetWindowRgn` 直接确认「区域已设且不是整窗」。
-2. **视频窗和主窗外框严丝合缝** —— 两者 `GetWindowRect` 必须逐像素相同。
+1. **画面画出来了** —— 探针里 `frame` 非零（mpv 交来了像素），中心取样是彩条。
    铺客户区而不是外框的话，边框那一圈会透出桌面。
 3. **玻璃真的透着画面** —— 胶囊里取两个点（压在两个不同色条上）：72% 深玻璃
    不能把它们抹成同一个颜色。这是本轮的核心目标，也是「实心黑板」和
    「玻璃」的唯一客观区别。
 4. **歌单是悬浮面板** —— 展开后画面宽度不变。
-5. **双击画面 = 全屏播放**（不是最大化）—— 叠加窗自己判双击（`WM_LBUTTONDBLCLK`
+5. **双击画面 = 全屏播放**（不是最大化）—— GPUI 的 `on_double_click` → `set_cinema`；
    对合成输入不可靠），把 `ToggleCinema` 塞进队列，由 tick 调
    `PlayerView::set_cinema`；判定看**外框是否等于显示器矩形**，比 `IsZoomed` 更
    贴近用户看到的样子。
 6. **全屏里有三个出口都回窗口** —— `Esc`（`App::intercept_keystrokes`，不是
    keymap + `on_action`）、右上角「最大化」按钮、再双击画面。出口之后客户区必须
    重新等于外框（GPUI 退出全屏时不重算客户区，靠 tick 里的自愈）。
-7. **顶栏铺满整个宽度** —— 窗口有 7 逻辑像素的隐形外框，叠加窗按外框铺、GPUI 只
+7. **顶栏铺满整个宽度** —— 客户区铺满之后，标题带的玻璃必须盖到左右两个边沿
    画客户区，于是顶栏左右各缺一条，露出的是**没被压暗的画面**。判据：窗口最左 /
    最右那一列，标题带中线必须比它下面的画面明显暗。
-8. **按住画面能拖动窗体** —— 拖动过程中画面必须跟着走（叠加窗由 tick 追上），
+8. **按住画面能拖动窗体** —— 画面归主窗口之后拖动是 GPUI 自己搬的（8ms 轮询光标），
    松手后外框依旧对齐。
 9. **方向键接通播放器** —— 左右 ±5 秒（`seek`）、上下 ±5% 音量
    （`set_property volume`）。判据取 mpv 的 IPC trace：只看界面动没动不够，
    那可能只是 tick 的乐观更新；命令真的发出去才算接通。
 10. **ⓘ 信息卡压在画面上** —— 点开之后左下角那块必须从"画面"变成"深玻璃"，
-    而且那两个角点还在主窗口区域里（区域没把它加回去的话，卡片会被叠加窗盖住，
+    而且那两个角点都在 chrome 布局里（探针报错的话，脚本按坐标点就会点空），
     用户看到的是"点了没反应"）；再点一次收起，那块要回到画面。
 11. **字幕 / 音轨按钮接线通** —— 判据取 IPC trace 里的 `cycle sid/aid`：
     素材只有一条轨时 mpv 什么也不做，"点了没反应"和"切到了"肉眼分不出。
@@ -39,6 +39,7 @@
 """
 
 import ctypes
+import json
 import os
 import shutil
 import subprocess
@@ -69,7 +70,7 @@ if not exe.is_absolute():
 out_dir = root / "target" / "verify-shots"
 out_dir.mkdir(parents=True, exist_ok=True)
 # 时长要够：整套流程要跑 50 秒上下（全屏/回窗口/拖窗每一步都要等窗口稳定），
-# 素材播完之后叠加窗会被隐藏，后面的取样全变成主窗底色——"按住画面拖窗"就成了
+# 素材播完之后画面会停住，后面的取样全变成画布底色——"按住画面拖窗"就成了
 # "点在一块 GPUI 画布上"，歌单/方向键也一起假失败。仓库里的样片只有 5 秒，
 # 所以这里用一段现生成的 2 分钟长片（落在 target/，不进仓库）：
 #   mpv av://lavfi:testsrc2=duration=120:size=1280x720:rate=24 \
@@ -162,7 +163,7 @@ def right_group_button(index_from_right):
     视频模式下的顺序（右→左）：全屏 0、列表 1、主题 2、音轨 3、字幕 4。
 
     以前按「胶囊铺满整宽」写成 `lw - 123`：胶囊收窄之后那个点落到胶囊外的
-    画面上，点击被叠加窗吃掉——表现为"点列表没反应"，实际是根本没点中。
+    画面上，点击会落到画面上（被当成拖窗/双击）——表现为"点列表没反应"，
     """
     group_right = capsule_left() + CAPSULE_WIDTH - CAPSULE_PAD_X
     return group_right - 12 - index_from_right * 40, controls_center_y()
@@ -172,7 +173,7 @@ def playlist_button():
     """「列表」按钮的中心（逻辑坐标）。视频模式下它在最右内侧第二位。"""
     return right_group_button(1)
 
-# 双击：叠加窗认这一组消息（真实双击就是它们，见 `double_click`）
+# 双击：GPUI 认这一组消息（真实双击就是它们，见 `double_click`）
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
 WM_LBUTTONDBLCLK = 0x0203
@@ -209,7 +210,12 @@ data_dir.mkdir(parents=True, exist_ok=True)
 # 也可能只是 tick 的乐观更新，反过来也一样（声音变了、界面没动）。
 mpv_trace = root / "target" / "verify-mpv-trace.log"
 mpv_trace.unlink(missing_ok=True)
-env = dict(os.environ, SMP_DATA_DIR=str(data_dir), SMP_MPV_TRACE=str(mpv_trace))
+# 界面状态的唯一真值出口：画面进主窗口之后没有窗口区域可读了，脚本靠这个 JSON
+# 问「胶囊在哪 / 面板开没开 / 控制层淡到几」。见 crates/app/src/ui_state.rs。
+ui_state_path = root / "target" / "verify-ui-state.json"
+ui_state_path.unlink(missing_ok=True)
+env = dict(os.environ, SMP_DATA_DIR=str(data_dir), SMP_MPV_TRACE=str(mpv_trace),
+           SMP_UI_STATE=str(ui_state_path))
 # 视频内核是进程内 libmpv，DLL 必须能被 exe 找到。打包目录里自带一份；直接对
 # target/debug 或 target/release 跑时可能还没拷，这里退到 target/mpv-dev（fetch-libmpv.ps1
 # 的默认落地位置），免得"缺 DLL"被误判成"视频功能坏了"。
@@ -252,8 +258,6 @@ if owner.value != proc.pid:
 
 scale = user32.GetDpiForWindow(hwnd) / 96.0
 
-overlay = user32.FindWindowW("SimpleMediaPlayerVideoOverlay", None)
-print(f"overlay hwnd = {overlay}")
 
 
 def client_rect():
@@ -280,70 +284,58 @@ def frame_rect(handle=None):
     return left, top, right - left, bottom - top
 
 
-def region_box():
-    """主窗口当前的窗口区域：返回 (类型, 外接矩形) 或 (0, None) 表示没设区域。
+def ui_state():
+    """读界面自己写的状态探针；读不到就返回 None（还在启动/没设环境变量）。"""
+    try:
+        raw = ui_state_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        # 写盘用「临时文件 + 改名」，理论上读不到半截；真读到了当下一次没发生
+        return None
 
-    `GetWindowRgn` 的返回码：0 = ERROR（区域是整窗/未设）、1 NULLREGION、
-    2 SIMPLEREGION、3 COMPLEXREGION。整窗 − 画面 + chrome 一定是 COMPLEXREGION。
+
+def chrome_contains(lx, ly):
+    """这个逻辑点是否落在 chrome（标题带 / 遮罩 / 胶囊 / 信息卡 / 面板）上。
+
+    上一代这里是 `PtInRegion`：主窗口把自己的窗口区域切成了这几块，剩下的
+    让给视频窗，所以「区域里在不在」就是「这块归谁画」。现在画面就在主窗口里，
+    没有区域可问——判据换成界面自己报的 `rects`（同一份布局，见
+    `ui_state::ChromeLayout`）。
     """
-    rgn = ctypes.windll.gdi32.CreateRectRgn(0, 0, 0, 0)
-    kind = user32.GetWindowRgn(hwnd, rgn)
-    if kind == 0:
-        ctypes.windll.gdi32.DeleteObject(rgn)
-        return 0, None
-    r = wintypes.RECT()
-    ctypes.windll.gdi32.GetRgnBox(rgn, ctypes.byref(r))
-    ctypes.windll.gdi32.DeleteObject(rgn)
-    return kind, (r.left, r.top, r.right - r.left, r.bottom - r.top)
+    state = ui_state()
+    if not state:
+        return False
+    for rect in state.get("rects", []):
+        if (rect["x"] <= lx <= rect["x"] + rect["w"]
+                and rect["y"] <= ly <= rect["y"] + rect["h"]):
+            return True
+    return False
 
 
-def region_contains(lx, ly):
-    """这一点是否还在主窗口的窗口区域里（= 点击/绘制都归主窗口）。"""
-    rgn = ctypes.windll.gdi32.CreateRectRgn(0, 0, 0, 0)
-    inside = False
-    if user32.GetWindowRgn(hwnd, rgn):
-        wr = wintypes.RECT()
-        user32.GetWindowRect(hwnd, ctypes.byref(wr))
-        pt = wintypes.POINT(0, 0)
-        user32.ClientToScreen(hwnd, ctypes.byref(pt))
-        ox, oy = pt.x - wr.left, pt.y - wr.top
-        inside = bool(
-            ctypes.windll.gdi32.PtInRegion(rgn, ox + round(lx * scale), oy + round(ly * scale))
-        )
-    ctypes.windll.gdi32.DeleteObject(rgn)
-    return inside
-
-
-def wait_region(lx, ly, want, timeout=3.0):
-    """等窗口区域在某个逻辑点上变成期望状态。
-
-    改尺寸之后要过两帧才一致：先有新的布局（canvas 报新的 chrome 矩形），
-    再由 tick 重建区域。中间那几帧里，胶囊所在的位置**还不在**主窗口区域里，
-    点击会落到下面的视频窗上（表现为"点了没反应"，看起来像应用的 bug）。
-    验收脚本必须等它稳定，否则测的是过渡态。
-    """
+def wait_chrome(lx, ly, want, timeout=3.0):
+    """等探针在某个点上变成期望状态（淡入淡出与布局各有几帧延迟）。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if region_contains(lx, ly) == want:
+        if chrome_contains(lx, ly) == want:
             return True
         time.sleep(0.1)
-    return region_contains(lx, ly) == want
+    return chrome_contains(lx, ly) == want
 
 
 def panel_open():
-    """歌单面板是否展开。**只能**在 `wait_settled()` 之后问：
-
-    区域还没按视频区算出来时整窗都在区域里，这个判断会假通过。
-    取样点落在面板中线上——展开时那里是浅色面板底，收起时是画面。
-    """
-    return region_contains(lw - PLAYLIST_INSET - PLAYLIST_WIDTH / 2, 120)
+    """歌单面板是否展开（问界面自己，不再靠取样颜色猜）。"""
+    state = ui_state()
+    return bool(state and state.get("panel"))
 
 
 def wake():
     """把控制层叫回来（播放中 2.5s 没有输入它就淡出了）。
 
     自动化脚本每两步之间常静置 1~3 秒，正好落进淡出窗口：这时主窗口的区域已经
-    收缩成 1 像素，点击**直接落到下层叠加窗**上——轻则"点了没反应"，重则开始拖窗
+    收缩成空，点击**直接落到画面上**——轻则"点了没反应"，重则开始拖窗
     （窗口被挪走，后面所有坐标全错），或者被当成双击进了全屏。所以每次点击/取样
     之前先晃一下光标；0.45s 是淡入时间（4 个 100ms tick）。
     """
@@ -356,19 +348,19 @@ def wake():
 
 
 def wait_settled(timeout=3.0):
-    """等一切跟上新的窗口几何：外框对齐 + 顶栏两端/胶囊都回到区域里。
+    """等一切跟上新的窗口几何：布局对齐 + 顶栏两端/胶囊都在 chrome 里。
 
-    关键是那条 `False`：**画面中心必须是洞**。窗口刚被改过尺寸时，应用还没按
-    新的视频区重算区域，`GetWindowRgn` 会短暂返回"整个窗口"——这时
-    `region_contains(任意点)` 恒为 True，后面所有"面板/胶囊在不在区域里"的
-    判断都会假通过（歌单明明没展开也判通过了，实测踩过）。
+    那条 `False`（画面中心**不是** chrome）是关键：窗口刚被改过尺寸时探针还是
+    旧布局，只要它不是「整窗都是 chrome」就说明已经稳定了；同时它也挡住
+    "把全屏当 chrome"这类回归。`wake()` 先叫回控制层——淡出之后 `rects` 是空的，
+    所有 `True` 判定都会假失败。
     """
     wake()
     wait_aligned(timeout)
-    wait_region(lw * 0.5, lh * 0.45, False, timeout)
-    wait_region(2, 17, True, timeout)
-    wait_region(lw - 2, 17, True, timeout)
-    wait_region(*playlist_button(), True, timeout)
+    wait_chrome(lw * 0.5, lh * 0.45, False, timeout)
+    wait_chrome(2, 17, True, timeout)
+    wait_chrome(lw - 2, 17, True, timeout)
+    wait_chrome(*playlist_button(), True, timeout)
     time.sleep(0.15)
 
 
@@ -427,19 +419,19 @@ def wait_darker(pt, base, timeout=2.5, gap=80):
     return px
 
 
-def wait_region_clear(lx, ly, timeout=2.5):
-    """等某个点**离开**主窗口区域（卡片收起后那块交还给画面）。"""
+def wait_chrome_clear(lx, ly, timeout=2.5):
+    """等某个点**离开** chrome 布局（卡片收起后那块交还给画面）。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if not region_contains(lx, ly):
+        if not chrome_contains(lx, ly):
             return True
         time.sleep(0.1)
-    return not region_contains(lx, ly)
+    return not chrome_contains(lx, ly)
 
 
 # 抢前台：脚本所在进程不在前台时，`SetForegroundWindow` 会被系统拒绝（只有前台
 # 进程才有权抢），而**第一次落在窗口上的点击会被吃掉用于激活**——表现为"点了没
-# 反应，第二次才灵"。第七轮之后连"先点画面激活"这条也不成立了：画面点下去是叠加窗
+# 反应，第二次才灵"。第七轮之后连"先点画面激活"这条也不成立了：画面点下去
 # 的 `WM_NCLBUTTONDOWN`（HTCAPTION），那是鼠标捕获、不激活主窗口。
 # 标准解法是临时把本线程挂到前台线程的输入队列上再抢。
 def force_foreground():
@@ -502,7 +494,7 @@ def click(lx, ly):
     user32.GetClassNameW(hit, buf, 128)
     print(f"  点击 逻辑({lx:.0f},{ly:.0f}) → 屏幕({sx},{sy}) 窗口={hit} 类='{buf.value}'")
     if buf.value != "Zed::Window":
-        # 记下来在判定段汇总：坐标偏出胶囊时点击会落到下层视频叠加窗上，
+        # 记下来在判定段汇总：坐标偏出胶囊时点击会落到画面上，
         # 界面毫无反应，而截图看不出差别（这一轮就吃了"坐标偏 344"的亏）。
         CHROME_MISSES.append((round(lx), round(ly), buf.value))
         print(f"  ⚠ 该点不在主窗（落到 {buf.value}），按钮必然点不中——坐标和布局对不上")
@@ -520,23 +512,25 @@ def click(lx, ly):
 
 
 def double_click(lx, ly):
-    """在画面区双击（叠加窗收 `WM_LBUTTONDBLCLK` → 进/出全屏播放）。
+    """在画面区双击（GPUI 的 `on_double_click` → 进/出全屏播放）。
 
-    这里**不用**模拟光标：真实双击走的是
-    `WM_LBUTTONDOWN → UP → WM_LBUTTONDBLCLK → UP` 这一组消息，而叠加窗正是照这个
-    路径处理的，直接把同一组消息投给它即可。用 `SetCursorPos` + `mouse_event` 反而
-    不稳：两次按下之间只要漏进一条 `WM_MOUSEMOVE`，叠加窗就会当成「按住画面拖窗体」
-    把窗口挪走（实测窗口被挪了 12,-16，双击也随之失效）。
+    走**真实光标**：画面现在归主窗口自己的 GPUI 视图，双击由 GPUI 自己识别
+    （按 `GetDoubleClickTime` 与前后两次按下的距离）。投递消息这条路走不通，
+    因为 GPUI 还会比对光标位置与命中测试，`PostMessage` 来的坐标不参与命中。
+
+    两次按下之间**不要**插 `SetCursorPos` 的移动：那会让第二次按下被当成
+    "又一次点在别的元素上"，双击不成立。所以先一次性把光标放到位。
     """
     ox, oy = client_origin()
-    wl, wt, _, _ = frame_rect(overlay)
-    cx = ox + round(lx * scale) - wl
-    cy = oy + round(ly * scale) - wt
-    lparam = ((cy & 0xFFFF) << 16) | (cx & 0xFFFF)
-    for message in (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK, WM_LBUTTONUP):
-        user32.PostMessageW(overlay, message, MK_LBUTTON, lparam)
-        time.sleep(0.02)
-    time.sleep(0.6)
+    sx, sy = ox + round(lx * scale), oy + round(ly * scale)
+    user32.SetCursorPos(sx, sy)
+    time.sleep(0.15)
+    for _ in range(2):
+        user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.03)
+        user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        time.sleep(0.06)
+    time.sleep(0.8)
 
 
 def sample(img, lx, ly):
@@ -574,27 +568,32 @@ def wait_client_settled(timeout=2.0):
 
 
 def check_aligned(tag):
-    """视频窗必须和主窗外框逐像素重合。"""
-    main = frame_rect()
-    ovl = frame_rect(overlay)
-    delta = tuple(o - m for o, m in zip(ovl, main))
-    print(f"  [{tag}] 主窗外框 = {main}  视频窗外框 = {ovl}  差 = {delta}")
-    return delta == (0, 0, 0, 0)
+    """画面必须铺满整个客户区（没有第二块窗口要对了，验的是「画面没被裁」）。"""
+    state = ui_state() or {}
+    stage = state.get("stage") or {}
+    cw, ch = client_rect()
+    cw, ch = cw / scale, ch / scale
+    ok = bool(stage) and abs(stage.get("w", 0) - cw) <= 2 and abs(stage.get("h", 0) - ch) <= 2
+    print(f"  [{tag}] 客户区 = {cw:.0f}x{ch:.0f}  画面区 = {stage.get('w', 0):.0f}x{stage.get('h', 0):.0f}")
+    return ok
 
 
 def wait_aligned(timeout=2.0):
-    """等视频窗追上主窗口的新几何。
-
-    窗口刚被改过尺寸时，叠加窗要等下一帧（canvas 重新上报视频区）+ 100ms tick
-    才跟上来；这期间截图会拍到"画面还停在旧位置、右边露出桌面/别的窗口"，
-    看起来像"没铺满"，其实是取样太早。
-    """
+    """等画面区的尺寸追上客户区（布局晚一两帧）。"""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if frame_rect(overlay) == frame_rect():
+        if check_aligned_quiet():
             return True
         time.sleep(0.1)
-    return frame_rect(overlay) == frame_rect()
+    return check_aligned_quiet()
+
+
+def check_aligned_quiet():
+    state = ui_state() or {}
+    stage = state.get("stage") or {}
+    cw, ch = client_rect()
+    cw, ch = cw / scale, ch / scale
+    return bool(stage) and abs(stage.get("w", 0) - cw) <= 2 and abs(stage.get("h", 0) - ch) <= 2
 
 
 # ---- 0. 窗体大小 = 内容大小 ---------------------------------------------
@@ -630,7 +629,7 @@ print(
     f" → 逻辑 {fit_w:.1f}x{fit_h:.1f}"
 )
 expect = EXPECTED_PIXELS.get(media.name)
-# 截图前先等叠加窗追上新的窗口几何（否则取到的是"画面还停在旧位置"的中间态）
+# 截图前先等布局跟上新的窗口几何（否则取到的是"画面还停在旧尺寸"的中间态）
 fit_aligned = wait_aligned()
 if expect:
     fit_ok = abs(fit_client[0] - expect[0]) <= 2 and abs(fit_client[1] - expect[1]) <= 2
@@ -642,7 +641,7 @@ else:
 # 画面右缘：窗口比例正好等于画面比例时那里是画面本体；黑边（letterbox）或比例
 # 不对时会是黑的。取样点避开左侧竖条里的胶囊（y 取客户区正中）。
 #
-# 要等几帧：改完尺寸后 mpv 得重新配置 VO，叠加窗的几何已经到了、画面却可能还是
+# 要等几帧：改完尺寸后 mpv 得重新配置渲染尺寸，画面可能还是旧的
 # 上一帧的一部分（表现为"上面一条是画面、下面露出桌面"）。这是**瞬态**，
 # 等不到就必须如实报失败，所以只在超时前重试（给 3 秒，慢机器上 VO 重配更久）。
 fit_edge = (0, 0, 0)
@@ -656,10 +655,10 @@ while time.time() < deadline:
     time.sleep(0.15)
 img_fit.save(out_dir / "floating-00-fit.png")
 print(f"  画面右缘像素 = {fit_edge}   ← 应为彩条（有黑边就不是）")
-print(f"  视频窗是否已跟上新几何 = {fit_aligned}")
+print(f"  画面区是否已跟上新几何 = {fit_aligned}")
 
 # ---- 0.5 圆角 ----------------------------------------------------------
-# 视频模式两块窗口都设了 `DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND`。
+# 视频模式下主窗口设了 `DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND`。
 # 像素判据不稳（角外是桌面，颜色不可控），这里查**属性值**证明请求发出去了，
 # 再打一行角上的实测像素供人眼复核。2 = ROUND / 1 = DONOTROUND。
 DWMWA_WINDOW_CORNER_PREFERENCE = 33
@@ -677,13 +676,12 @@ def corner_pref(handle):
 
 
 corner_main = corner_pref(hwnd)
-corner_overlay = corner_pref(overlay)
-rounded_ok = corner_main == 2 and corner_overlay == 2
+rounded_ok = corner_main == 2
 wx, wy, _, _ = frame_rect()
 corner_px = ImageGrab.grab(bbox=(wx, wy, wx + 4, wy + 4)).getpixel((1, 1))
 inner_px = ImageGrab.grab(bbox=(wx + 8, wy + 8, wx + 12, wy + 12)).getpixel((1, 1))
 print(
-    f"  圆角：主窗={corner_main} 视频窗={corner_overlay}（2=ROUND）"
+    f"  圆角：主窗={corner_main}（2=ROUND）"
     f"  角上像素={corner_px} 往里 8px={inner_px}"
 )
 
@@ -719,12 +717,18 @@ lw, lh = set_w / scale, set_h / scale
 print(f"脚本摆到 {width}x{height} 后：物理 {set_w}x{set_h} 逻辑 {lw:.1f}x{lh:.1f}")
 wait_settled()
 
-# ---- 1. 画面区是否真的让出来了 -----------------------------------------
+# ---- 1. 画面是否真的画出来了 -------------------------------------------
+# 上一代这里验的是「主窗口把画面区从自己的窗口区域里减掉」；现在画面就在主窗口
+# 的渲染树里（mpv 软件渲染 → 纹理），判据换成正面的：画面中心必须是彩条，
+# 而且探针要报出一个和客户区一样大的 stage。
 img = grab(out_dir / "floating-01-video.png")
 mid = sample(img, lw / 2, lh / 2)
-kind, box = region_box()
-print(f"画面中心像素 = {mid}   ← 应为彩条（区域减法生效才会出帧）")
-print(f"主窗口区域 = 类型 {kind}（2=SIMPLE / 3=COMPLEX），外接框 {box}")
+state = ui_state() or {}
+print(f"画面中心像素 = {mid}   ← 应为彩条（软件渲染出帧才会有颜色）")
+print(
+    f"探针：video={state.get('video')} frame={state.get('frame')} "
+    f"stage={state.get('stage')} chrome={state.get('chrome')}"
+)
 
 aligned = check_aligned("静止")
 
@@ -779,9 +783,9 @@ panel_mid = lw - PLAYLIST_INSET - PLAYLIST_WIDTH / 2
 panel_px = sample(img2, panel_mid, 120)
 print(f"歌单面板内 (.., 120) = {panel_px}   ← 应为面板底色（浅）")
 print(f"歌单展开后画面中心 = {sample(img2, lw / 2, lh / 2)}")
-# 面板浮在画面上，但它**不在**原来的窗口区域里：区域必须把它加回去（否则被剪掉）。
-panel_inside = region_contains(panel_mid, 120)
-print(f"歌单面板区在窗口区域里 = {panel_inside}   ← 必须是 True，否则面板被剪掉")
+# 面板浮在画面上，探针必须把它报成 chrome（脚本后面按它算点击坐标）。
+panel_inside = chrome_contains(panel_mid, 120)
+print(f"歌单面板在 chrome 布局里 = {panel_inside}   ← 必须是 True")
 closed = toggle_playlist(False)  # 收起来，别挡住后面的取样
 print(f"再点一次收起歌单 = {closed}")
 refresh_geometry()
@@ -808,7 +812,7 @@ for step in range(1, 9):
     user32.SetCursorPos(start[0] + step * round(12 * scale), start[1] + step * round(6 * scale))
     time.sleep(0.05)
 time.sleep(0.25)
-# 拖动**途中**取样：叠加窗跟不上就会在这里露黑边（画面还停在旧位置）
+# 拖动**途中**取样：画面跟着窗口走，中心那块不该变成底色
 img_drag = grab(root / "target" / "floating-03-dragging.png")
 drag_mid = sample(img_drag, lw * 0.5, lh * 0.45)
 user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
@@ -816,13 +820,13 @@ time.sleep(0.6)
 after = window_rect()
 dx, dy = after[0] - before[0], after[1] - before[1]
 print(f"拖动前 {before[:2]} → 拖动后 {after[:2]}（位移 {dx},{dy}）")
-print(f"拖动途中画面中心 = {drag_mid}   ← 应为彩条（叠加窗跟上了）")
+print(f"拖动途中画面中心 = {drag_mid}   ← 应为彩条（窗口移动不影响画面）")
 drag_aligned = check_aligned("拖动后")
 refresh_geometry()
 
 # ---- 5. 双击画面 → 全屏播放；Esc / 最大化按钮 → 回窗口 -----------------
 #
-# 双击画面是**播放器手势**（进/出全屏），不是最大化：叠加窗只把「发生了一次双击」
+# 双击画面是**播放器手势**（进/出全屏），不是最大化：GPUI 识别双击之后
 # 排进队列，由 100ms tick 切影院模式（窗口真的全屏 + 收起歌单）。用户报过三连：
 # 双击没进全屏、全屏后回不来、Esc 不管用。
 #
@@ -1010,8 +1014,8 @@ print(f"字幕/音轨 → cycle 命令 {cycles_before}→{cycles_after} 条")
 
 # ---- 7. ⓘ 视频信息卡：贴左下、压在画面上、再点收起 ----------------------
 #
-# 卡片是「画在画面上」的东西，所以踩的坑和胶囊一样：不进窗口区域就被叠加窗整块
-# 盖住。判据用像素而非 `try_find`：区域没减对时节点是在的，只是用户看不见。
+# 卡片是「画在画面上」的东西，判据同样有两层：探针里必须在（脚本要靠它算坐标），
+# 像素上必须真的变深（玻璃画上去了）。两者缺一，用户就是"点了没反应"。
 cw4, ch4 = client_rect()
 cw4, ch4 = cw4 / scale, ch4 / scale
 # ⓘ 是左侧组第一枚：胶囊左沿 + padding 20 + 半个 20 盒。胶囊左沿不是 `x = 24`
@@ -1022,7 +1026,7 @@ info_pt = (capsule_left() + CAPSULE_PAD_X + 10, controls_center_y())
 CARD_TOP = ch4 - (CAPSULE_INSET + CAPSULE_HEIGHT + INFO_GAP + INFO_HEIGHT)
 CARD_LEFT = CAPSULE_INSET
 card_probe = (CARD_LEFT + INFO_WIDTH / 2, CARD_TOP + INFO_HEIGHT / 2)  # 卡片正中
-wait_region(*info_pt, True)
+wait_chrome(*info_pt, True)
 info_before = sample(grab(out_dir / "verify-info-0-before.png"), *card_probe)
 
 
@@ -1040,7 +1044,7 @@ def info_toggle(want_open, tries=3):
             if sum(px[:3]) + 80 < sum(info_before[:3]):
                 return True, px
         else:
-            cleared = wait_region_clear(CARD_LEFT + 10, CARD_TOP + 10)
+            cleared = wait_chrome_clear(CARD_LEFT + 10, CARD_TOP + 10)
             px = sample(grab(), *card_probe)
             if cleared:
                 return True, px
@@ -1051,8 +1055,8 @@ def info_toggle(want_open, tries=3):
 # 轮询到卡片画上去为止（固定 sleep 会拍到"点击还没被处理"的那一帧）
 info_opened, info_open_px = info_toggle(True)
 grab(out_dir / "verify-info-1-open.png")
-# 两个角点都要归主窗口：左上角的文字区 + 右下角的空白玻璃
-info_in_region = region_contains(CARD_LEFT + 10, CARD_TOP + 10) and region_contains(
+# 两个角点都要在 chrome 布局里：左上角的文字区 + 右下角的空白玻璃
+info_in_region = chrome_contains(CARD_LEFT + 10, CARD_TOP + 10) and chrome_contains(
     CARD_LEFT + INFO_WIDTH - 10, CARD_TOP + INFO_HEIGHT - 10
 )
 # 收起同理：等那块真的从区域里退出去，别按 0.45s 猜
@@ -1077,7 +1081,7 @@ if not fit_ok:
     print(f"FAIL: 起播后窗口尺寸没跟画面对齐（客户区 {fit_client}，期望 {expect or '16:9'}）")
     ok = False
 elif not fit_aligned:
-    print("FAIL: 调整尺寸后视频窗没跟上主窗口几何（画面会停在旧位置）")
+    print("FAIL: 调整尺寸后画面区没跟上客户区（画面会停在旧尺寸）")
     ok = False
 elif not colorful(fit_edge):
     print(f"FAIL: 画面右缘是 {fit_edge}，比例对不上/有黑边（画面没铺满客户区）")
@@ -1085,27 +1089,20 @@ elif not colorful(fit_edge):
 else:
     print(f"OK: 起播即把窗口调成画面尺寸 {fit_client}（1:1），画面铺满不留黑边")
 if not rounded_ok:
-    print(
-        f"FAIL: 视频模式没设圆角（主窗={corner_main} 视频窗={corner_overlay}，期望都是 2）"
-    )
+    print(f"FAIL: 视频模式没设圆角（主窗={corner_main}，期望 2）")
     ok = False
 else:
-    print(f"OK: 视频模式两块窗口都设了圆角（角上像素 {corner_px}，不是画面本体）")
+    print(f"OK: 视频模式整窗圆角（角上像素 {corner_px}，不是画面本体）")
 if not colorful(mid):
-    print(f"FAIL: 画面中心不是彩条（{mid}），画面区没从窗口区域里减掉")
+    print(f"FAIL: 画面中心不是彩条（{mid}），软件渲染没出帧")
     ok = False
 else:
-    print(f"OK: 画面区露出来了，屏幕中心是彩条 {mid}")
-if kind not in (2, 3):
-    print("FAIL: 主窗口没有设窗口区域（视频窗会被判成完全遮挡而停止出帧）")
-    ok = False
-else:
-    print(f"OK: 主窗口区域已设（类型 {kind}），外接框仍然是整窗 {box}")
+    print(f"OK: 画面画出来了，屏幕中心是彩条 {mid}")
 if not aligned:
-    print("FAIL: 视频窗和主窗外框没对齐（铺客户区会让边框透出桌面）")
+    print("FAIL: 画面区没铺满客户区（会露出底色/被裁）")
     ok = False
 else:
-    print("OK: 静止时视频窗与主窗外框严丝合缝")
+    print("OK: 静止时画面区等于客户区")
 if spread < 25:
     print(f"FAIL: 胶囊里的两处几乎同色（色差 {spread}），玻璃没有透出画面")
     ok = False
@@ -1134,10 +1131,10 @@ if not fs_entered:
     print(f"FAIL: 双击画面没进全屏播放（client 仍是 {cw1}x{ch1}，外框 {frame_rect()}）")
     ok = False
 elif not colorful(fs_mid):
-    print(f"FAIL: 全屏后画面中心不是彩条（{fs_mid}），叠加窗没跟着铺满")
+    print(f"FAIL: 全屏后画面中心不是彩条（{fs_mid}），画面没跟着铺满")
     ok = False
 elif not fs_aligned:
-    print("FAIL: 全屏后视频窗和主窗外框没对齐")
+    print("FAIL: 全屏后画面区没铺满客户区")
     ok = False
 elif not fs_band_ok:
     print(f"FAIL: 全屏态顶栏没铺满宽度（两端取样 {fs_band_px}）")
@@ -1153,7 +1150,7 @@ elif (cw2, ch2) != (base_client[0], base_client[1]):
     print(f"FAIL: Esc 之后客户区没回到窗口态（{cw2}x{ch2}，期望 {base_client}）")
     ok = False
 elif not esc_aligned:
-    print("FAIL: Esc 之后视频窗和主窗外框没对齐")
+    print("FAIL: Esc 之后画面区没铺满客户区")
     ok = False
 else:
     print(f"OK: Esc 从全屏回窗口 {cw2}x{ch2}（窗口态 {base_client[0]}x{base_client[1]}）")
@@ -1164,7 +1161,7 @@ elif not max_exits:
     print(f"FAIL: 全屏态点「最大化」没回窗口（client={cw3}x{ch3}）")
     ok = False
 elif not max_aligned:
-    print("FAIL: 全屏里点「最大化」之后视频窗和主窗外框没对齐")
+    print("FAIL: 全屏里点「最大化」之后画面区没铺满客户区")
     ok = False
 else:
     print(f"OK: 全屏态点「最大化」回窗口 {cw3}x{ch3}")
@@ -1174,15 +1171,15 @@ if dx == 0 and dy == 0:
 else:
     print(f"OK: 按住画面拖动窗口，位移 {dx},{dy}")
 if not colorful(drag_mid):
-    print(f"FAIL: 拖动途中画面没跟上（中心取到 {drag_mid}）")
+    print(f"FAIL: 拖动途中画面没了（中心取到 {drag_mid}）")
     ok = False
 else:
-    print(f"OK: 拖动途中画面跟着走 {drag_mid}")
+    print(f"OK: 拖动途中画面还在 {drag_mid}")
 if not drag_aligned:
-    print("FAIL: 拖动后视频窗和主窗外框没对齐")
+    print("FAIL: 拖动后画面区没铺满客户区")
     ok = False
 else:
-    print("OK: 拖动后外框依旧对齐")
+    print("OK: 拖动后画面区仍等于客户区")
 if not seek_keys_ok:
     print("FAIL: 右键没把 seek 发给 mpv（方向键没接通）")
     ok = False
@@ -1204,7 +1201,7 @@ if not info_dark or not info_opened:
     print(f"FAIL: 点 ⓘ 之后那块还是画面（{info_before} → {info_open_px}，卡片没画出来）")
     ok = False
 elif not info_in_region:
-    print("FAIL: 信息卡两个角点不在主窗口区域里（会被叠加窗盖住）")
+    print("FAIL: 信息卡两个角点不在 chrome 布局里（探针与布局对不上）")
     ok = False
 elif not info_hole_gone:
     print(f"FAIL: 再点一次 ⓘ 没收回信息卡（那块仍在窗口区域里，{info_closed_px}）")
@@ -1212,7 +1209,7 @@ elif not info_hole_gone:
 else:
     print(f"OK: ⓘ 信息卡压住画面（{info_before} → {info_open_px}），再点收回 {info_closed_px}")
 if CHROME_MISSES:
-    # 坐标和布局对不上时点击会静默落到叠加窗上，症状是"点了没反应"——先报这个，
+    # 坐标和布局对不上时点击会静默落空，症状是"点了没反应"——先报这个，
     # 否则上面那些 FAIL 会被误当成功能坏掉。
     print(f"FAIL: {len(CHROME_MISSES)} 次点击没落在主窗上（首次 {CHROME_MISSES[0]}）")
     ok = False

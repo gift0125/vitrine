@@ -52,10 +52,12 @@
 │  │ (rodio)     │  │ (lofty 解析 │            │
 │  │             │  │  元数据)    │            │
 │  └─────────────┘  └────────────┘            │
-│  ┌─────────────┐   （Stage 4 ✅）             │
-│  │ VideoEngine │ ← mpv.exe 子进程 + JSON IPC  │
-│  └─────────────┘   + app::video_overlay 顶层窗口│
-└─────────────────────────────────────────────┘
+│  ┌─────────────┐   （Stage 4 ✅）              │
+│  │ VideoEngine │ ← 进程内 libmpv（C API）      │
+│  │  + Render   │   SW render API → BGRA 帧      │
+│  └──────┬──────┘   → app::video_surface 纹理    │
+└─────────┼───────────────────────────────────┘
+          └→ gpui_kit::img()（画面在 GPUI 合成树里）
         gpui-kit (base / component / assets)
         GPUI (GPU 加速保留模式渲染)
 ```
@@ -68,11 +70,13 @@ gpui-kit = "0.7"          # UI 框架（含 component/assets 默认 feature）
 rodio = "0.21"            # 音频解码与播放
 lofty = "0.22"            # 音频元数据（封面、时长、标签）
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"          # 播放列表持久化 + mpv IPC 消息
+serde_json = "1"          # 播放列表持久化
 directories = "6"         # 配置目录定位
 # Stage 4 引入（实际落地）：
-# raw-window-handle = "0.6"  # 取 GPUI 窗口 HWND 作为叠加窗口 owner
-# mpv.exe 为外部依赖（不引入 libmpv2）
+# libloading = "0.8"        # 运行时加载 libmpv-2.dll
+# image = "0.25"            # RenderImage 的帧格式（与 gpui-pre 同版本）
+# async-channel = "2"       # render 回调（mpv 线程）→ UI 线程的帧信号
+# libmpv-2.dll 为外部依赖（scripts/fetch-libmpv.ps1）
 ```
 
 ---
@@ -1412,6 +1416,90 @@ tick 在算的（和 `drop_activity` 同一个套路）。
   **颜色**不是缩放，上游没有按下缩放这个口子；要么等版本，要么自己画按钮。
 
 
+### 🎞 第十五轮：mpv 软件渲染出帧，删掉 `--wid` 叠加窗（2026-10-18）
+
+上一轮的结尾写着「**L3 需要 libmpv render API（架构级）**」。本轮就是这一刀：不再让 mpv 往另一个
+窗口里画，而是把帧取回进程、塞进 GPUI 的合成树。
+
+#### 为什么必须换掉 `--wid`
+
+`--wid` 的本质是「把画面交给另一个顶层窗口」，GPUI 永远拿不到那些像素，于是：
+
+- 玻璃只能**平铺 72%** 自救（设计稿要 60% + backdrop blur），L3 只能伪造；
+- 主窗口必须逐像素透明、再把自己的窗口区域改成「整窗 − 画面 + chrome」，否则被完全遮挡的窗口
+  **不出帧**（系统只看矩形不看 alpha）；
+- chrome 得 `RGN_OR` 加回区域，不然它自己被剪掉（区域同时裁渲染和命中测试）；
+- z 序每帧对账、鼠标事件在叠加窗 wndproc 里兜（`SetForegroundWindow`、自己判双击、自己拖动）、
+  拖放要两条接收路径；
+- 顺手的两个雷：区域为空会把窗口从 DWM 合成树里摘掉、`WS_EX_TRANSPARENT` 会让整窗不被合成。
+
+#### 三个 API 事实（决定实现形状）
+
+1. `MPV_RENDER_PARAM_API_TYPE` 的 **data 就是 `char*` 本身**，不是指向指针的指针；参数 ID：
+   `SW_SIZE=17`（`int[2]`）、`SW_FORMAT=18`（`char*`，`"bgr0"`）、`SW_STRIDE=19`（`size_t*`）、
+   `SW_POINTER=20`；参数数组以 `type == 0` 结尾。
+2. **必须 `vo=libmpv`**：mpv 默认的 vo 是 `gpu`（要一个真窗口），没有窗口时它自己换了 vo，
+   渲染上下文就只清一次黑、update 回调也只来一次。再加 `video-timing-offset=0`——否则
+   `render()` 会等到显示时刻才返回，把 UI 线程堵在那里。
+3. 所有 `mpv_render_context_*` 只能在**创建它的线程**上调；update 回调跑在 mpv 自己的线程上、
+   **禁止在里面调 mpv API** → 只 `try_send` 一个信号，真正的取帧由主线程做。
+
+#### 帧怎么变成屏幕上的像素
+
+| 环节 | 做法 |
+|---|---|
+| 通知 | `async_channel::bounded(1)` + `try_send`：天然合并成「有帧了」，回调不会积压 |
+| 取帧 | `cx.spawn_in` 前后台任务 `recv().await` → `pump_frame`（随后 `try_recv` 排空） |
+| 尺寸 | 纯函数 `render::fit_render_size`：contain 适配、**只缩不放**、上限 2560×1440 |
+| 格式 | `bgr0`，**第 4 字节是垃圾，必须补 255**（否则画面全透明） |
+| 上传 | `RenderImage::new(vec![Frame::new(RgbaImage)])`（字节按 BGRA 解释）→ `ImageSource::Render` → `gpui_kit::img(...).object_fit(Contain).size_full()` |
+| 回收 | 展示后 `window.drop_image()`，留 2 帧退役队列（正在显示的那张不能释放） |
+| L3 | 同一帧降到 **48×20** 存成第二张图，胶囊里 `object_fit(Fill)` 铺满（GPU 双线性 ≈ 大半径 box blur） |
+
+上限 2560×1440 不是审美选择：`RenderImage` 每帧都是**新的 `ImageId`**，Windows 的图集按
+`(image_id, frame_index)` 分配 tile（从 1024² 起、最大 16384²），1080p 勉强、4K 直接把图集吃满。
+
+#### 删掉/迁移了什么
+
+- `crates/app/src/video_overlay.rs`：**1010 行全删**（窗口创建、区域、z 序、双击判定、拖动、拖放）；
+- 拖动：画面元素 `on_mouse_down` 记「光标 + 窗口原点」，8ms 循环 `GetCursorPos` → `SetWindowPos`
+  （`SWP_NOSIZE|NOZORDER|NOACTIVATE`），`on_mouse_up` 清锚点。`Window::start_window_move()`
+  在 Windows 后端**没有实现**，`WM_NCLBUTTONDOWN/HTCAPTION` 只跟上头一两步（GPUI 的 wndproc
+  吃掉了后续 `WM_MOUSEMOVE`）；
+- 双击：`on_double_click` → `set_cinema`。能直接收到是因为窗口现在是**正常激活**的 GPUI 窗口
+  （以前叠加窗 `WS_EX_NOACTIVATE`，系统压根不发 `WM_LBUTTONDBLCLK`）。注意它只挂在
+  `Stateful<Div>` 上（元素得有 `.id()`），普通 `Div` 没这个方法；
+- 拖放：只剩 GPUI 的 `IDropTarget` 一条路（画面区也在主窗口里了）；
+- `chrome_rects()` → `chrome_layout()`（`ui_state::ChromeLayout`）：**用途变了**，不再递给
+  `SetWindowRgn`，而是给单测和验收探针用；
+- 验收：`scripts/verify_floating_chrome.py` 从读 `GetWindowRgn` 改成读 `SMP_UI_STATE` 探针的 JSON
+  （画面区 / chrome 矩形 / 淡出强度 / 面板态），`panel_open()` 从「像素猜」变成权威字段。
+
+#### 两个新坑
+
+1. **`window.bounds()` 也会假**。进出全屏那一下 GPUI 把 `WM_SIZE` 丢了 → `logical_size` 不更新，
+   `bounds()` 和 `viewport_size` **一起**停在旧值，只比它俩永远发现不了。真实值只能问系统：
+   新增 `window_actions::client_size()`（`GetClientRect`），判据改成
+   `viewport ≠ bounds`（普通改尺寸）**或** `bounds ≠ 真实客户区`（进出全屏）。
+   症状很有辨识度：全屏后画面铺满，chrome 却画在 853×580 的位置、点哪都不对。
+2. **`Div::bg()` 先于子节点绘制**。胶囊的玻璃渐变铺在 `.bg()` 上，被整幅模糊图盖住 → 胶囊变成
+   一块亮白板、白字读不出来。改法：渐变也是一个 `absolute` 子层，顺序 = 模糊图 → 玻璃 → 染色
+   → 两条 1px 内描边 → 内容。
+
+#### 结果
+
+- `cargo test --workspace`：29（core，含 `render_api_delivers_opaque_pixels` 真 DLL 用例）
+  + 42（app）全绿，零告警；
+- `scripts/verify_floating_chrome.py`：**17 项 ALL OK**——画面出帧（青/品红色条取样）、窗口长成
+  画面尺寸、玻璃透色、歌单开合、`ⓘ` 信息卡压住画面、字幕/音轨各发一条 `cycle`、双击全屏
+  3840×2160 且画面铺满、全屏点「最大化」回窗口、按住画面拖动位移 144,72。
+
+#### 留给下一轮
+
+- **真 backdrop blur**：现在是「降采样 + 双线性」的近似，大块纯色边界会比设计稿软一点；
+- **4K 点对点**：要共享纹理 / D3D11 互操作（`--wid` 时代的零拷贝现在已经换成了每帧一次 CPU 往返）；
+- 设计稿剩下的 `track_hover`、`active_scale .92`、PiP 窗口（卡在 gpui-component 上游）。
+
 ---
 
 ## 4. 里程碑与时间线
@@ -1460,12 +1548,17 @@ simple-media-player/
 │   ├── gpui-kit-plan.md    # 本文档
 │   └── screenshots/        # 各阶段验证截图 + README 用图
 ├── scripts/
-│   ├── package.ps1         # release 构建 + 打包（-WithMpv 可附带 mpv）
-│   └── verify_m2_video.py  # 冒烟工具：归位/置顶截图、点击、拖拽、叠加窗口探测
+│   ├── package.ps1         # release 构建 + 打包（-WithLibmpv 附带 libmpv-2.dll）
+│   ├── fetch-libmpv.ps1    # 下载 mpv-dev 的 DLL/头文件，-CopyToExe 直接放到 target
+│   ├── verify_floating_chrome.py  # 真机验收：17 项（画面/几何/交互，读 SMP_UI_STATE）
+│   ├── shot.py             # 截图：置顶、按 DPI 定位、真实点击、可选 --no-resize
+│   ├── normalize-frames.py # 设计导出图归位（读 spec.json，按 2× 裁、清透明区 RGB）
+│   └── make-overview.py    # 重拼 docs/design-overview.png
 └── dist/                   # 打包产物（gitignore）
 ```
 
 ---
 
-*状态：Stage 0–5 全部完成，`v1.0.0` 已打包（`scripts/package.ps1`）。
-后续方向见 Stage 5「已知限制」：纹理共享浮层、键盘可用的 Slider、随包 mpv、跨平台验证。*
+*状态：Stage 0–5 全部完成，`v1.0.0` 已打包（`scripts/package.ps1`）；第十五轮把视频改成
+sw-render → GPUI 纹理，`--wid` 叠加窗已删除。后续方向见第十五轮「留给下一轮」：
+真 backdrop blur、4K 共享纹理、`track_hover` / PiP。*

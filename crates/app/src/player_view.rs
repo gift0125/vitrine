@@ -4,9 +4,13 @@
 //! - 右上：封面占位区（音频）/ 视频舞台（视频）
 //! - 底部：控制栏（上一首/播放暂停/下一首 + 进度条 + 音量 + 全屏 + 主题切换）
 //!
-//! 双引擎：音频走 `AudioEngine`（rodio），视频走 `VideoEngine`（mpv 子进程）。
-//! 按文件扩展名自动切换；视频模式下 mpv 渲染进 `video_overlay` 创建的顶层叠加窗口，
-//! 其位置由 render 阶段的 `canvas` 回调捕获的视频区 bounds 驱动。
+//! 双引擎：音频走 `AudioEngine`（rodio），视频走 `VideoEngine`（进程内 libmpv）。
+//! 按文件扩展名自动切换；视频模式下 mpv 走**软件渲染 API**，把每一帧写成 BGRA
+//! 交给我们，我们包成 GPUI 纹理画在舞台上（见 `video_surface`）。
+//!
+//! 这条链路取代了上一代的 `--wid` 叠加窗：画面就在主窗口自己的渲染树里，不再需要
+//! 「窗口打洞 + 逐像素透明 + z 序自愈」，chrome 真的压在画面之上，画面像素还能顺手
+//! 拿来做胶囊染色（L2）和模糊底（L3）。
 //!
 //! 100ms 定时器轮询位置并同步 SeekBar，播放结束自动切下一首。
 
@@ -16,8 +20,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use player_core::{
-    find_libmpv, is_video_file, load_track_meta, scan_dir_for_tracks, AudioEngine, PlaybackState,
-    SpawnOptions, TrackMeta, VideoEngine, VideoStatus,
+    find_libmpv, fit_render_size, is_video_file, load_track_meta, scan_dir_for_tracks,
+    AudioEngine, PlaybackState, SpawnOptions, TrackMeta, VideoEngine, VideoStatus,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -36,8 +40,9 @@ use gpui_kit::*;
 use crate::persistence::{self, RepeatMode, Settings};
 use crate::playlist::PlaylistDelegate;
 use crate::theme::overlay;
-use crate::video_overlay::{self, ChromeRect, Hwnd, VideoOverlay};
-use crate::window_actions;
+use crate::ui_state::{ChromeLayout, Rect as UiRect, UiState};
+use crate::video_surface::VideoSurface;
+use crate::window_actions::{self, Hwnd};
 
 /// 进度条量程未知时的兜底（元数据解析失败）。
 const SEEK_FALLBACK_MAX: f32 = 600.0;
@@ -48,7 +53,7 @@ const TICK_INTERVAL: Duration = Duration::from_millis(100);
 /// 设计稿分平台：mac 自绘 34，**Windows 主窗 40**（和设置窗标题带一致，也是
 /// Win10/11 原生标题栏高度）；窗口按钮 46×40 正好是一块标准热区。
 ///
-/// `theme::install` 也读它来给 toast 让位，`video_overlay` 读它算顶栏挖洞，
+/// `theme::install` 也读它来给 toast 让位（通知层要从标题带下面开始），
 /// 所以是 `pub(crate)`。
 pub(crate) const TITLE_BAND: f32 = 40.0;
 /// 底部悬浮胶囊的内缩。
@@ -106,8 +111,8 @@ const INFO_GAP: f32 = 16.0;
 /// 底部为悬浮胶囊预留的高度。
 ///
 /// 胶囊实高 92（见 `CAPSULE_PAD_Y`：8 + 24 + 8 + 44 + 8），加上 24 内缩再留
-/// 2px 余量。留多了窗口下方会空出一条死气沉沉的黑带，留少了 mpv 叠加窗会啃掉
-/// 胶囊上沿。
+/// 2px 余量。留多了窗口下方会空出一条死气沉沉的黑带，留少了玻璃胶囊会贴到
+/// 画面最下沿、下沿那圈亮边看不出厚度。
 const BOTTOM_BAND: f32 = 118.0;
 /// 多久没有新的拖拽经过就算「拖走了」：`drag_over` 在拖动过程中会持续触发，
 /// 停更这么久只可能是鼠标带着文件离开了窗口。
@@ -146,13 +151,13 @@ const CHROME_IDLE: Duration = Duration::from_millis(2500);
 /// 不用 GPUI 的 `with_animation`：那个动画只在有帧驱动时推进，而这个界面的帧
 /// 是 tick 拉起来的（画面本身就是 mpv 在画，主窗口大部分时间是空的）。
 const CHROME_FADE_STEP: f32 = 0.25;
-/// 淡到这个值以下就当「已经隐藏」：区域收缩（画面整块让出去）用。
+/// 淡到这个值以下就当「已经隐藏」：chrome 整块让出、探针里 `rects` 为空。
 const CHROME_HIDDEN_EPS: f32 = 0.01;
-/// 换片 / seek 之后多久去抓一帧算色相（等解码出首帧）。
-const TINT_DELAY: Duration = Duration::from_millis(400);
-/// 取色失败（首帧还没到）的重试间隔，以及最多重试几次。
-const TINT_RETRY: Duration = Duration::from_millis(500);
-const TINT_TRIES: u8 = 3;
+/// 画面色相换一次的门限（度）。
+///
+/// 逐帧套用会让胶囊玻璃跟着画面闪——同一镜头里每帧的均值都在几个度上抖。
+/// 8° 差不多是「换了个配色」的量级，一个镜头之内基本一动不动。
+const TINT_HYSTERESIS: f32 = 8.0;
 /// 时间码字体（设计稿用等宽）：跟主题走，取平台原生的等宽族。
 ///
 /// 写死 "Consolas" 在 macOS/Linux 上不存在，会退到非等宽字体，
@@ -298,11 +303,17 @@ const SUB_SEEK: usize = 1;
 /// 用 `Cell` 是因为 paint 回调只有 `&self` 上下文，且不需要触发重绘。
 type VideoRectCell = Rc<Cell<Option<(f32, f32, f32, f32)>>>;
 
-/// 视频播放运行时（叠加窗口 + mpv 进程）。
+/// 视频播放运行时（mpv 引擎 + 界面手里的画面）。
 #[derive(Default)]
 struct VideoRuntime {
-    overlay: Option<VideoOverlay>,
     engine: Option<VideoEngine>,
+    /// 舞台上的画面、胶囊模糊底、染色色相（见 `video_surface`）
+    surface: VideoSurface,
+    /// mpv 的「有新帧」信号（容量 1，投递侧 `try_send` 合并）。
+    ///
+    /// 放在这里是因为**接信号要 window**（`cx.spawn_in`），而 `start_video` 手上
+    /// 没有 window：引擎起播时只把接收端存下来，下一次 tick 再把泵拉起来。
+    frames: Option<async_channel::Receiver<()>>,
 }
 
 /// 方向键的四个方向。
@@ -382,6 +393,53 @@ pub(crate) fn chrome_visible_target(
     idle < CHROME_IDLE
 }
 
+/// 两个色相之间的最短距离（度，0~180）。///
+/// 色相是环：350° 和 10° 只差 20°，不是 340°。胶囊染色的迟滞判据要用它，
+/// 直接相减会让「红→品红」那一小段永远算成大幅变化，玻璃每帧都在闪。
+pub(crate) fn hue_distance(a: f32, b: f32) -> f32 {
+    let diff = (a - b).abs() % 360.0;
+    diff.min(360.0 - diff)
+}
+
+/// 诊断：`SMP_RENDER_TRACE=1` 时把「舞台 / 原生 / 实际帧」的尺寸关系打出来。
+///
+/// 只在三者之一变化时打一行（逐帧打会把 session.log 淹掉）。这一行能一次回答
+/// 三个常见病症：帧尺寸跟舞台一样 = 原生尺寸还没报上来（画面被拉伸）、
+/// 帧尺寸小于舞台 = 被像素预算或原生尺寸限制（放大靠 GPU）、
+/// 帧尺寸的比例和舞台不一样 = contain 生效了（该有黑边）。
+fn trace_frame(
+    stage_w: f32,
+    stage_h: f32,
+    native: Option<(u32, u32)>,
+    frame: (usize, usize),
+    scale: f32,
+) {
+    if std::env::var_os("SMP_RENDER_TRACE").is_none() {
+        return;
+    }
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<(u32, u32, u32, u32)>> = Mutex::new(None);
+    let key = (stage_w as u32, stage_h as u32, frame.0 as u32, frame.1 as u32);
+    let mut slot = LAST.lock().unwrap();
+    if *slot == Some(key) {
+        return;
+    }
+    *slot = Some(key);
+    let native = match native {
+        Some((w, h)) => format!("{w}x{h}"),
+        None => "none".to_string(),
+    };
+    let detail = format!(
+        "frame {width}x{height} stage {sw:.0}x{sh:.0} native {native} scale {scale}",
+        width = frame.0,
+        height = frame.1,
+        sw = stage_w,
+        sh = stage_h,
+    );
+    eprintln!("[render] {detail}");
+    persistence::log_session(&format!("render: {detail}"));
+}
+
 pub struct PlayerView {
     engine: Option<AudioEngine>,
     playlist: Entity<ListState<PlaylistDelegate>>,
@@ -421,28 +479,28 @@ pub struct PlayerView {
     /// 960×540，隔一帧才报真值。按第一份数据调窗口会先跳到一个错的尺寸再跳回来，
     /// 所以同一个值连着出现两次才动手。
     fit_seen: Option<(u32, u32, u8)>,
-    /// render 阶段由 canvas 捕获的视频区（窗口逻辑坐标 x, y, w, h）
+    /// render 阶段由 canvas 捕获的视频区（窗口逻辑坐标 x, y, w, h）。
+    ///
+    /// 画面现在铺满整个窗口，这个值只给验收探针用（「舞台铺到哪」），不再驱动
+    /// 叠加窗定位。
     video_rect: VideoRectCell,
     /// render 阶段由 canvas 捕获的控制胶囊矩形。
     ///
-    /// 视频模式要把画面区从主窗口的窗口区域里减掉（否则被整块盖住的视频窗会停止
-    /// 出帧，见 `video_overlay` 模块头），而胶囊是浮在画面上的，得再加回区域里。
-    /// 胶囊高度是内容撑开的（随字号/行距变），不能写死，只能量。
+    /// 胶囊高度是内容撑开的（随字号/行距变），不能写死，只能量：验收脚本要按它
+    /// 算点击坐标，单元测试要断言 760×92。
     capsule_rect: VideoRectCell,
-    /// 等 mpv 回执的切轨动作：`(类型, 切换前的轨号, 发起时刻)`。
-    ///
+    /// 等 mpv 回执的切轨动作：`(类型, 切换前的轨号, 发起时刻)`。    ///
     /// 见 `cycle_subtitles`：`cycle` 是单向命令、没有返回值，只能靠观测值变化确认。
     pending_track: Option<(TrackKind, u32, Instant)>,
     /// 是否展开「视频信息」卡（胶囊左端的 `ⓘ`）。
     ///
-    /// 它压在画面上，和胶囊一样要加回窗口区域（见 `chrome_rects`）；尺寸是写死的
-    /// 240×180，但仍然量一次——字号/行距跟着主题变，实际高度未必是 180。
+    /// 尺寸写死 240×180，但仍然量一次——字号/行距跟着主题变，实际高度未必是 180；
+    /// 验收探针和单元测试都靠这个矩形。
     info_open: bool,
     info_rect: VideoRectCell,
-    /// 当前已应用的窗口区域（用内容做键，避免每帧都打 SetWindowRgn——
-    /// 那会让整窗重绘，画面跟着闪）。第二项是 scale 的位模式（跨屏换 DPI 要重算）。
-    chrome_region: Option<(Vec<ChromeRect>, u32)>,
-    /// 主窗口当前是不是圆角状态（视频模式才圆，见 `sync_overlay_rect`）。
+    /// 待还掉的画面贴图（退出视频时立起来，下一次 tick 真正还）。
+    surface_clear: bool,
+    /// 主窗口当前是不是圆角状态（视频模式才圆，见 `sync_video_chrome`）。
     corners_rounded: bool,
     /// 上一次补算客户区（`refresh_client_area`）的时刻，用来限流
     client_kick: Option<Instant>,
@@ -450,7 +508,7 @@ pub struct PlayerView {
     layout_kick: Option<Instant>,
     /// 是否已经把窗口表面的底色改成透明（见 `Render` 里的说明）
     surface_transparent: bool,
-    /// GPUI 主窗口句柄（叠加窗口的 z 序基准）
+    /// GPUI 主窗口句柄（拖动 / 最大化 / 客户区自愈都要它）
     main_hwnd: Hwnd,
     /// 窗口是否最大化。
     ///
@@ -480,15 +538,23 @@ pub struct PlayerView {
     ///
     /// 和 `drop_activity` 同一个套路：监听里只写时间戳，由 tick 消费并决定重绘。
     activity_moved: Rc<Cell<Option<Instant>>>,
-    /// L2 画面染色：当前片子底部中间那块的**色相**（0~360）。
+    /// L2 画面染色：当前**已应用**的色相（0~360）。
     ///
-    /// 只在换片 / seek 之后取一次（一次缩略截图 + 一次均值），不做逐帧取色。
-    /// `None` = 还没取到（刚起播、或截图失败）：这时胶囊就是纯 L1 的玻璃。
-    frame_tint: Option<f32>,
-    /// 下一次该取色的时刻（换片/seek 之后延迟 [`TINT_DELAY`]，等首帧真解码出来）。
-    tint_due: Option<Instant>,
-    /// 取色已经重试了几次（首帧没到的时候 `screenshot-raw` 会失败）。
-    tint_tries: u8,
+    /// 逐帧取色是免费的（像素本来就在手上，见 `video_surface::FrameRef::band_hue`），
+    /// 但每帧都换一次玻璃颜色会跟着画面闪。所以只在色相**跳超过 8°** 时才应用，
+    /// 一个镜头之内基本是稳定的。
+    tint_applied: Option<f32>,
+    /// 拖动窗口的锚点：`(按下时光标 x, y, 窗口 x, y)`（都是屏幕物理像素）。
+    ///
+    /// 用 `Cell` 而不是普通字段：拖动循环跑在 `cx.spawn_in` 的任务里，每个 tick
+    /// 读一次锚点、算一次目标位置。画面区以前归叠加窗，拖动由 wndproc 做；现在
+    /// 画面在主窗口里，GPUI 的 `start_window_move()` 在 Windows 后端又没有实现
+    /// （实测只有 apple / test 后端有），只能自己搬。
+    drag_anchor: Rc<Cell<Option<(i32, i32, i32, i32)>>>,
+    /// 验收探针的输出路径（`SMP_UI_STATE`），没设就完全不产生开销。
+    ui_probe: Option<PathBuf>,
+    /// 上一次写出去的探针 JSON（内容没变就不重写盘）。
+    ui_published: Option<String>,
 
     // ---- 用户可见错误 ----
     /// 待弹出的错误提示（由 tick 统一推成 toast，保证有 window 可用）
@@ -508,8 +574,8 @@ pub struct PlayerView {
     drop_hint_shown: bool,
     /// 视频模式下的临时状态胶囊（文案, 出现时刻, 是否错误）。
     ///
-    /// 视频模式下 mpv 叠加窗盖住了整个内容区，gpui-component 的 toast 落在里面
-    /// 等于不可见，所以改成画在标题带上的小胶囊（那条带子在叠加窗之上）。
+    /// 视频模式下 gpui-component 的 toast 会和画面抢焦点位置（落在画面中央），
+    /// 所以视频模式改成画在标题带上的小胶囊。
     status_pill: Option<(SharedString, Instant, bool)>,
     /// 上一帧是否画了状态胶囊（tick 用它判断要不要重绘）
     status_pill_shown: bool,
@@ -572,9 +638,9 @@ impl PlayerView {
         ];
 
         let mut subscriptions = subscriptions;
-        // 窗口移动/缩放时同步叠加窗口位置
+        // 窗口移动/缩放：圆角属性与验收探针要跟着更新
         subscriptions.push(cx.observe_window_bounds(window, |this, window, _cx| {
-            this.sync_overlay_rect(window);
+            this.sync_video_chrome(window);
         }));
         // 退出应用时结束 mpv 子进程（避免孤儿进程）
         subscriptions.push(cx.on_app_quit(|this, _cx| {
@@ -618,7 +684,7 @@ impl PlayerView {
             }
         }
 
-        // 主窗口句柄（叠加窗口的 owner）；拿不到则视频功能降级
+        // 主窗口句柄：拖动、最大化、客户区自愈都要它
         let main_hwnd = window
             .window_handle()
             .ok()
@@ -658,7 +724,7 @@ impl PlayerView {
             pending_track: None,
             info_open: false,
             info_rect,
-            chrome_region: None,
+            surface_clear: false,
             corners_rounded: false,
             client_kick: None,
             layout_kick: None,
@@ -671,9 +737,10 @@ impl PlayerView {
             chrome_alpha: 1.0,
             activity: Instant::now(),
             activity_moved: Rc::new(Cell::new(None)),
-            frame_tint: None,
-            tint_due: None,
-            tint_tries: 0,
+            tint_applied: None,
+            drag_anchor: Rc::new(Cell::new(None)),
+            ui_probe: std::env::var_os("SMP_UI_STATE").map(PathBuf::from),
+            ui_published: None,
             last_error: startup_errors.first().cloned(),
             pending_errors: startup_errors,
             pending_infos: Vec::new(),
@@ -766,7 +833,7 @@ impl PlayerView {
                 }
             }));
 
-        // 100ms 轮询：进度同步 + 自动连播 + 叠加窗口跟随 + 窗口尺寸节流落盘
+        // 100ms 轮询：进度同步 + 自动连播 + 控制层淡出 + 窗口尺寸节流落盘
         cx.spawn_in(window, async move |this, cx| loop {
             cx.background_executor().timer(TICK_INTERVAL).await;
             let Ok(()) = this.update_in(cx, |view, window, cx| view.tick(window, cx)) else {
@@ -802,8 +869,8 @@ impl PlayerView {
     /// 把排队的提示弹出来。
     ///
     /// 两种呈现方式，取决于**底色**：音频模式用右上角 toast（gpui-component 的
-    /// 通知层，位置固定、会自己排队）；视频模式整块内容区被 mpv 叠加窗盖着，
-    /// in-app toast 等于不可见，所以改成标题带里的小胶囊（见 `status_pill`）。
+    /// 通知层，位置固定、会自己排队）；视频模式整块内容区都是画面，toast 落在
+    /// 画面中间会挡住内容，所以改成标题带里的小胶囊（见 `status_pill`）。
     fn flush_errors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let to_pill = self.video_active;
         for message in std::mem::take(&mut self.pending_errors) {
@@ -835,23 +902,15 @@ impl PlayerView {
     fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_errors(window, cx);
 
+        // 退出视频时立起的标记：贴图要窗口才能还（见 `leave_video`）
+        if std::mem::take(&mut self.surface_clear) {
+            self.video.surface.clear(window);
+            cx.notify();
+        }
+
         // 命令行「打开方式」：等第一帧渲染完再起播，构造期间不发通知
         if let Some(index) = self.pending_autoplay.take() {
             self.play_track(index, cx);
-        }
-
-        // 拖到画面上的文件由视频窗代收（画面区不在主窗口的区域里，见 video_overlay）
-        let dropped = video_overlay::take_dropped();
-        if !dropped.is_empty() {
-            self.import_dropped(dropped.into_iter().map(PathBuf::from).collect(), cx);
-        }
-
-        // 双击画面 → 全屏播放。视频窗只能把"发生了一次双击"记进队列（它不在 GPUI 的
-        // 上下文里），真正的切换在这里做。延迟 ≤1 帧。
-        for event in video_overlay::take_events() {
-            match event {
-                video_overlay::OverlayEvent::ToggleCinema => self.toggle_cinema(window, cx),
-            }
         }
 
         // 拖放提示：`drag_over` 的样式回调拿不到 cx，只能留时间戳。
@@ -873,11 +932,15 @@ impl PlayerView {
             cx.notify();
         }
 
-        // 控制层淡出/淡入：必须在 `sync_overlay_rect` 之前——区域要看 `chrome_alpha`。
+        // 控制层淡出/淡入：必须在 `sync_video_chrome` 之前——探针要看到新的 `chrome_alpha`。
         self.tick_chrome_fade(cx);
 
-        // L2 画面染色：换片 / seek 之后隔一会儿取一次色（见 `schedule_frame_tint`）。
-        self.tick_frame_tint(cx);
+        // 帧泵：引擎起播时只存下了接收端（`start_video` 手上没有 window），
+        // 在这里把「有新帧」接成界面上的画面。
+        self.ensure_frame_pump(window, cx);
+
+        // L2 画面染色：色相变了才让胶囊重画（判据在 `apply_frame_tint`）。
+        self.apply_frame_tint(cx);
 
         // 最大化状态：用户可能用系统的双击标题栏 / Aero Snap / 右键菜单改变它，
         // 这些都不经过我们的按钮，所以每帧比对一次，变了才重绘（图标要换成「还原」）。
@@ -920,8 +983,8 @@ impl PlayerView {
             }
         }
 
-        // 叠加窗口跟随窗口移动/缩放
-        self.sync_overlay_rect(window);
+        // 视频模式：圆角属性 + 验收探针
+        self.sync_video_chrome(window);
 
         // 客户区自愈：进出全屏后系统不重算客户区（实测退全屏后窗口已是 1280×731、
         // 客户区还停在 3840×2010），界面会整块画在旧尺寸上。每帧比一次，不一致就补
@@ -944,8 +1007,13 @@ impl PlayerView {
         }
 
         // 布局自愈：进出全屏那一下 GPUI 的布局会停在旧尺寸（画面已经全屏，顶栏却
-        // 只画在左上角 853×34 那一小块里、右上角的窗口按钮根本不存在）。判据用
-        // `viewport_size`（布局真正用的那个）和 `window.bounds()` 比。
+        // 只画在左上角一小块里、右上角的窗口按钮根本不存在）。
+        //
+        // 判据有两条，缺一不可：
+        // - `viewport ≠ bounds`：布局用的和窗口说的是两回事（普通改尺寸走这条）；
+        // - `bounds ≠ 真实客户区`：**进出全屏走的是这条**。GPUI 漏掉那一次尺寸通知
+        //   之后 `logical_size` 根本没更新，`bounds()` 和 `viewport` 一起停在旧值，
+        //   只比它俩永远发现不了。真实值只能问系统（`GetClientRect`）。
         //
         // 注意：**不能**在这里调 `window.bounds_changed(cx)`——它会把 `bounds_observers`
         // 全跑一遍，其中就有对本视图的 `update`，而此刻视图正在被 update，直接 panic
@@ -956,20 +1024,27 @@ impl PlayerView {
         const LAYOUT_KICK_COOLDOWN: Duration = Duration::from_millis(300);
         let viewport = window.viewport_size();
         let bounds = window.bounds().size;
+        let scale = window.scale_factor();
+        let physical = window_actions::client_size(self.main_hwnd);
         let viewport_stale = (viewport.width.as_f32() - bounds.width.as_f32()).abs() > 0.5
             || (viewport.height.as_f32() - bounds.height.as_f32()).abs() > 0.5;
-        if viewport_stale {
+        let bounds_stale = physical.0 > 0
+            && ((bounds.width.as_f32() * scale - physical.0 as f32).abs() > 1.5
+                || (bounds.height.as_f32() * scale - physical.1 as f32).abs() > 1.5);
+        if viewport_stale || bounds_stale {
             let due = self
                 .layout_kick
                 .is_none_or(|at| at.elapsed() >= LAYOUT_KICK_COOLDOWN);
             if due {
                 self.layout_kick = Some(Instant::now());
                 persistence::log_session(&format!(
-                    "layout stale: viewport={:.0}x{:.0} window={:.0}x{:.0} -> kick",
+                    "layout stale: viewport={:.0}x{:.0} window={:.0}x{:.0} client={}x{} -> kick",
                     viewport.width.as_f32(),
                     viewport.height.as_f32(),
                     bounds.width.as_f32(),
                     bounds.height.as_f32(),
+                    physical.0,
+                    physical.1,
                 ));
                 let main = self.main_hwnd;
                 cx.spawn_in(window, async move |_this, _cx| {
@@ -1028,9 +1103,7 @@ impl PlayerView {
                     }
                     self.video_active = false;
                     self.current = None;
-                    if let Some(overlay) = &mut self.video.overlay {
-                        overlay.hide();
-                    }
+                    self.surface_clear = true;
                     cx.notify();
                 }
             }
@@ -1091,9 +1164,7 @@ impl PlayerView {
                         engine.stop();
                     }
                     self.video_active = false;
-                    if let Some(overlay) = &mut self.video.overlay {
-                        overlay.hide();
-                    }
+                    self.surface_clear = true;
                     cx.notify();
                 }
             }
@@ -1162,97 +1233,81 @@ impl PlayerView {
         .detach();
     }
 
-    /// 让叠加窗口对齐 canvas 捕获的视频区，并压在主窗口正下方。
+    /// 视频模式的窗口属性同步：圆角 + 验收探针。
     ///
-    /// 视频窗在**下面**（见 `video_overlay` 模块头），所以这里只管位置和 z 序：
-    /// 内容区不再需要开洞，主窗口的 chrome 半透明，画面自己会从玻璃底下透出来。
-    fn sync_overlay_rect(&mut self, window: &Window) {
-        // 圆角：视频播放时整窗变成圆角（画面上下两角来自视频叠加窗，标题带两角来自
-        // 主窗口，见 `window_actions::set_rounded`）；回到音频模式恢复直角。
-        // 只在状态变化时调——改变窗口属性会触发一次重绘，别每帧都打。
+    /// 上一代这里还要「让叠加窗跟上视频区、压在主窗正下方、把画面从主窗区域里减掉」，
+    /// 因为画面是另一块窗口。现在画面就在自己的渲染树里，只剩下两件事：
+    /// 视频时给整窗加圆角（画面贴到窗口边缘，方角会割裂），以及把界面状态写给验收脚本。
+    fn sync_video_chrome(&mut self, window: &Window) {
+        // 只在状态变化时调——改窗口属性会触发一次重绘，别每帧都打。
         if self.corners_rounded != self.video_active {
             self.corners_rounded = self.video_active;
             window_actions::set_rounded(self.main_hwnd, self.video_active);
         }
-        if !self.video_active {
-            if let Some(overlay) = &mut self.video.overlay {
-                overlay.hide();
-            }
-            // 退出视频模式：主窗口恢复整窗矩形（否则界面还是被剪成 chrome 那几块）
-            if self.chrome_region.take().is_some() {
-                video_overlay::clear_region(self.main_hwnd);
-            }
-            return;
-        }
-        let Some((x, y, w, h)) = self.video_rect.get() else {
-            return;
-        };
-        if w < 8.0 || h < 8.0 {
-            return;
-        }
-        let scale = window.scale_factor();
-        // 铺满**外框**：客户区外那一圈边框留在主窗口的区域里（要不没法拖动缩放），
-        // 而那一圈我们不画东西，只铺到客户区就会从边框透出桌面。
-        let (wx, wy, ww, wh) = video_overlay::window_rect(self.main_hwnd);
-        let physical = (wx, wy, ww, wh);
-        if let Some(overlay) = &mut self.video.overlay {
-            // 最小化时它得跟着消失（没有 owner 关系，系统不再代劳）
-            if overlay.follow_minimize() {
-                return;
-            }
-            overlay.set_rect(physical.0, physical.1, physical.2, physical.3);
-            if !overlay.is_visible() {
-                overlay.show();
-            }
-        }
-        // 主窗口把画面区让出去：系统只认窗口区域，不减掉这块，被完全盖住的视频窗
-        // 就会被判成「不可见」而停止出帧（画面一片空白，连 PrintWindow 都是黑的）。
-        //
-        // 去重键**不含窗口位置**：区域坐标是相对窗口矩形的，纯移动不需要重设；
-        // 带上位置的话拖动/贴边过程中每一步都会 `SetWindowRgn`（整窗重绘 + 画面抖）。
-        // 尺寸变化已经由 chrome 自己的坐标/宽高体现，scale 单独记一笔（跨屏换 DPI）。
-        let chrome = self.chrome_rects(window);
-        let key = (chrome, scale.to_bits());
-        if self.chrome_region.as_ref() != Some(&key) {
-            if std::env::var_os("SMP_REGION_TRACE").is_some() {
-                persistence::log_session(&format!(
-                    "region <- stage=({x:.1},{y:.1},{w:.1},{h:.1}) chrome={:?} scale={scale}",
-                    key.0
-                ));
-            }
-            video_overlay::set_region(self.main_hwnd, (x, y, w, h), &key.0, scale);
-            self.chrome_region = Some(key);
-        }
+        self.publish_ui_state(window);
     }
 
-    /// 视频模式下主窗口区域里要**留下**的 chrome（逻辑像素）。
+    /// 把「界面认为自己处在什么状态」写到 `SMP_UI_STATE`。
     ///
-    /// 画面铺满整窗，所以除了这几块以外全让出去——让出去的部分露出下面的视频窗，
-    /// 这几块留在主窗口里、用半透明玻璃画在画面之上。
-    fn chrome_rects(&self, window: &Window) -> Vec<ChromeRect> {
+    /// 没有区域可读之后，验收脚本要判断「胶囊在不在」「面板开没开」只能问界面自己。
+    /// 内容不变就不写盘（`chrome_alpha` 只在淡入淡出的那 4 帧里变，其余时候是常数）。
+    fn publish_ui_state(&mut self, window: &Window) {
+        let Some(path) = self.ui_probe.clone() else {
+            return;
+        };
+        let bounds = window.bounds();
+        let state = UiState {
+            video: self.video_active,
+            chrome_alpha: self.chrome_alpha,
+            panel_open: self.playlist_open,
+            info_open: self.info_open,
+            cinema: self.cinema,
+            window: (
+                bounds.size.width.as_f32(),
+                bounds.size.height.as_f32(),
+            ),
+            stage: self.video_rect.get().map(|(x, y, w, h)| UiRect::new(x, y, w, h)),
+            frame: self.video.surface.size(),
+            layout: self.chrome_layout(window),
+        };
+        let json = state.to_json();
+        if self.ui_published.as_deref() == Some(json.as_str()) {
+            return;
+        }
+        state.publish(&path);
+        self.ui_published = Some(json);
+    }
+
+    /// 视频模式下压在画面上的那几块 chrome（逻辑像素，已含抗锯齿留白）。
+    ///
+    /// 它已经从渲染管线上下来了（画面在自己手里，不需要给任何窗口「打洞」），
+    /// 但仍然是**唯一一处**把「标题带 / 遮罩 / 胶囊 / 信息卡 / 歌单」的位置写成
+    /// 数据的地方：单元测试靠它断言几何，验收脚本靠它算点击坐标。
+    fn chrome_layout(&self, window: &Window) -> ChromeLayout {
         let bounds = window.bounds();
         let width = bounds.size.width.as_f32();
         let height = bounds.size.height.as_f32();
 
-        // 抗锯齿留白：区域切得太贴边会把圆角的白描边切掉半个像素
+        // 抗锯齿留白：切得太贴边会把圆角那圈 1px 描边切掉半个像素
         const PAD: f32 = 1.5;
 
-        // 控制层已经淡掉了：整块让给叠加窗。
-        //
-        // 这一条是自动淡出的**另一半**——只把元素画成透明、区域还留着的话，
-        // 那几块依然是主窗口的地盘：鼠标移过去落在看不见的按钮上，画面也少了
-        // 一块"能点的区域"（淡出后拖动/双击都该回到画面自己的手势上）。
-        if self.chrome_alpha <= CHROME_HIDDEN_EPS {
-            return Vec::new();
+        let visible = self.chrome_alpha > CHROME_HIDDEN_EPS;
+        let mut layout = ChromeLayout {
+            visible,
+            width,
+            height,
+            ..Default::default()
+        };
+        if !visible {
+            return layout;
         }
 
-        let mut chrome = Vec::with_capacity(5);
-        // 标题带整条留下：右端还有窗口按钮，中间截断会很奇怪
-        chrome.push(ChromeRect::rect(0., 0., width, TITLE_BAND));
+        // 标题带整条：右端还有窗口按钮，中间截断会很奇怪
+        layout.title_band = Some(UiRect::new(0., 0., width, TITLE_BAND));
 
-        // 底部渐隐遮罩：整条压在画面上，所以整块都得留在主窗口里
+        // 底部渐隐遮罩：整条压在画面上
         if self.video_active {
-            chrome.push(ChromeRect::rect(
+            layout.vignette = Some(UiRect::new(
                 0.,
                 (height - VIGNETTE_HEIGHT).max(0.),
                 width,
@@ -1261,49 +1316,31 @@ impl PlayerView {
         }
 
         if let Some((x, y, w, h)) = self.capsule_rect.get() {
-            chrome.push(ChromeRect::rounded(
-                x - PAD,
-                y - PAD,
-                w + PAD * 2.,
-                h + PAD * 2.,
-                CAPSULE_RADIUS + PAD,
-            ));
+            layout.capsule = Some(
+                UiRect::rounded(x, y, w, h, CAPSULE_RADIUS).inflate(PAD),
+            );
         }
 
-        // 视频信息卡：和胶囊同样的道理——它画在画面上，不进区域就被叠加窗盖住，
-        // 用户看到的是"点了 ⓘ 什么都没发生"。
         if self.info_open && self.video_active {
             if let Some((x, y, w, h)) = self.info_rect.get() {
-                chrome.push(ChromeRect::rounded(
-                    x - PAD,
-                    y - PAD,
-                    w + PAD * 2.,
-                    h + PAD * 2.,
-                    12. + PAD,
-                ));
+                layout.info_card = Some(UiRect::rounded(x, y, w, h, 12.).inflate(PAD));
             }
         }
 
         // 歌单：展开时浮在画面右侧
         //
         // 这里的四个数必须和 `render_playlist_panel` 里的定位**逐像素一致**
-        // （top/right/bottom/width）：区域是"主窗负责画哪块"的声明，比面板大一圈
-        // 就等于把一段画面也算给主窗（拖窗的热区错位）；小一圈则面板边缘被叠加窗
-        // 盖住。以前写的是 `width - 12` / `TITLE_BAND + 6`，那是最早一版面板的
-        // 位置，改面板时漏了这里。
+        // （top/right/bottom/width），否则脚本按这份数据算出来的点击会落在面板外。
         if self.playlist_open && !self.cinema {
             let panel_x = width - PLAYLIST_INSET - PLAYLIST_WIDTH;
             let panel_y = TITLE_BAND + PLAYLIST_TOP_GAP;
             let panel_h = (height - panel_y - PLAYLIST_BOTTOM).max(0.);
-            chrome.push(ChromeRect::rounded(
-                panel_x - PAD,
-                panel_y - PAD,
-                PLAYLIST_WIDTH + PAD * 2.,
-                panel_h + PAD * 2.,
-                CAPSULE_RADIUS + PAD,
-            ));
+            layout.panel = Some(
+                UiRect::rounded(panel_x, panel_y, PLAYLIST_WIDTH, panel_h, CAPSULE_RADIUS)
+                    .inflate(PAD),
+            );
         }
-        chrome
+        layout
     }
 
     /// 把 mpv 报的时长补进轨道元数据（同时落盘）。
@@ -1390,7 +1427,7 @@ impl PlayerView {
         // 开播这一刻算一次输入：新片子的前 2.5 秒控制层必须是亮着的，
         // 否则刚打开视频就是一块"什么都没有"的画面（用户还没碰过任何输入）。
         self.activity = Instant::now();
-        self.schedule_frame_tint();
+        self.tint_applied = None;
 
         if want_video {
             // 音频引擎让位（mpv 负责音视频）
@@ -1432,31 +1469,13 @@ impl PlayerView {
         }
     }
 
-    /// 进入视频模式：确保叠加窗口与 mpv 进程就绪，然后加载文件。
+    /// 进入视频模式：确保 mpv 引擎与软件渲染就绪，然后加载文件。
     fn start_video(&mut self, track: &TrackMeta, cx: &mut Context<Self>) {
         self.video_error = None;
         self.video_active = true;
         // 换片了：等新片子的尺寸出来再调窗口（旧尺寸不能沿用）
         self.fit_done = None;
         self.fit_seen = None;
-
-        if self.main_hwnd == 0 {
-            self.video_active = false;
-            self.video_error = Some("无法获取主窗口句柄，视频渲染不可用".into());
-            self.report_error("视频不可用：无法获取主窗口句柄");
-            return;
-        }
-
-        if self.video.overlay.is_none() {
-            self.video.overlay = VideoOverlay::create(self.main_hwnd);
-        }
-        let Some(overlay) = &self.video.overlay else {
-            self.video_active = false;
-            self.video_error = Some("无法创建视频叠加窗口".into());
-            self.report_error("视频不可用：无法创建叠加窗口");
-            return;
-        };
-        let wid = overlay.hwnd();
 
         // 复用进程；连接已断开则重建
         let need_spawn = match &self.video.engine {
@@ -1474,9 +1493,10 @@ impl PlayerView {
                 );
                 return;
             };
+            // `wid: None` = 不要 `--wid` 叠加窗，改走软件渲染（见 `video::spawn`）
             match VideoEngine::spawn(SpawnOptions {
                 libmpv,
-                wid: Some(wid),
+                wid: None,
                 volume: self.settings.volume,
                 extra_args: Vec::new(),
             }) {
@@ -1490,7 +1510,28 @@ impl PlayerView {
             }
         }
 
-        if let Some(engine) = &self.video.engine {
+        if let Some(engine) = &mut self.video.engine {
+            // 软件渲染上下文：一个引擎开一次。换片复用引擎时不能重复创建
+            // （`mpv_render_context_create` 会返回 `property unavailable`）。
+            if !engine.has_render() {
+                match engine.enable_render() {
+                    Ok(()) => {}
+                    Err(err) => {
+                        self.video_error = Some(format!("视频渲染不可用：{err}"));
+                        self.report_error(format!("视频不可用：软件渲染初始化失败（{err}）"));
+                        self.video_active = false;
+                        return;
+                    }
+                }
+            }
+            // 「有新帧」回调：mpv 在**自己的线程**上调，绝不能碰 mpv API，只往通道
+            // 里丢一个信号；容量 1 + `try_send` 天然合并，解码快于出帧时也不会堆积。
+            let (tx, rx) = async_channel::bounded::<()>(1);
+            engine.set_frame_callback(Box::new(move || {
+                let _ = tx.try_send(());
+            }));
+            self.video.frames = Some(rx);
+
             engine.set_volume(self.settings.volume);
             engine.load(&track.path);
         }
@@ -1498,27 +1539,106 @@ impl PlayerView {
         self.rebuild_seek(max, cx);
     }
 
-    /// 退出视频模式（停止 mpv、隐藏叠加窗口）。
+    /// 退出视频模式（停止 mpv、把画面从舞台上撤下来）。
+    ///
+    /// 贴图不能在这里还：`Window::drop_image` 要窗口，而这个函数是从 `play_track`
+    /// 那类没有 window 的路径上来的。所以只立一个标记，下一次 tick 统一还。
     fn leave_video(&mut self) {
         if let Some(engine) = &self.video.engine {
             engine.stop();
         }
-        if let Some(overlay) = &mut self.video.overlay {
-            overlay.hide();
-        }
         self.video_active = false;
         self.video_error = None;
+        self.surface_clear = true;
+        self.tint_applied = None;
     }
 
     fn shutdown_video(&mut self) {
         self.video_active = false;
-        if let Some(overlay) = &mut self.video.overlay {
-            overlay.hide();
-        }
+        self.surface_clear = true;
         if let Some(engine) = &mut self.video.engine {
             engine.shutdown();
         }
         self.video.engine = None;
+        self.video.frames = None;
+    }
+
+    /// 把「有新帧」信号接成界面上的画面。
+    ///
+    /// 接收端用一次就没了：换片时 `start_video` 会重新建一条通道并重设回调，
+    /// 旧通道的发送端随回调被替换而释放，旧泵 `recv()` 拿到 `Err` 自己退出。
+    fn ensure_frame_pump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(frames) = self.video.frames.take() else {
+            return;
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            while frames.recv().await.is_ok() {
+                // 合并：解码可能比 UI 快，队列里堆的信号一次抽干，只画最新那一帧
+                while frames.try_recv().is_ok() {}
+                let Ok(()) = this.update_in(cx, |view, window, cx| view.pump_frame(window, cx))
+                else {
+                    break;
+                };
+            }
+        })
+        .detach();
+    }
+
+    /// 渲染并收下一帧。
+    ///
+    /// 渲染尺寸由 `fit_render_size` 定：按舞台尺寸做 contain、只缩不放、封顶
+    /// 2560×1440。放大交给 GPU 的双线性插值——1080p 的片子在小窗口里缩小是无损的，
+    /// 而 4K 放进 720p 窗口时按舞台尺寸渲染，解码器不用出 4K 帧。
+    fn pump_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.video_active {
+            return;
+        }
+        let native = self.video.engine.as_ref().and_then(|engine| {
+            let status = engine.status();
+            (status.width > 0 && status.height > 0).then_some((status.width, status.height))
+        });
+        let bounds = window.bounds().size;
+        let (width, height) = fit_render_size(
+            bounds.width.as_f32(),
+            bounds.height.as_f32(),
+            native,
+            window.scale_factor(),
+        );
+
+        // 拆开借用：`render_frame` 拿 `&mut engine` 的同时 `surface` 要可变
+        let VideoRuntime { engine, surface, .. } = &mut self.video;
+        let Some(engine) = engine.as_mut() else {
+            return;
+        };
+        let Some(frame) = engine.render_frame(width, height) else {
+            return;
+        };
+        trace_frame(bounds.width.as_f32(), bounds.height.as_f32(), native, (frame.width, frame.height), window.scale_factor());
+        surface.accept(frame, window);
+        cx.notify();
+    }
+
+    /// L2 染色：画面底部那块的色相变了才让胶囊重画。
+    ///
+    /// 逐帧直接套用色相会让玻璃跟着画面闪（一个镜头里每帧的均值都在小范围抖），
+    /// 所以设一个 8° 的迟滞：只有真的换了配色才更新。
+    fn apply_frame_tint(&mut self, cx: &mut Context<Self>) {
+        if !self.video_active {
+            if self.tint_applied.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let Some(hue) = self.video.surface.tint() else {
+            return;
+        };
+        let changed = self
+            .tint_applied
+            .is_none_or(|old| hue_distance(old, hue) > TINT_HYSTERESIS);
+        if changed {
+            self.tint_applied = Some(hue);
+            cx.notify();
+        }
     }
 
     fn toggle_play(&mut self, cx: &mut Context<Self>) {
@@ -1646,8 +1766,8 @@ impl PlayerView {
             if let Some(engine) = &self.video.engine {
                 engine.seek(secs);
             }
-            // 换了画面就要重新取色：色相跟着镜头走（切到蓝天/夜戏/雪景）
-            self.schedule_frame_tint();
+            // 跳完画面全变了：把染色的迟滞重置，新镜头的色相立刻生效
+            self.tint_applied = None;
         } else if let Some(engine) = &mut self.engine {
             engine.seek(secs);
         }
@@ -1903,8 +2023,8 @@ impl PlayerView {
             return;
         }
         self.cinema = on;
-        // 视频窗要知道这件事：全屏时不能再按住画面拖窗体
-        video_overlay::set_cinema(on);
+        // 全屏时画面占满整块屏、没有可拖的余地，把拖动锚点撤掉
+        self.drag_anchor.set(None);
         if window.is_fullscreen() != on {
             window.toggle_fullscreen();
         }
@@ -2204,9 +2324,9 @@ impl PlayerView {
 
     /// 拖入文件时的提示层（盖住整个窗口）。
     ///
-    /// 视频模式只能放在标题带里：画面那一块已经从主窗口的窗口区域里减掉了（见
-    /// `chrome_rects`），主窗口在那块画什么都不会显示——居中卡片只会看到四周
-    /// 暗下去的边框、中间什么都没有。
+    /// 上一代这里要分两条路：视频模式下画面那块不归主窗口，居中卡片只会看到四周
+    /// 暗边、中间什么都没有，所以只能把提示塞进标题带。画面进了自己的渲染树之后
+    /// 这个约束消失了，两种模式用同一个居中卡片。
     fn render_drop_hint(&self) -> Div {
         let scrim = div()
             .absolute()
@@ -2214,36 +2334,6 @@ impl PlayerView {
             .left(px(0.))
             .size_full()
             .bg(gpui_kit::rgba(0x08090CC0));
-
-        if self.video_active {
-            return scrim
-                .flex()
-                .items_center()
-                .justify_center()
-                .h(px(TITLE_BAND))
-                .child(
-                    h_flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .px(px(14.))
-                        .py(px(5.))
-                        .rounded(px(999.))
-                        .bg(overlay::glass())
-                        .border_1()
-                        .border_color(overlay::border())
-                        .child(
-                            Icon::new(IconName::Music)
-                                .size(px(13.))
-                                .text_color(overlay::accent()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(overlay::fg())
-                                .child("松开即可导入并播放"),
-                        ),
-                );
-        }
 
         scrim.flex().items_center().justify_center().child(
             v_flex()
@@ -2289,10 +2379,9 @@ impl PlayerView {
     //   1. 视频画面只占「标题带以下、胶囊以上」，胶囊落在深色画布上；
     //   2. 视频模式下列表展开时，画面右侧让位。
     //
-    // 第七轮起这两个偏差都没了：mpv 窗口改到主窗口**下面**，画面铺满整窗，chrome
-    // 用半透明玻璃真的压在画面上（主窗口把画面区从自己的窗口区域里减掉，见
-    // `video_overlay::set_region`）。唯一剩下的是**没有区域级 backdrop blur**：
-    // Windows 的 acrylic 只能整窗，所以玻璃只有 72% 深色这一半效果。
+    // 第七轮起画面铺满整窗，chrome 用半透明玻璃真的压在画面上。第十轮起 mpv 走
+    // 软件渲染 API，画面**就在主窗口的渲染树里**——不再有第二块窗口、不再有窗口
+    // 区域打洞，玻璃的 L3 模糊也终于有像素可用（见 `video_surface`）。
 
     /// 标题带只压在两种底色上：音频模式是主题 `background`，视频模式是压在画面上的
     /// 深玻璃。前景色必须跟着**底色**走，不能跟着应用主题走——浅色主题 + 深玻璃的
@@ -2467,18 +2556,14 @@ impl PlayerView {
     /// - **音频**：占「标题带以下、胶囊以上」的流式空间。
     ///
     /// `self_stretch` 不能少：`h_flex()` 默认 `items_center`，舞台的子元素又全是
-    /// 绝对定位（内容高度 0），不撑满交叉轴的话舞台高度会塌成 0——视频区 canvas
-    /// 捕获到 `0x0`，mpv 叠加窗就永远定不到位（表现为黑屏但有声音）。
+    /// 绝对定位（内容高度 0），不撑满交叉轴的话舞台高度会塌成 0——画面被压成
+    /// 零高就什么都看不见了。
     fn render_stage(&self, cx: &Context<Self>) -> impl gpui_kit::IntoElement {
         let stage = div().id("stage").test_support().relative();
 
         let stage = if self.video_active {
-            // 画面铺满整窗。这里**不铺任何底色**：视频窗在主窗口下面，主窗口这块
-            // 保持 alpha 0，画面才透得上来（铺一层深色就又把画面盖住了）。
-            //
-            // 注意这块区域最终会被 `chrome_rects` 从主窗口的窗口区域里减掉——
-            // 它压根不属于主窗口，所以按住画面拖动、拖放文件都发生在视频窗上
-            // （`video_overlay` 把两者转回主窗口）。
+            // 画面铺满整窗。底下那一层深色画布在 `render_video_surface` 里铺
+            // （`Contain` 留出来的边必须是黑的，不能透出主题底色）。
             stage.absolute().top(px(0.)).left(px(0.)).size_full()
         } else {
             stage
@@ -2578,18 +2663,27 @@ impl PlayerView {
         surface
     }
 
-    /// 视频：一块**透明**的占位（真正的像素来自下面那个 mpv 叠加窗）。
+    /// 视频：把 mpv 交来的那一帧画在舞台上。
     ///
-    /// 这里曾经铺的是 `overlay::canvas()`（不透明深色），因为那时叠加窗在**上面**、
-    /// 根本透不过来。现在视频窗在主窗口下面，这一层必须留空，否则又把画面盖住了。
-    /// 只有出错时才铺回去——那时没有画面可透，浮一块透明的错误提示反而看不清。
-    fn render_video_surface(&self, _cx: &Context<Self>) -> Div {
-        let base = div().absolute().top(px(0.)).left(px(0.)).size_full();
-        let base = if self.video_error.is_some() {
-            base.bg(overlay::canvas())
-        } else {
-            base
-        };
+    /// 底色必须是深色画布：`object_fit: Contain` 在画面比例和窗口比例不一致时会
+    /// 留边，留出来的那圈得是黑的（和设计稿的 `overlay::canvas()` 一致），不能透出
+    /// 主题底色。
+    ///
+    /// 手势（拖动窗体 / 双击全屏）挂在这一层。以前画面归叠加窗，这两个手势只能在
+    /// wndproc 里手写（见 `window_actions`）；现在事件正常到 GPUI，直接挂监听。
+    fn render_video_surface(
+        &self,
+        cx: &Context<Self>,
+    ) -> gpui_kit::Stateful<Div> {
+        // 不加 `test_support()`：它在 test-support 特性下会把元素包成 `Observed`，
+        // 函数签名就没法写出具体类型了；这块也不需要按 id 查询（几何走 chrome_layout）。
+        let base = div()
+            .id("video-surface")
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full()
+            .bg(overlay::canvas());
 
         if let Some(err) = &self.video_error {
             return base.flex().items_center().justify_center().child(
@@ -2614,22 +2708,101 @@ impl PlayerView {
             );
         }
 
-        // 每帧把视频区 bounds 写回 Cell，tick 据此定位叠加窗口
-        let slot = self.video_rect.clone();
-        let stage = canvas(
-            move |bounds, _window, _cx| {
-                slot.set(Some((
-                    bounds.origin.x.as_f32(),
-                    bounds.origin.y.as_f32(),
-                    bounds.size.width.as_f32(),
-                    bounds.size.height.as_f32(),
-                )));
-            },
-            |_bounds, _out, _window, _cx| {},
-        )
-        .size_full();
+        // 画面。还没有帧（刚起播、或渲染失败）时只留黑底——不要画占位图，
+        // 那会在"第一帧到之前"闪一块和设计稿无关的东西。
+        let base = match self.video.surface.image() {
+            Some(source) => base.child(
+                gpui_kit::img(source)
+                    .object_fit(gpui_kit::ObjectFit::Contain)
+                    .size_full(),
+            ),
+            None => base,
+        };
 
-        base.child(stage)
+        // 每帧把视频区 bounds 写回 Cell（验收探针据此报告「画面铺到哪」）
+        let slot = self.video_rect.clone();
+        let base = base.child(
+            canvas(
+                move |bounds, _window, _cx| {
+                    slot.set(Some((
+                        bounds.origin.x.as_f32(),
+                        bounds.origin.y.as_f32(),
+                        bounds.size.width.as_f32(),
+                        bounds.size.height.as_f32(),
+                    )));
+                },
+                |_bounds, _out, _window, _cx| {},
+            )
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full(),
+        );
+
+        self.picture_gestures(base, cx)
+    }
+
+    /// 画面上的手势：按住左键拖窗体、双击切全屏。
+    ///
+    /// 两个都不能用 GPUI 的现成设施：
+    /// - `WindowControlArea::Drag` 会把这块变成非客户区（`HTCAPTION`），系统自己
+    ///   接管拖动，同时也把双击变成"最大化"、鼠标事件也不再进 GPUI；
+    /// - `Window::start_window_move()` 在 Windows 后端没有实现（只有 apple / test
+    ///   后端有）。
+    ///
+    /// 所以自己搬：按下时记一份锚点（光标屏幕坐标 + 窗口外框坐标），拖动循环按
+    /// 「光标走了多少，窗口就走多少」每 8ms 追一次。不用 `on_mouse_move` 驱动——
+    /// 那个事件在快速拖动时可能被窗口重绘挤掉，位置会跟丢；轮询光标永远是最新的。
+    fn picture_gestures(
+        &self,
+        element: gpui_kit::Stateful<Div>,
+        cx: &Context<Self>,
+    ) -> gpui_kit::Stateful<Div> {
+        element
+            .on_mouse_down(
+                gpui_kit::MouseButton::Left,
+                cx.listener(|this, _e, window, cx| {
+                    this.begin_picture_drag(window, cx);
+                }),
+            )
+            .on_mouse_up(
+                gpui_kit::MouseButton::Left,
+                cx.listener(|this, _e, _window, _cx| {
+                    this.drag_anchor.set(None);
+                }),
+            )
+            .on_double_click(cx.listener(|this, _e, window, cx| {
+                // 双击优先：先撤掉拖动，免得"双击的第二下"把窗口拖走一点点
+                this.drag_anchor.set(None);
+                this.toggle_cinema(window, cx);
+            }))
+    }
+
+    /// 按下画面：记锚点并拉起拖动循环。
+    fn begin_picture_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 全屏 / 最大化时窗口不该被拖走
+        if !self.video_active || self.cinema || self.maximized || self.main_hwnd == 0 {
+            return;
+        }
+        let (cursor_x, cursor_y) = window_actions::cursor_pos();
+        let (window_x, window_y) = window_actions::window_origin(self.main_hwnd);
+        let anchor = self.drag_anchor.clone();
+        anchor.set(Some((cursor_x, cursor_y, window_x, window_y)));
+        self.activity = Instant::now();
+
+        let main = self.main_hwnd;
+        cx.spawn_in(window, async move |_this, cx| {
+            // 8ms ≈ 120Hz：比鼠标事件密，窗口才跟得上光标。
+            // 这里不能挂 `on_mouse_move`：快速拖动时那个事件会被窗口重绘挤掉，
+            // 位置一旦跟丢，后面每帧都会差同样的距离（越拖越偏）。
+            let step = Duration::from_millis(8);
+            while let Some((ax, ay, wx, wy)) = anchor.get() {
+                let (x, y) = window_actions::cursor_pos();
+                window_actions::move_window(main, wx + x - ax, wy + y - ay);
+                cx.background_executor().timer(step).await;
+            }
+        })
+        .detach();
     }
 
     /// 悬浮播放列表面板：320 宽、Latte 底、浮在画面上（默认可收起）。
@@ -2997,16 +3170,13 @@ impl PlayerView {
     /// 时（雪景、白墙、天空），11px 的时间码和 1px 图标会被糊掉，只能靠把玻璃
     /// 越加越浓自救（现在是 72%，设计稿要 60%）。底下先压一层渐变，玻璃就敢薄。
     ///
-    /// **它必须进 `chrome_rects`**：画在画面上却不在主窗区域里，等于被 mpv 叠加窗
-    /// 整块盖住（画了看不见）。而进了区域就吃鼠标，所以这里补上和画面同款的双击
-    /// （全屏）——否则窗口最下面三分之一会变成"点哪都没反应"。
+    /// 它压着画面最下面 240px，所以**手势要和画面一模一样**（按住拖动、双击全屏），
+    /// 否则窗口底部三分之一就成了"点哪都没反应"的死区。
     ///
     /// 不给它 `WindowControlArea::Drag`：那会让压在它上面的胶囊按钮变成非客户区
-    /// （标题带那条只敢给左半段设 Drag，就是同一个坑）。淡出之后这块区域整个让给
-    /// 叠加窗，拖动又回到画面自己的手势上。
+    /// （标题带那条只敢给左半段设 Drag，就是同一个坑）。
     fn render_vignette(&self, cx: &mut Context<Self>) -> impl gpui_kit::IntoElement {
-        let stamp = self.activity_moved.clone();
-        div()
+        let element = div()
             .id("vignette")
             .absolute()
             .left(px(0.))
@@ -3016,52 +3186,8 @@ impl PlayerView {
             .bg(crate::theme::v_gradient(
                 gpui_kit::rgba(0x0B0C1000),
                 overlay::vignette(),
-            ))
-            .on_mouse_move(move |_, _, _| stamp.set(Some(Instant::now())))
-            .on_double_click(cx.listener(|this, _e, window, cx| {
-                this.toggle_cinema(window, cx);
-            }))
-    }
-
-    /// 换片 / seek 之后排一次画面取色。
-    ///
-    /// 延迟 400ms 是留给"解码出帧"的：`screenshot-raw` 抓的是**当前显示的那一帧**，
-    /// 刚 `loadfile` 完去抓，拿到的还是上一部片子的画面（或者一张黑帧），染出来的
-    /// 色相是错的，而且这种错不会自己恢复。
-    fn schedule_frame_tint(&mut self) {
-        self.frame_tint = None;
-        self.tint_tries = 0;
-        self.tint_due = Some(Instant::now() + TINT_DELAY);
-    }
-
-    /// 到点了就取一次色；失败最多重试 3 次（`screenshot-raw` 在首帧之前会失败）。
-    fn tick_frame_tint(&mut self, cx: &mut Context<Self>) {
-        if !self.video_active {
-            self.tint_due = None;
-            if self.frame_tint.take().is_some() {
-                cx.notify();
-            }
-            return;
-        }
-        let Some(due) = self.tint_due else { return };
-        if Instant::now() < due {
-            return;
-        }
-        self.tint_due = None;
-        let hue = self.video.engine.as_ref().and_then(|e| e.frame_hue());
-        match hue {
-            Some(hue) => {
-                if self.frame_tint != Some(hue) {
-                    self.frame_tint = Some(hue);
-                    cx.notify();
-                }
-            }
-            None if self.tint_tries < TINT_TRIES => {
-                self.tint_tries += 1;
-                self.tint_due = Some(Instant::now() + TINT_RETRY);
-            }
-            None => {}
-        }
+            ));
+        self.picture_gestures(element, cx)
     }
 
     /// 控制层该不该显示（自动淡出的目标态）。
@@ -3084,13 +3210,9 @@ impl PlayerView {
 
     /// 每 tick 推一步透明度（见 [`CHROME_FADE_STEP`]）。
     fn tick_chrome_fade(&mut self, cx: &mut Context<Self>) {
-        // 鼠标移动有两条来源：主窗口这边（`render` 根节点的 on_mouse_move）和
-        // 叠加窗（画面区不在主窗区域里，那边自己记）。都在动之前先把时间戳并进来。
-        let moved = self
-            .activity_moved
-            .take()
-            .or_else(video_overlay::activity_stamp);
-        if let Some(stamp) = moved {
+        // 鼠标移动由根节点的 `on_mouse_move` 记（画面也在根节点下面，事件照常冒泡），
+        // 这里只把时间戳搬进普通字段。
+        if let Some(stamp) = self.activity_moved.take() {
             self.activity = stamp;
         }
         let target = if self.chrome_wanted() { 1.0 } else { 0.0 };
@@ -3166,8 +3288,8 @@ impl PlayerView {
     /// 数据全部来自 mpv 的 `observe_property`（见 `VideoStatus` 的那些字段），
     /// 拿不到就显示 `—`：宁可空着，也不要编一个像样但不对的数。
     ///
-    /// 它压在画面上 → 必须进 `chrome_rects` 的挖洞列表，否则会被叠加窗整块盖住
-    /// （画是画了，用户看不见、也点不到）。
+    /// 它压在画面上 → 必须进 `chrome_layout`（探针与测试的几何真相），否则验收
+    /// 脚本按坐标去点「ⓘ」就会落在卡片外面。
     fn render_info_card(&self, _cx: &Context<Self>) -> impl gpui_kit::IntoElement {
         let slot = self.info_rect.clone();
         let status = self
@@ -3303,9 +3425,15 @@ impl PlayerView {
     /// 高度是算出来的：8 + 24（进度区：时间行 16 + 4 + 轨道 4）+ 8 + 44（走带）
     /// + 8 = 92，正好是设计稿的 92。所有尺寸都是常数，不随窗口拉伸——设计稿里它
     /// 是画面下方的一条窄带，两侧留出画面，不是铺满整宽的黑条。
+    ///
+    /// 三层的**先后顺序**是这张图的关键（后画的在上面）：
+    /// ① L3 画面模糊（整块铺满）→ ② L1 深色玻璃（60~74% 半透明，模糊从它底下
+    /// 透出来）→ ③ L2 染色（画面色相，α .26/.08）。所以玻璃底色不能写成
+    /// `.bg()`：`bg` 在子节点**之前**画，会被模糊层整块盖住，胶囊就变成一块
+    /// 亮色的磨砂板，浅色时间码在上面根本看不清。
     fn render_capsule(&self, cx: &mut Context<Self>) -> Div {
-        // 外框负责定位/底色/圆角，内层负责 padding —— 夹在中间的 canvas 量到的
-        // 就是胶囊的真实外框（含 padding），算区域时不会差一圈。
+        // 外框负责定位/圆角，内层负责 padding —— 夹在中间的 canvas 量到的
+        // 就是胶囊的真实外框（含 padding），算几何时不会差一圈。
         let slot = self.capsule_rect.clone();
         div()
             .w(px(CAPSULE_WIDTH))
@@ -3313,11 +3441,6 @@ impl PlayerView {
             .rounded(px(CAPSULE_RADIUS))
             // 圆角裁掉 1px 内描边和染色层探出去的那点角
             .overflow_hidden()
-            // L1 定向光：竖向渐变（上偏蓝灰、下压深黑），不是一块平底色
-            .bg(crate::theme::v_gradient(
-                overlay::capsule_top(),
-                overlay::capsule_bottom(),
-            ))
             .border_1()
             .border_color(overlay::edge())
             // 接触阴影 + 环境阴影：贴地那层负责"压住"，散开那层负责"浮起来"
@@ -3337,8 +3460,32 @@ impl PlayerView {
                     inset: false,
                 },
             ])
-            // L2 画面染色（取不到画面时这一层干脆不画）
-            .when_some(self.frame_tint, |el, hue| {
+            // ① L3 画面模糊：48×20 的底部缩略图拉到整块胶囊，GPU 的双线性插值
+            // 本身就是一次大半径模糊（见 `video_surface`）。没有画面时这一层不画，
+            // 后面那层玻璃底色照样给出一块完整的深色。
+            .children(self.video.surface.blur().map(|source| {
+                gpui_kit::img(source)
+                    .object_fit(gpui_kit::ObjectFit::Fill)
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .size_full()
+                    .into_any_element()
+            }))
+            // ② L1 定向光：竖向渐变（上偏蓝灰、下压深黑），不是一块平底色
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .size_full()
+                    .bg(crate::theme::v_gradient(
+                        overlay::capsule_top(),
+                        overlay::capsule_bottom(),
+                    )),
+            )
+            // ③ L2 画面染色（取不到画面时这一层干脆不画）
+            .when_some(self.tint_applied, |el, hue| {
                 el.child(div().absolute().top(px(0.)).left(px(0.)).size_full().bg(
                     crate::theme::v_gradient(overlay::tint(hue, 0.26), overlay::tint(hue, 0.08)),
                 ))
@@ -3922,11 +4069,6 @@ impl PlayerView {
         self.chrome_alpha = alpha;
     }
 
-    /// 测试用：读当前控制层透明度。
-    pub(crate) fn test_chrome_alpha(&self) -> f32 {
-        self.chrome_alpha
-    }
-
     /// 测试用：直接切「最大化」状态。
     ///
     /// 真实切换要 `ShowWindowAsync`（无头窗口没有原生句柄），这里只验
@@ -3936,16 +4078,12 @@ impl PlayerView {
         self.maximized = on;
     }
 
-    /// 测试用：视频模式下主窗口区域里会留下哪些 chrome 矩形。
+    /// 测试用：视频模式下压在画面上的那几块 chrome 矩形。
     ///
-    /// 这几个矩形就是「哪些像素还归主窗口」的全部真相——画面区被减掉之后，
-    /// 没被列进来的 chrome 会被系统直接剪掉，而**剪掉的部分看着像"没画"**，
-    /// 所以必须有测试盯着它和实际布局对齐，不能靠肉眼看截图。
-    pub(crate) fn test_chrome_rects(
-        &self,
-        window: &Window,
-    ) -> Vec<crate::video_overlay::ChromeRect> {
-        self.chrome_rects(window)
+    /// 这几个矩形是「chrome 铺在哪」的唯一真相，单元测试靠它断言几何与淡出行为：
+    /// 胶囊 760×92、面板右沿对齐、淡出后整块为空。
+    pub(crate) fn test_chrome_rects(&self, window: &Window) -> Vec<UiRect> {
+        self.chrome_layout(window).chrome_rects()
     }
 
     /// 测试用：模拟一次用户可见提示，并立刻走 tick 里的分发逻辑。
@@ -4023,19 +4161,9 @@ impl PlayerView {
         self.maximized
     }
 
-    /// 测试用：走「双击画面」那条路——视频窗把事件排进队列，tick 取走执行。
-    ///
-    /// 队列本身是 Win32 侧的静态量（真窗口才有），无头测试直接调同一条处理路径，
-    /// 覆盖的是「事件 → 切换影院」这段逻辑。
-    pub(crate) fn test_on_overlay_event(
-        &mut self,
-        event: crate::video_overlay::OverlayEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match event {
-            crate::video_overlay::OverlayEvent::ToggleCinema => self.toggle_cinema(window, cx),
-        }
+    /// 测试用：走「双击画面」那条路（GPUI 的 `on_double_click` 最终也调它）。
+    pub(crate) fn test_toggle_cinema(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_cinema(window, cx);
     }
 
     /// 测试用：点「最大化」按钮（全屏时它的语义是回到窗口）。
@@ -4088,17 +4216,16 @@ impl Render for PlayerView {
             }
         }
 
-        // 视频模式整窗留空（alpha 0）：窗口表面已经透明，
-        // 这块空出来的地方露出的就是下面那个 mpv 叠加窗。
-        // 音频模式仍然自己铺一层不透明底色，和以前完全一样。
+        // 视频模式整窗交给舞台（画面 + 黑边），根节点仍然是透明的；音频模式自己铺
+        // 一层不透明底色，和以前完全一样。
         let background = if self.video_active {
             gpui_kit::transparent_black()
         } else {
             cx.theme().background
         };
         // 控制层透明度：视频播放中一段时间没输入就淡掉（见 `chrome_wanted`）。
-        // 淡到 0 也不撤元素——**区域**（`chrome_rects`）会先把它们从主窗口里剪掉，
-        // 命中测试跟着区域走，所以不会留下看不见但点得到的按钮。
+        // 淡到 0 只影响绘制，元素还在树上——这是有意的：面板/信息卡本来就不该在
+        // 淡出时被卸载（它们的展开态要留住），而透明元素的命中测试同样会被跳过。
         let chrome_alpha = self.chrome_alpha;
         let move_stamp = self.activity_moved.clone();
 
@@ -4122,7 +4249,7 @@ impl Render for PlayerView {
                     view.import_dropped(dropped, cx);
                 });
             })
-            // 视频模式：舞台铺满**整个窗口**，标题带/胶囊/歌单压在画面上（见 chrome_holes）。
+            // 视频模式：舞台铺满**整个窗口**，标题带/胶囊/歌单压在画面上。
             // 必须排在最前面——GPUI 按子节点顺序绘制，后画的才在上面。
             .when(self.video_active, |el| {
                 el.child(self.render_stage(cx))

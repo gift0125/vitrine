@@ -16,7 +16,7 @@
 | 能力 | 说明 |
 |---|---|
 | 音频播放 | MP3 / FLAC / WAV / OGG / M4A / AAC 等（rodio 解码） |
-| 视频播放 | MP4 / MKV / WebM / MOV / AVI / TS 等（mpv 硬解，`hwdec=auto-safe`） |
+| 视频播放 | MP4 / MKV / WebM / MOV / AVI / TS 等（mpv 硬解 `hwdec=auto-safe`，帧经**软件渲染 API** 交给 GPUI 合成，见「架构」） |
 | 播放列表 | 添加文件 / 递归扫描文件夹、拖拽排序、删除单曲、清空、双击播放；面板**悬浮在画面上**（不挤占画面宽度）、一键开合；展开时控制栏居中于剩余画面，行内带序号与「规格 · 时长」 |
 | 播放模式 | 底部工具条三档：循环（关 / 列表循环 / 单曲循环）、随机、排序（加入顺序 / 标题 / 时长），全部随设置落盘 |
 | 章节 | 面板「章节」页读 mpv 的 `chapter-list`：有章节就能点着跳，没有时直接说明 |
@@ -112,6 +112,10 @@ cargo test --workspace
 
 UI 测试把持久化目录重定向到临时目录（见 `persistence::set_config_dir_for_test`），不会污染真实配置。
 
+还有一条真机验收：`python scripts/verify_floating_chrome.py`（需要先 `cargo build`）。它启动应用、
+按 `SMP_UI_STATE` 探针算坐标去点真实按钮、抓屏取样，跑 17 项检查——画面出帧、窗口长成画面尺寸、
+玻璃透色、歌单开合、`ⓘ` 信息卡、字幕/音轨 cycle、双击全屏与四个出口、按住画面拖动。
+
 ## 故障排查
 
 | 现象 | 排查方式 |
@@ -119,6 +123,8 @@ UI 测试把持久化目录重定向到临时目录（见 `persistence::set_conf
 | 视频区提示找不到 libmpv-2.dll | 跑 `scripts/fetch-libmpv.ps1 -CopyToExe`，或设 `SMP_LIBMPV_PATH` 指向 DLL |
 | 视频打不开、日志只有一句 toast | 设 `SMP_MPV_LOG=%TEMP%\mpv.log` 后重试，libmpv 的真实报错在里面 |
 | 想确认命令/事件是否正常 | 设 `SMP_MPV_TRACE=%TEMP%\mpv.log`，逐行记录发给 libmpv 的命令与事件 |
+| 画面比例 / 黑边看着不对 | 设 `SMP_RENDER_TRACE=1`，每换一种尺寸打一行 `[render] frame WxH stage WxH native WxH scale S` |
+| 想从外面看「界面以为自己在哪」 | 设 `SMP_UI_STATE=%TEMP%\ui.json`，应用每帧把画面区、chrome 矩形、淡出强度写成 JSON（验收脚本读的就是它） |
 | 应用是否被外部结束 | 看 `%APPDATA%\simple-media-player\session.log`：有 `event loop returned` 是正常退出，只有 `start` 说明被强杀 |
 | 播放失败但界面上只闪了一下提示 | 同一条错误也写进了 `session.log`（`error: 无法播放「…」…`），可以直接翻日志 |
 
@@ -145,31 +151,46 @@ UI 测试把持久化目录重定向到临时目录（见 `persistence::set_conf
 
 ```
 crates/
-├── app/                 # GPUI 应用：窗口、视图状态、播放列表、顶层叠加窗口
+├── app/                 # GPUI 应用：窗口、视图状态、播放列表
 │   ├── player_view.rs   # 主区域 + 底部控制栏 + 双引擎路由 + 100ms 状态轮询
+│   ├── video_surface.rs # 一帧 BGRA → GPUI 纹理（含 48×20 模糊缩略图、旧图退役）
+│   ├── ui_state.rs      # 画面上 chrome 的几何唯一真相（chrome_rects）+ 验收探针
 │   ├── playlist.rs      # 列表 delegate（虚拟滚动、拖拽排序）
 │   ├── theme.rs         # 设计稿色板 → gpui-component 主题 token（Latte / Mocha）
-│   ├── video_overlay.rs # Win32 顶层叠加窗口（纯 FFI，无额外 crate）
 │   └── persistence.rs   # 配置与会话日志
 └── player-core/         # 播放内核（无 UI 依赖）
     ├── audio.rs         # rodio：play/pause/seek/volume
-    ├── video.rs         # mpv 子进程 + JSON IPC
+    ├── video.rs         # 进程内 libmpv：起播、属性观察、出帧
+    ├── render.rs        # mpv 软件渲染 API → BGRA 帧缓冲（取色 / 缩略图）
     └── metadata.rs      # lofty 元数据、目录扫描
 ```
 
-### 视频为什么要单独开一个叠加窗口
+### 视频画面怎么进 GPUI 渲染树
 
-GPUI 的 Windows 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`），**无法在自己的窗口里承载原生子窗口**，
-所以「把 mpv 渲染进 GPUI 窗口」这条路走不通。
+GPUI 的 Windows 后端是 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`），**窗口里塞不下原生子窗口**。
+所以曾经只有一条路：另开一个 `WS_POPUP` 顶层窗、mpv 用 `--wid` 直接画上去。那张账单很长——主窗口
+要垫在画面上面并逐像素透明、再用 `SetWindowRgn` 把画面区从自己身上挖掉（被完全遮挡的窗口不出帧）、
+chrome 得 `RGN_OR` 加回区域、z 序每帧对账、鼠标事件靠 wndproc 里 `SetForegroundWindow` 兜着；而且
+区域一空窗口会从 DWM 合成树里消失。代价最大的一条是**区域级 backdrop blur 拿不到**（acrylic 只能整窗，
+糊的是窗口背后的桌面），玻璃质感永远差一层。
 
-实际方案：
+现在用 mpv 的**软件渲染 API**，画面就是 GPUI 自己的一张图：
 
-1. 应用创建一个 `WS_POPUP` 顶层窗口，**没有 owner、垫在主窗口正下方**（不带激活、不进任务栏）；
-2. mpv 用 `--wid=<该窗口句柄>` 直接把硬解帧画上去，Rust 侧零像素搬运；
-3. GPUI 每帧用 `canvas` 回调报告视频区矩形，叠加窗口据此 `SetWindowPos` 跟随（缩放、全屏、影院模式都跟随）；
-4. 播放控制走 mpv 的 JSON IPC 命名管道。
+1. `mpv_render_context_create` 带 `MPV_RENDER_PARAM_API_TYPE = "sw"`，**必须同时 `vo=libmpv`**
+   （默认的 `vo=gpu` 要一个真窗口，只会清成黑色并只回调一次）；`video-timing-offset=0` 让
+   `render` 不等显示时刻、不阻塞 UI 线程；
+2. update 回调跑在 mpv 的线程上、**不能在里面调 mpv API** → 只 `try_send` 进
+   `async_channel::bounded(1)`（天然合并成「有帧了」），由 GPUI 的前台任务取出来出帧；
+3. 主线程调 `mpv_render_context_render` 拿 `bgr0`（第 4 字节是垃圾，必须补 255）→
+   `RenderImage` → `ImageSource::Render` → `gpui_kit::img(...)`；展示完调 `window.drop_image()`
+   让图集回收（留 2 帧退役队列，避免正在显示的那张被释放）；
+4. 送进去的尺寸走纯函数 `render::fit_render_size`：contain 适配、**只缩不放**、上限 2560×1440
+   （每帧都是新 `ImageId`，超大图会把图集吃满）；
+5. 画面在合成树里之后，chrome 就是普通子节点叠在上面，同一帧缩到 48×20 当模糊底
+   （GPU 双线性 ≈ 大半径 box blur），L3 才真的成立；拖动/双击也回到普通元素手势。
 
-垫在下面而不是盖在上面，是为了让控制条的玻璃能真的透出画面（见下一节）。
+删掉的东西：`video_overlay.rs`（1010 行）、区域打洞、z 序对账、`WS_EX_TRANSPARENT` 实验、
+以及「视频窗铺主窗矩形还是客户区」那一串几何坑。播放控制仍走 libmpv 的 C API（进程内，无 IPC）。
 
 ### 最大化 / 还原为什么自己实现
 
@@ -190,43 +211,20 @@ GPUI 的 Windows 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`）
 顺带修掉一个持久化问题：最大化时窗口尺寸不再被当成「用户尺寸」写进设置
 （以前最大化后等 5 秒，下次启动就会按最大化尺寸开窗）。
 
-### 视频窗为什么垫在主窗下面（以及那块区域为什么要「减掉」）
+### 窗口为什么仍然逐像素透明
 
-早先的做法是让叠加窗口盖在主窗口上面，再在叠加窗口自己身上开洞把 chrome 露出来。
-那样 chrome 虽然「浮」在画面上，但它背后只有主窗口的不透明表面——玻璃永远是实心黑板。
-
-现在是反过来：**主窗口逐像素透明，画面垫在它下面**，同一句 `overlay::glass()`
-（`#0B0C10` @72%）就真的透出画面了。两件事缺一不可：
+画面已经自己铺了黑底（含信箱黑边），所以「透出桌面」的只剩两处：玻璃的 alpha，和圆角外侧那四个角。
+两件事缺一不可：
 
 1. `WindowOptions.window_background = Transparent`；
 2. 把 gpui-component `RootPlugin` 给窗口表面 refine 的那层 `.bg(tokens.background)`
    逐窗覆盖掉（`Root` 实现 `Styled`，在 `render` 里做一次；`new` 那会儿 `Root` 还没挂上）。
 
-**但只做这两步画面是黑的**：系统判定「窗口是否被遮挡」只看窗口矩形/区域，不看逐像素
-透明度。视频窗整块被主窗口盖着时，mpv 的呈现会停下来不出帧（`PrintWindow` 也是黑的，
-`--d3d11-flip=no` 无效）。三次实测确认：把视频窗挪到没被盖住的地方 → 画面正常；在主窗口
-区域上挖个 300×300 的洞 → 画面正好出现在洞里。
+画面区再也不会「被主窗口盖住所以停止出帧」——那种病是 `--wid` 方案的专属，随叠加窗一起消失了。
 
-于是主窗口在视频模式下把自己的窗口区域改成：
-
-```
-整窗矩形 − 画面区 + chrome（标题带 / 胶囊 / 歌单）
-```
-
-- 非客户区那圈边框留在区域里 → 四边拖动缩放、系统边框照常；
-- chrome 必须用 `RGN_OR` 加回去，否则它自己也被剪掉——区域同时裁剪**渲染**和**命中测试**，
-  表现就是「控件没画出来、也点不到」；
-- 区域只认**物理像素**、坐标相对**窗口矩形**，所以要按 `ClientToScreen − GetWindowRect`
-  的偏移换算；`CreateRoundRectRgn` 收的是椭圆**宽高**（直径）不是半径；
-- 视频窗铺的是主窗口**外框**（`GetWindowRect`）而不是客户区：边框那一圈仍在主窗口区域里，
-  而我们在那儿不画东西，铺到客户区就会从边框透出桌面；
-- 胶囊高度是内容撑开的，不能写死，由胶囊内部的 `canvas` 每帧量出来（`capsule_rect`），
-  再外扩 1.5px，否则会切掉 1px 白描边；
-- 区域重设有去重键（不含窗口位置——区域坐标相对窗口矩形，纯移动不用重设），
-  否则拖动时每帧 `SetWindowRgn` 会让整窗重绘、画面发抖。
-
-`ui_tests::chrome_region_covers_capsule_and_panel` 盯着「区域矩形 vs 实际布局」的对齐，
-`scripts/verify_floating_chrome.py` 在真机上验收（画面出帧、玻璃透色、拖动、双击最大化）。
+`chrome_layout()` 仍然把标题带/胶囊/信息卡/歌单/底部遮罩的矩形算出来（`ui_state::ChromeLayout`），
+但**用途变了**：不再是给 `SetWindowRgn` 递刀子，而是①`hidden_chrome_leaves_no_rects` 这类单测，
+②验收脚本的 `SMP_UI_STATE` 探针（点击坐标、淡出判定都读它）。
 
 ### 窗口尺寸为什么等于画面尺寸
 
@@ -247,12 +245,12 @@ GPUI 的 Windows 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`）
 双面胶：窗口尺寸**不在视频模式下持久化**（那份尺寸是算出来的，存下来会让下次启动的
 音频模式跟着某部片子的比例走）。
 
-### 圆角为什么两块窗口都要设
+### 圆角为什么要自己设
 
-视频模式整个窗口是圆的，而最上面两个角属于主窗口的标题带、最下面两个角属于**下面那块
-视频窗**——只圆一块会在角上留一个方角。所以进视频模式时两块窗口都设
-`DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)`，退出时主窗口改回
-`DWMWCP_DONOTROUND`（音频模式保持原来的直角）。
+视频模式整个窗口是圆的（画面直接铺到边）。进视频模式时给主窗口设
+`DwmSetWindowAttribute(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)`，退出时改回
+`DWMWCP_DONOTROUND`（音频模式保持原来的直角）。窗口是逐像素透明的，被 DWM 切掉的四个角
+自然透出桌面。
 
 不用 `SetWindowRgn` 自己切：区域是 1 bit 的，边缘必然是锯齿；DWM 这条属性是系统按 DPI
 算好半径再抗锯齿，也就是 Windows 11 上其它窗口的样子。Windows 10 没有这条属性，调用被
@@ -260,29 +258,20 @@ GPUI 的 Windows 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`）
 
 ### 按住画面拖动 / 双击全屏
 
-画面区不在主窗口的区域里了，点在上面命中的是视频窗，所以这两件事由
-`video_overlay` 的 wndproc 接：
+画面现在是 GPUI 里的一个普通元素（`.id("video-surface")`），手势直接在元素上接，
+不再有第二个窗口的 wndproc：
 
-- `WM_LBUTTONDOWN` 记起点 + `SetCapture`，`WM_MOUSEMOVE` 里按**累计位移** `SetWindowPos`
-  主窗口，并同步把叠加窗粘上去（不等 100ms 的 tick，拖动时画面才不落后）；
-- 双击 → **全屏播放**（不是最大化）：wndproc 只把「发生了一次双击」排进队列
-  （`OverlayEvent::ToggleCinema`），由 100ms tick 调 `PlayerView::set_cinema` 切影院模式。
-  双击**自己的判**——这块窗口是 `WS_EX_NOACTIVATE`，系统对"没被激活的窗口"只连发
-  `WM_LBUTTONDOWN`，`WM_LBUTTONDBLCLK` 常常不来。
-- 全屏态下不再拖窗体（画面本来就铺满屏幕）。
-
-同一处代码不用「转交系统」的捷径，都踩过：
-
-- `SendMessageW(main, WM_NCLBUTTONDOWN, HTCAPTION)` 让系统做模态拖动——在这个窗口上
-  只跟上头一两步就停住（GPUI 的 wndproc 自己处理 `WM_MOUSEMOVE`，系统的模态循环拿不到
-  位移）；
-- 转交 `WM_NCLBUTTONDBLCLK`——窗口会撑到工作区，但 `WS_MAXIMIZE` 位丢了，`IsZoomed`
-  为假，标题带图标和「再点一次还原」全乱。
-
-代价：没有 Aero Snap（贴边吸附）和「拖最大化窗口还原」，最大化状态下按住画面不拖。
-
-> 也别给叠加窗加 `WS_EX_TRANSPARENT` 想「命中穿透」：实测会让整块窗口**不再被合成**，
-> 帧还在但完全看不见。
+- `on_mouse_down(Left)` 记下「光标屏幕坐标 + 窗口左上角」，再起一个 8ms 的循环读
+  `GetCursorPos`、按差值 `SetWindowPos`（`SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE`），
+  `on_mouse_up` 清锚点。不用 `Window::start_window_move()`——**Windows 后端没有实现**；
+  也没有 `SendMessageW(main, WM_NCLBUTTONDOWN, HTCAPTION)` 这条捷径（GPUI 自己的 wndproc
+  会吃掉后续的 `WM_MOUSEMOVE`，系统模态拖动只跟上头一两步就停住）。
+- 双击 → **全屏播放**（不是最大化）：`on_double_click` 先清锚点再调 `set_cinema`。
+  这次能直接收到双击，因为窗口是正常激活的 GPUI 窗口——以前叠加窗是 `WS_EX_NOACTIVATE`，
+  系统对没激活过的窗口只连发 `WM_LBUTTONDOWN`，`WM_LBUTTONDBLCLK` 压根不来，只能自己按
+  `GetDoubleClickTime` + `SM_CXDOUBLECLK` 判。
+- `on_double_click` 只挂在 `Stateful<Div>` 上（元素必须有 `.id()`），普通 `Div` 没这个方法。
+- 全屏 / 最大化 / 非视频模式下不拖窗体（画面本来就铺满）。
 
 ### 全屏播放的四个出口
 
@@ -292,27 +281,27 @@ GPUI 的 Windows 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`）
 | 出口 | 实现 | 注意 |
 |---|---|---|
 | `Esc` / `F11` | `App::intercept_keystrokes` | 不能用 `bind_keys` + `on_action`：没有焦点元素时 GPUI 把按键派发给 dispatch 树的**根**，那是 gpui-component 的 `Root`，挂在视图根节点上的 `on_action` 永远收不到 |
-| 再双击画面 | 叠加窗双击 → 队列 → tick | 见上 |
+| 再双击画面 | 元素上的 `on_double_click` | 见上 |
 | 右上角「最大化」 | `toggle_maximize` 里先判 `cinema` → 退影院 | 全屏时 GPUI 已摘掉 `WS_MAXIMIZEBOX`，这时再 `SW_MAXIMIZE` 只会卡在错乱态 |
 | 胶囊里的退出键 | `exit-cinema` 按钮 | 影院模式下标题带右侧会多出这个键 |
 
 **坑：进出全屏那一下 GPUI 会把自己的尺寸通知丢掉。** `WM_SIZE` 是在 `SetWindowPos`
 里**同步**派发的，此时 App 正被本轮 `update` 借用，GPUI 的 resize 回调里
-`handle.update()` 拿不到借用权（`log_err` 之后静默失败，连日志都没有）。结果是
-`window.bounds()` 已经是全屏尺寸，**布局用的 `viewport_size` 还停在旧尺寸**——
-画面铺满整屏，顶栏却只画在左上角 853×34 那一小块里、右上角的窗口按钮根本不存在，
-点哪里都没反应。
+`handle.update()` 拿不到借用权（`log_err` 之后静默失败，连日志都没有）。结果是布局停在
+旧尺寸——画面铺满整屏，顶栏却只画在左上角 853×34 那一小块里、右上角的窗口按钮根本不存在，
+点哪里都没反应（`Esc` 还灵，因为键盘不走命中测试）。
+
+**而且 `window.bounds()` 也可能一起假**：全屏这条路径上 GPUI 的 `logical_size` 根本没更新，
+`bounds()` 和 `viewport_size` 双双停在旧值，只比它俩永远发现不了。真实值只能问系统：
+`window_actions::client_size()`（`GetClientRect`）——所以判据有两条，`viewport ≠ bounds`
+（普通改尺寸）**或** `bounds ≠ 真实客户区`（进出全屏）。
 
 `refresh()` 治不好（它不碰 viewport，只是标脏），`bounds_changed(cx)` 更不能直接调
 （会把 `bounds_observers` 全跑一遍，其中就有对本视图的 `update` → panic
 「cannot update PlayerView while it is already being updated」）。可用的是给窗口
 **补一条 `WM_SIZE`**（`window_actions::kick_layout`，`PostMessage` 到消息循环里，
 lparam 用真实客户区尺寸）：GPUI 的尺寸处理只认 lparam、是幂等的，重放一次布局就按
-新尺寸重排。tick 里每 100ms 比一次 `viewport_size` 和 `window.bounds()`，不一致就补一条。
-
-> 踩坑记录：Windows 命名管道上挂起的 `ReadFile` 会阻塞 `WriteFile`（即使句柄是 `try_clone` 出来的），
-> 所以 IPC 不能「读线程 + 写线程」并发，必须单线程串行 + `PeekNamedPipe` 非阻塞探测。
-> 详见 `crates/player-core/src/video.rs` 模块注释。
+新尺寸重排。tick 里每 100ms 对一次账，不一致就补一条（300ms 限流）。
 
 ### 方向键：`←`/`→` 跳 5 秒、`↑`/`↓` 调 5% 音量
 
@@ -351,9 +340,9 @@ gpui-component 0.7.3 的 `Slider` 没有 `FocusHandle`、也不参与键盘（�
 
 三处必须记住的：
 
-- **信息卡压在画面上 → 必须进 `chrome_rects`**。否则它被叠加窗整块盖住，节点在、
-  看不见、也点不到，用户看到的是「点了 `ⓘ` 什么也没发生」（和胶囊当初同一个坑）。
-  `ui_tests::info_card_toggles_and_is_carved_out` 用「区域块数 2→3→2」守着这条。
+- **信息卡要进 `chrome_layout()`**。它现在是普通子节点，视觉上一定画得出来；进几何表是为了
+  两件事：淡出时一起让位（否则透明卡片照样吃点击），以及验收脚本能在它上面取点。
+  `ui_tests::info_card_toggles_and_is_carved_out` 守着「开了就多一块、关了少一块」。
 - **卡片里的值要能截断**。mpv 的 `video-codec` 报的是并列别名
   （`h264 (High) / AVC / MPEG-4 AVC / MPEG-4`），整串塞进 240 宽的卡会直接冲出右边。
   取第一段（`short_codec`）再给值加 `min_w_0 + truncate`；单段测试见
@@ -367,19 +356,17 @@ gpui-component 0.7.3 的 `Slider` 没有 `FocusHandle`、也不参与键盘（�
 下一轮 tick 比对观测值：变了报新轨，800ms 没变就明说「没有其他字幕轨可切」，
 落在标题带胶囊上（视频模式的即时反馈统一在那里）。
 
-### 拖放为什么要两条接收路径
+### 拖放
 
-拖进来的文件有两条落地路径：
+一条路径：GPUI 自己的 `IDropTarget`（注册在主窗口上）。`.on_drop::<ExternalPaths>(...)`
+挂在根节点上，整窗都是投放区——画面区也在主窗口里，所以不再需要「叠加窗自己收
+`WM_DROPFILES`」那套补丁。
 
-1. **GPUI 自己的 `IDropTarget`**（注册在主窗口上）覆盖标题带、控制条、歌单面板这些**留在**
-   主窗口区域里的区域：`.on_drop::<ExternalPaths>(...)` 挂在根节点上，整窗都是投放区。
-2. **叠加窗口自己收**：OLE 查找投放目标是由 `WindowFromPoint` 从光标下的窗口沿父链向上的，
-   而画面区已经被从主窗口区域里减掉了，光标下命中的就是叠加窗。所以叠加窗口调
-   `DragAcceptFiles(hwnd, TRUE)`，由系统把投放转成 `WM_DROPFILES`，wndproc 里
-   `DragQueryFileW` 取出路径丢进队列，主线程 100ms 的 tick 再统一消费。
-
-两条路径最终都汇进 `PlayerView::import_dropped`：文件夹递归扫描 → 按 `path_key`
+落地后统一走 `PlayerView::import_dropped`：文件夹递归扫描 → 按 `path_key`
 （`\` 与 `/` 归一化）去重 → 追加进列表 → 播第一个。
+
+拖拽过程中的提示是「全窗压暗 + 居中卡片」，两种模式同一份实现——画面在合成树里之后，
+它不会再被盖住，也没有必要为视频模式单独挪位置。
 
 ## 视觉规范（对齐设计稿）
 
@@ -398,9 +385,12 @@ gpui-component 0.7.3 的 `Slider` 没有 `FocusHandle`、也不参与键盘（�
 `overlay` 模块集中提供这组颜色（`canvas` / `glass` / `border` / `fg` / `dim` /
 `accent` / `play`），界面代码不写死色值。
 
-从第七轮起这层玻璃是**真的半透明**：画面垫在主窗下面，72% 的深色底会真的透出画面色相
-（验收脚本取两个不同色条处的胶囊像素做色差判定）。唯一缺的是**区域级 backdrop blur**：
-Windows 的 acrylic 只能整窗生效，做不到「只糊 chrome 底下那块」。
+这层玻璃是**真的半透明**：画面就在同一个合成树里，72% 的深色底会真的透出画面色相
+（验收脚本取两个不同色条处的胶囊像素做色差判定），模糊底是同一帧降到 48×20 再拉伸的。
+
+质感分三层（`design/spec.json → texture_layers`）：L1 玻璃本身（竖向渐变 + 白 14% 描边 +
+两条 1px 内描边 + 双层阴影 + 底部 240 高渐隐）、L2 取画面**色相**染色（S 46% / L 36%，
+α .26/.08，只取色相不取明度，8° 迟滞避免闪）、L3 上述降采样模糊。
 
 应用表面的语义 token（`theme.rs` 把设计稿色板翻译成 gpui-component token）：
 
@@ -418,17 +408,17 @@ Mocha Mauve `#CBA6F7`，播放键仍是品牌色 `#8839EF`。
 
 ### 尺寸
 
-自定义标题带 **34px**（自绘拖动区 + 最小化/最大化/关闭，窗口按钮 **46 宽 × 标题栏高**，
-字形是手写 10×10 SVG）、悬浮胶囊内缩 **24px**（圆角 12、padding 16×8、行距 4）、
-播放列表 **320px** 宽（顶部 40、右侧 12、底部让开胶囊）、播放按钮 **44 正圆**、
-正文字号 13 / 辅助 11 / 时间码用等宽 10。
-控制行分三段：左端音量、**中间走带控制恒在窗口正中**、右端列表 / 影院 / 换肤
-（左、中、右三栏等宽，见 `transport_controls_are_horizontally_centered` 用例）。
+所有数值的唯一来源是 `design/spec.json`——改任一条都要同步 `scripts/verify_floating_chrome.py`
+里的常数（脚本按几何取像素，对不上就报假失败）。
 
-胶囊高度按「占窗口多少」调，不按像素堆：三条横排控件加 padding 曾经撑到 107 高
-（680 高窗口的 15.7%），远看像压在下沿的一块黑板；现在约 90（13%），
-`BOTTOM_BAND` 也相应收到 116。窗口按钮不能沿用 `xsmall` 图标按钮（20×20）——
-Windows 的点击热区就是 46 宽整块，图标 10px，悬停铺满底色、关闭键用系统红 `#C42B1C`。
+概览：标题带 **34px**（自绘拖动区 + 最小化/最大化/关闭，窗口按钮 **46 宽 × 标题栏高**，字形是
+手写 10×10 SVG）、控制胶囊 **760×92**（距下 24、圆角 14、padding 20×8，细节见「控制栏 v3」）、
+播放列表 **320px** 宽（顶部 = 标题带 + 8、右侧 24、底部 119）、播放按钮 **44 正圆**、
+底部渐隐带 **118**、正文字号 13 / 辅助 11 / 时间码用等宽 10。控制行分三段，
+左右两栏等宽（`flex_1`）**中间走带控制才恒在正中**（`transport_controls_are_horizontally_centered`）。
+
+窗口按钮不能沿用 `xsmall` 图标按钮（20×20）——Windows 的点击热区就是 46 宽整块，图标 10px，
+悬停铺满底色、关闭键用系统红 `#C42B1C`。
 
 标题带的前景色**跟着底色走**，不跟主题走：视频模式下这条带压低在画面上的深玻璃
 （`overlay::glass()`），若还取浅色主题的 `muted_foreground`，对比度只有 3:1 左右，
@@ -441,8 +431,8 @@ Windows 的点击热区就是 46 宽整块，图标 10px，悬停铺满底色、
 | 音频 | gpui-component 通知层（会自己排队、可手动关） | 右上角，让开标题带 12px，宽 320 |
 | 视频 | 标题带里的小胶囊（浅色文案 + 状态图标，4s 自动退场） | 标题带右侧、窗口按钮左边 |
 
-原因是视频模式的画面铺满整窗、只把标题带/胶囊/歌单挖出来（见上面的「开洞」一节），
-in-app toast 落在画面那块等于没画；标题带本来就在叠加窗之上，小胶囊才是能看见的位置。
+原因是视频模式整块是深色画布，右上角的通知层会盖在画面上、和玻璃胶囊打架；
+标题带里那枚小胶囊读起来更轻，也不挡画面。
 通知层的默认位置（`TITLE_BAR_HEIGHT + 16`）会贴住窗口按钮下沿，宽度 382 在 1040 窗口里
 占 37%，所以 `theme::install` 里把 `margins.top` 改成「标题带 + 12」、宽度收到 320。
 
@@ -474,33 +464,35 @@ in-app toast 落在画面那块等于没画；标题带本来就在叠加窗之�
 
 ### 与设计稿的差异
 
-架构上已经能「开洞」，但挖出来的那块露出的是 GPUI 的**不透明**画布，不是画面本身，
-所以还有两处看起来和设计稿不完全一致：
+画面已经进了 GPUI 的合成树，玻璃能真的透出画面了，剩下这些还差一点：
 
-1. **画面上的 chrome 是实心深色，不是毛玻璃**：设计稿的标题带/胶囊是「60% 黑 + 32px 模糊」。
-   当前画面由 mpv 画在**上面**那个叠加窗口里，而 GPUI 的 `WindowBackgroundAppearance::Blurred`
-   （Windows 后端映射到 `SetWindowCompositionAttribute` 的 acrylic）模糊的是窗口**背后**的内容，
-   看到的只会是桌面。要做真背景模糊得把视频窗放到主窗口**下面**（owned 窗口恒在 owner 之上，
-   得放弃 owner 关系自己管 z 序），成本远大于收益，暂不做。
+1. **毛玻璃是「降采样 + 双线性」而不是真 backdrop blur**：设计稿的标题带/胶囊是
+   「60% 黑 + 32px 模糊」。`WindowBackgroundAppearance::Blurred` 走不通（Windows 后端映射到
+   `SetWindowCompositionAttribute` 的 acrylic，糊的是窗口**背后**的桌面）；mpv 的 render API
+   也不给模糊。现在的做法是把同一帧降到 **48×20** 当底图拉伸——GPU 双线性插值等价于大半径
+   box blur，观感接近，但大块纯色边界会比设计稿软一点。真模糊要自己起一条 GPU 管线（或
+   gaussian 的 CPU 版，1080p 每帧不值得），暂不做。
 2. **歌单面板保持应用表面色（Latte 浅底）**：它压在画面上，用深色玻璃的话列表行的文字色
    得跟着换一套（`List` delegate 取的是主题 token），当前以可读性优先。
 
-另外设计稿控制行右侧的 CC / 音轨 / 设置 / PiP 图标本版本没有对应功能，因此不画。
+另外设计稿控制行右侧的 CC（字幕开关）/ 设置 / PiP 在本版本没有对应功能，因此不画；
+音轨与字幕是「循环切轨」（`cycle aid` / `cycle sid`），不是开关。
 
 ## 已知限制
 
-- **视频区里能浮的只有「挖过洞」的那几块**：浮层必须先在叠加窗口的区域里挖出来，
-  所以是固定几何（标题带 / 胶囊 / 歌单），不是任意元素都能画在画面上。将来要做
-  位置自由的字幕/控件浮层，仍需改纹理共享方案。
-  因此视频模式的即时反馈都落在标题带上：拖放提示是一枚小胶囊（全窗卡片会被叠加窗挡住），
-  操作回执/错误也是标题带胶囊（见上面的呈现表）。
+- **每一帧都要上传一张纹理**：`RenderImage` 每帧是新 `ImageId`，Windows 的 DirectX 图集按
+  `(image_id, frame_index)` 分配 tile（最大 16384²），所以送到渲染的尺寸被 `fit_render_size`
+  压到 2560×1440 以内、显示过的图立即 `drop_image()`（保留 2 帧退役队列）。4K 片子是
+  「解码 4K、送 1440p」，不是点对点；要真 4K 得换共享纹理/D3D11 互操作。
+- **软件渲染走 CPU**：`vo=libmpv` 意味着 mpv 先把帧读到内存（`bgr0`）再由我们上传，1080p
+  在普通台式机上够用，但比 `--wid` 的零拷贝多一次往返。
 - **进度条与音量条的键盘操作绕过了组件**：上游 `Slider`（`gpui-component` 0.7.3）既无
   `FocusHandle` 也无 AccessKit 角色/值，键盘焦点到不了它身上。`←`/`→`、`↑`/`↓` 是在
   `App` 级拦截里实现的，所以**拖到一半松开鼠标那类精细操作仍只有鼠标能做**；容器已补
   `aria_label` 作为分组名。
 - **视频播完后不能靠方向键倒回去**：mpv 是 `--keep-open=no`，播完会把文件卸掉，此时
   `seek` 无效；这一版只做了音频的「播完从目标位置重新起播」。
-- **mpv 需要外部提供**：默认发布包不包含，可用 `-WithMpv` 打包。
+- **mpv 需要外部提供**：默认发布包不包含 DLL，用 `-WithLibmpv` 打包。
 - 播放列表拖拽排序依赖列表组件内建行为，列表项无键盘重排快捷键。
 
 ## 许可

@@ -18,8 +18,13 @@
 //!
 //! ## 画面怎么出来
 //!
-//! 仍然是**应用自建的顶层叠加窗口**：`wid` 选项把 mpv 的输出嵌进那个 HWND，
-//! 我们不做任何像素搬运（详见 `video_overlay` 的模块注释）。
+//! 走**软件渲染 API**（`mpv_render_context_*` + `MPV_RENDER_API_TYPE_SW`）：
+//! mpv 把每一帧缩放到我们给的缓冲里（BGRA），画面随我们的合成树一起上屏。
+//! 早先是 `wid` 选项塞进一个自建叠加窗，那套做法要付区域挖洞、z 序核对、
+//! 事件桥接三份代价，也拿不到「画面像素」（做不了玻璃模糊）——见 [`crate::render`]。
+//!
+//! `SpawnOptions::wid` 还留着：探针脚本靠它把画面塞进普通窗口看效果，
+//! 真正播放时传 `None`。
 //!
 //! ## 线程模型
 //!
@@ -48,6 +53,7 @@ use crate::libmpv::{
     MPV_EVENT_END_FILE, MPV_EVENT_FILE_LOADED, MPV_EVENT_LOG_MESSAGE, MPV_EVENT_PROPERTY_CHANGE,
     MPV_EVENT_START_FILE, MPV_FORMAT_DOUBLE, MPV_FORMAT_FLAG, MPV_FORMAT_INT64, MPV_FORMAT_STRING,
 };
+use crate::render::{FrameBuffer, FrameRef, RenderContext};
 
 /// 视频文件扩展名（由 mpv 解码，与音频走不同路径）。
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -189,6 +195,12 @@ pub struct VideoEngine {
     worker: Option<JoinHandle<()>>,
     quit: Arc<AtomicBool>,
     destroyed: bool,
+    /// 软件渲染上下文（[`Self::enable_render`] 之后才有）
+    render: Option<RenderContext>,
+    /// 每帧复用的像素缓冲：尺寸不变就不重新分配
+    buffer: FrameBuffer,
+    /// 上一次渲染失败的原因（只用来去重日志，别每帧刷）
+    last_render_error: Option<String>,
 }
 
 impl VideoEngine {
@@ -225,20 +237,34 @@ impl VideoEngine {
             format!("{:.2}", options.volume.clamp(0.0, 1.0) * 100.0),
         );
         apply("idle", "yes".into());
+        // 软件渲染下不能让 `mpv_render_context_render()` 阻塞到「该显示的时刻」：
+        // 它跑在 UI 线程上，阻塞就等于每帧掉 16ms 的界面响应（拖动、悬停全卡）。
+        // 置 0 之后「有新帧就立刻渲染」，节奏交给我们的重绘。
+        apply("video-timing-offset", "0".into());
 
-        match options.wid {
-            Some(wid) => {
-                // 句柄走 int64：字符串形式在 32 位句柄高位为 1 时会被解析成负数
-                let rc = mpv.set_option_i64(ctx.raw(), "wid", wid as i64);
-                if rc < 0 {
-                    trace(&format!(
-                        "!! wid={wid} 被拒（{}）",
-                        mpv.error_string(rc)
-                    ));
-                }
-                apply("force-window", "yes".into());
+        // 画面往哪去：
+        // - `Some(wid)`：mpv 自己画进那个窗口（旧的叠加窗方案，留着给探针脚本用）；
+        // - `None`：不设 `vo`，用 libmpv 的默认 `vo=libmpv`——这是 render API 的前提。
+        //
+        // 这里以前写的是 `vo=null`（纯音频客户端用），换成渲染 API 之后那行会把
+        // 视频输出关掉，`mpv_render_context_render` 永远拿不到帧。
+        if let Some(wid) = options.wid {
+            // 句柄走 int64：字符串形式在 32 位句柄高位为 1 时会被解析成负数
+            let rc = mpv.set_option_i64(ctx.raw(), "wid", wid as i64);
+            if rc < 0 {
+                trace(&format!(
+                    "!! wid={wid} 被拒（{}）",
+                    mpv.error_string(rc)
+                ));
             }
-            None => apply("vo", "null".into()),
+            apply("force-window", "yes".into());
+        } else {
+            // 渲染 API 必须显式指定 `vo=libmpv`：mpv 默认的 vo 是 `gpu`
+            // （要一个真窗口），没有窗口时它会去找别的 vo，**渲染上下文的
+            // `draw_frame` 就永远不被调用**——表现是 `mpv_render_context_render()`
+            // 一路返回 0、像素却全黑（它只是在清屏），而且 update 回调只在
+            // 注册那一次触发过，非常容易误判成"渲染器没跑起来"。
+            apply("vo", "libmpv".into());
         }
 
         for extra in &options.extra_args {
@@ -328,6 +354,9 @@ impl VideoEngine {
             worker: Some(worker),
             quit,
             destroyed: false,
+            render: None,
+            buffer: FrameBuffer::new(),
+            last_render_error: None,
         })
     }
 
@@ -419,22 +448,65 @@ impl VideoEngine {
             .collect()
     }
 
-    /// 取一帧画面、算它的**色相**（`texture_layers.L2_frame_tint`）。
+    /// 建立软件渲染上下文（幂等）。失败时返回 mpv 的错误码文本。
     ///
-    /// 只在换片 / seek 之后调一次：`screenshot-raw` 要拷一整帧（1080p ≈ 8MB），
-    /// 每帧算一次等于白扔掉 8MB/s 的带宽去染一块 760×92 的玻璃。取不到就返回
-    /// `None`（还没解码出首帧、或 VO 没在出图），调用方保持纯 L1 玻璃即可。
-    pub fn frame_hue(&self) -> Option<f32> {
-        let frame = self.mpv.screenshot_raw(self.ctx.raw())?;
-        let (r, g, b) = frame.bottom_band_mean()?;
-        let hue = crate::libmpv::rgb_hue(r, g, b);
-        trace(&format!(
-            "screenshot-raw {}x{} stride={} {} 底部均值=({r:.0},{g:.0},{b:.0}) 色相={hue:.0}°",
-            frame.width, frame.height, frame.stride, frame.format
-        ));
-        Some(hue)
+    /// **必须在将来调 [`Self::render_frame`] 的那个线程上调**，`render.h` 要求同一个
+    /// 渲染上下文的所有调用同线程。我们的调用方是 UI 线程，两处都从 UI 线程来。
+    pub fn enable_render(&mut self) -> Result<(), String> {
+        if self.render.is_some() {
+            return Ok(());
+        }
+        if !self.mpv.has_render_api() {
+            return Err("这个 libmpv 不带渲染 API（缺少 mpv_render_context_* 符号）".into());
+        }
+        match RenderContext::create(Arc::clone(&self.mpv), self.ctx.raw()) {
+            Ok(render) => {
+                trace("render: 软件渲染上下文已建立（sw / bgr0）");
+                self.render = Some(render);
+                Ok(())
+            }
+            Err(code) => {
+                let detail = self.mpv.error_string(code);
+                trace(&format!("!! render: 创建渲染上下文失败（{detail}）"));
+                Err(if detail.is_empty() {
+                    format!("mpv_render_context_create 失败（{code}）")
+                } else {
+                    detail
+                })
+            }
+        }
     }
 
+    pub fn has_render(&self) -> bool {
+        self.render.is_some()
+    }
+
+    /// 每来一帧就调一次（mpv 的任意内部线程）。里面只能丢信号，不能碰 mpv API。
+    pub fn set_frame_callback(&mut self, callback: Box<dyn Fn() + Send + Sync>) {
+        if let Some(render) = self.render.as_mut() {
+            render.set_update_callback(Some(callback));
+        }
+    }
+
+    /// 把当前这一帧渲染进内部缓冲，返回只读视图（BGRA）。
+    ///
+    /// 尺寸变了会自动重配置 mpv 的缩放器；调用方按 [`crate::render::fit_render_size`]
+    /// 算尺寸，不要每帧传窗口的物理尺寸（4K 窗里播 720p 会白白放大四倍）。
+    pub fn render_frame(&mut self, width: usize, height: usize) -> Option<FrameRef<'_>> {
+        let render = self.render.as_ref()?;
+        self.buffer.ensure(width, height);
+        if let Err(detail) = render.render(&mut self.buffer) {
+            // 每帧都打日志会刷屏：只在错误文本变化时记一次
+            if self.last_render_error.as_deref() != Some(detail.as_str()) {
+                trace(&format!("!! render: {detail}"));
+                self.last_render_error = Some(detail);
+            }
+            return None;
+        }
+        self.last_render_error = None;
+        render.report_swap();
+        Some(self.buffer.frame())
+    }
     /// 取走并清除「最近一次加载/解码失败」标记（UI 每轮轮询调用一次）。
     pub fn take_error(&self) -> Option<String> {
         let mut st = self.status.lock().ok()?;
@@ -454,6 +526,9 @@ impl VideoEngine {
         self.destroyed = true;
 
         self.quit.store(true, Ordering::SeqCst);
+        // 渲染上下文必须先于 mpv 销毁：`mpv_render_context_free` 会去碰已经没了的
+        // 视频输出链（顺序反了是崩溃，不是报错）。
+        drop(self.render.take());
         // 打断正在阻塞的 wait_event，事件线程立刻看到 quit 并退出
         self.mpv.wakeup(self.ctx.raw());
         if let Some(worker) = self.worker.take() {
@@ -1092,5 +1167,86 @@ mod tests {
         out.extend_from_slice(&data_len.to_le_bytes());
         out.extend(std::iter::repeat(0u8).take(data_len as usize));
         std::fs::write(path, out)
+    }
+
+    /// 渲染 API 端到端：建立 SW 上下文 → 有帧回调 → 真的拿到不透明的彩色像素。
+    ///
+    /// 这一段是「画面进了我们自己的合成树」的唯一硬证据：回调没来 = mpv 没出图；
+    /// 像素全黑 = 缩放/格式参数错；alpha 全 0 = 忘了把 `bgr0` 的第 4 字节刷成不透明
+    /// （表现出来就是「界面上一片空白」，而截图也是空的，很容易误判成没渲染）。
+    #[test]
+    fn render_api_delivers_opaque_pixels() {
+        let dev_copy = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("mpv-dev")
+            .join("libmpv-2.dll");
+        let Some(lib) = find_libmpv(None).or_else(|| dev_copy.is_file().then_some(dev_copy)) else {
+            eprintln!("跳过：未找到 libmpv-2.dll");
+            return;
+        };
+        let media = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("test-media")
+            .join("gen-bars.mp4");
+        if !media.is_file() {
+            eprintln!("跳过：缺少 test-media/gen-bars.mp4");
+            return;
+        }
+
+        let mut engine = VideoEngine::spawn(SpawnOptions {
+            libmpv: lib,
+            // 渲染 API 不能同时给 wid：给了就是两条输出互相打架
+            wid: None,
+            volume: 0.0,
+            extra_args: vec!["--ao=null".into(), "--loop-file=inf".into()],
+        })
+        .expect("libmpv 应该能初始化");
+        engine.enable_render().expect("应能建立软件渲染上下文");
+        assert!(engine.has_render());
+
+        let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&frames);
+        engine.set_frame_callback(Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        engine.load(&media.to_string_lossy().replace('\\', "/"));
+        assert!(
+            wait_for(|| frames.load(Ordering::SeqCst) > 0, 8000),
+            "update 回调应被触发（说明 mpv 出图了）"
+        );
+
+        // 首帧可能在回调之后几十毫秒才可渲染，给一段重试窗口（第一帧渲染出来之前
+        // `mpv_render_context_render` 只是清屏，返回 0 但像素全黑）
+        let mut got = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while std::time::Instant::now() < deadline {
+            if let Some(frame) = engine.render_frame(320, 180) {
+                let bright = frame
+                    .band_mean()
+                    .map(|(r, g, b)| r + g + b > 30.0)
+                    .unwrap_or(false);
+                if bright {
+                    got = Some((
+                        frame.width,
+                        frame.height,
+                        frame.data[3],
+                        frame.band_hue(),
+                        frame.band_thumbnail(8, 4).map(|t| t.len()),
+                    ));
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+
+        let (w, h, alpha, hue, thumb) = got.expect("应在 8 秒内渲染出一帧有内容的彩色画面");
+        assert_eq!((w, h), (320, 180), "渲染尺寸应等于请求的尺寸");
+        assert_eq!(alpha, 255, "bgr0 的第 4 字节要刷成不透明");
+        assert!(hue.is_some(), "彩条画面应能算出色相");
+        assert_eq!(thumb, Some(8 * 4 * 4), "缩略图尺寸应固定");
     }
 }
