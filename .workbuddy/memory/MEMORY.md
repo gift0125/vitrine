@@ -2,13 +2,19 @@
 
 ## 项目概览
 - 双轨：① Ardot 设计稿（Chroma 播放器 UI，file 737444551354649，Catppuccin Latte 浅色 + Mauve 强调色，macOS/Windows 两版页面并存）；② Rust 实现（GPUI Kit）。
-- 实现计划：docs/gpui-kit-plan.md（2026-10-17 v1.0）。框架 GPUI Kit v0.7（Longbridge，基于 Zed GPUI）；UI 用 gpui-component 带样式层；音频 rodio；视频 libmpv（Stage 4 可选，有降级预案）。
+- 实现计划：docs/gpui-kit-plan.md（2026-10-17 v1.0）。框架 GPUI Kit v0.7（Longbridge，基于 Zed GPUI）；UI 用 gpui-component 带样式层；音频 rodio；视频 mpv.exe 子进程 + `--wid` 叠加窗口（Stage 4 已落地，M2 tag）。当前进度：M0/M1/M2 已完成，下一步 M3 = Stage 5 打磨与发布。
 
 ## 工程约定
 - 五步流程：plan review → modify → implement → verify completion → next stage；验证以读实际文件/构建产物/git status 为准。
 - Cargo workspace：crates/app（UI bin）+ crates/player-core（播放内核 lib，无 UI 依赖）。gpui-kit 版本锁定 0.7.x。
 - 基线 commit 41c13ef（2026-10-17）。git 身份本仓库级配置：Kevin Zhang / kevin.zhang@local。
 - 工具链：用户自行安装 Rust + VS Build Tools（2026-10-17 确认），agent 不动系统环境。
+
+## GPUI 平台事实（踩过的坑，勿重复验证）
+- GPUI Windows 后端 = DirectComposition + WS_EX_NOREDIRECTIONBITMAP → **不能承载原生子窗口**；视频走 mpv.exe + `--wid` 自建 WS_POPUP 顶层窗口（owner=主窗口）。
+- `ListItem::confirmed()` 不产生任何视觉（只有 check_icon 才画对勾）；默认主题 `primary` 与正文色重合（light neutral-900 vs neutral-950），不能用 primary 表达"当前项"。列表高亮用 `list_active` / `list_active_border` token。
+- `cx.on_app_quit` **只在显式 App::quit() 时触发，窗口关闭不走它**；资源清理必须依赖 Drop。退出留痕见 `persistence::log_session` → `%APPDATA%/simple-media-player/session.log`。
+- 观测到"进程自行退出"时先分三档：日志有 `player_view dropped`+`event loop returned`=优雅退出；只有 `start`=被硬杀（宿主清理进程树）；在宿主任务内启动的长驻进程可稳定存活 16min+，应用本身无自杀路径。
 
 ## 设计稿要点（详见 2026-10-17 日志）
 - 色板严格取 Catppuccin Latte 官方值；Mauve #8839EF 唯一强调色。

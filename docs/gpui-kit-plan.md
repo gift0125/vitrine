@@ -159,8 +159,16 @@ GPUI 的 Windows 后端使用 `DirectComposition + WS_EX_NOREDIRECTIONBITMAP`，
 
 **已知限制 / 遗留**：
 1. 视频区内的 GPUI 元素会被视频窗口遮挡（未来要加浮层需改纹理共享方案）。
-2. 播放列表“当前曲目”高亮用 `theme.primary` 着色，而默认主题 `primary` 与正文色接近 → 视觉区分度弱（M1 遗留，Stage 5 换肤时一并处理）。
+2. ~~播放列表“当前曲目”高亮用 `theme.primary` 着色，区分度弱~~ → **已修（2026-10-18）**：
+   根因是默认主题里 `primary` 与正文色几乎重合（light: neutral-900 vs neutral-950；dark: neutral-50 vs neutral-50）。
+   改用列表语义 token（`list_active` 行底色 + `list_active_border` 左侧强调条）+ 图标换成 Volume2 + 标题半粗，
+   共 4 处视觉线索；明暗两套主题均截图验证，非当前行留 2px 透明占位条避免布局跳动。
 3. mpv 需外部提供：`SMP_MPV_PATH` 环境变量 → PATH → 常见安装路径依次探测；缺失时视频区显示明确错误文案，音频功能不受影响。
+4. 退出路径清理：`cx.on_app_quit` 只在显式 `App::quit()` 时触发，**窗口关闭不走它**；mpv 回收实际由
+   `VideoEngine::drop` 兜底（实测：播放中关窗口，mpv 进程确实被回收，无孤儿）。
+5. 空闲自行退出（M2 期间观察到一次，无崩溃/无 stderr）→ 已加会话留痕
+   `%APPDATA%/simple-media-player/session.log`（start / player_view dropped / app_quit / panic / event loop returned），
+   下次复现即可区分「应用主动退出」与「被外部终止」。
 
 **降级预案（未触发）**：若纹理共享/叠加窗口受阻超过 1 天，MVP 以音频播放器交付，视频功能砍为 v2。
 
@@ -169,7 +177,7 @@ GPUI 的 Windows 后端使用 `DirectComposition + WS_EX_NOREDIRECTIONBITMAP`，
 ### 🟡 Stage 5 — 打磨与发布（1 天）
 
 - [ ] UI 集成测试：`gpui_kit::test` 无头窗口驱动指针/键盘，断言播放状态、焦点、布局
-- [ ] 无障碍检查（AccessKit 角色/名称）
+- [ ] 无障碍检查（AccessKit 角色/名称）——列表行已补 `accessibility_label`（含“正在播放”后缀），其余控件待查
 - [ ] 错误处理：损坏文件、解码失败、设备占用的 toast 提示
 - [ ] `cargo build --release`，Windows 打包（单 exe + mpv dll 或 innosetup）
 - [ ] README + 截图

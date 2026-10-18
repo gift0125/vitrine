@@ -104,6 +104,75 @@ pub fn save_settings(settings: &Settings) {
     }
 }
 
+// ----------------------------------------------------------------------
+// 会话日志
+// ----------------------------------------------------------------------
+
+/// 追加一行会话日志到 `%APPDATA%/simple-media-player/session.log`。
+///
+/// 存在意义：M2 期间观察到一次「空闲约 13 分钟后进程自行退出、无崩溃无 stderr」，
+/// 无法复现。启动 / 退出请求 / 事件循环返回 / panic 全部留痕后，下次复现即可区分
+/// 「GPUI 主动退出」与「被外部终止」。
+///
+/// 文件超过 256 KiB 时整体丢弃重写，避免长期使用无限增长。
+pub fn log_session(event: &str) {
+    let Ok(dir) = ensure_config_dir() else {
+        return;
+    };
+    let path = dir.join("session.log");
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > 256 * 1024 {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write as _;
+        let _ = writeln!(
+            file,
+            "[{}] pid={} {}",
+            utc_timestamp(),
+            std::process::id(),
+            event
+        );
+        let _ = file.flush();
+    }
+}
+
+/// UTC 时间戳 `YYYY-MM-DD HH:MM:SSZ`（不引入 chrono，用民用日历换算）。
+fn utc_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
+/// Howard Hinnant 的 `civil_from_days`：Unix 纪元起的天数 → (年, 月, 日)。
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +204,27 @@ mod tests {
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.volume, settings.volume);
         assert_eq!(back.window_width, settings.window_width);
+    }
+
+    #[test]
+    fn civil_dates_from_unix_days() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(1), (1970, 1, 2));
+        assert_eq!(civil_from_days(365), (1971, 1, 1));
+        // 2026-10-18 = 1970-01-01 起第 20744 天
+        assert_eq!(civil_from_days(20_744), (2026, 10, 18));
+        // 闰日
+        assert_eq!(civil_from_days(19_783), (2024, 3, 1));
+    }
+
+    #[test]
+    fn timestamp_shape() {
+        let ts = utc_timestamp();
+        // "YYYY-MM-DD HH:MM:SSZ" = 20 字符
+        assert_eq!(ts.len(), 20, "格式应为 YYYY-MM-DD HH:MM:SSZ，实际 {ts}");
+        assert!(ts.ends_with('Z'));
+        assert_eq!(&ts[4..5], "-");
+        assert_eq!(&ts[10..11], " ");
+        assert!(ts[..4].parse::<u32>().is_ok(), "年份不可解析: {ts}");
     }
 }

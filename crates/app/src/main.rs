@@ -18,6 +18,19 @@ use crate::player_view::PlayerView;
 fn main() {
     let start_dark = std::env::args().any(|arg| arg == "--dark");
 
+    // 会话留痕：用于排查"进程自行退出"这类无法复现的问题，
+    // 能区分「GPUI 主动退出」与「被外部终止」（见 persistence::log_session）。
+    persistence::log_session(if start_dark {
+        "start (dark)"
+    } else {
+        "start (light)"
+    });
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        persistence::log_session(&format!("panic: {info}"));
+        default_hook(info);
+    }));
+
     // 恢复持久化状态（播放列表 + 设置）
     let saved_playlist = persistence::load_playlist();
     let settings = persistence::load_settings();
@@ -66,4 +79,8 @@ fn main() {
             })
             .expect("failed to open window");
         });
+
+    // 能走到这里说明 GPUI 事件循环正常结束（最后一个窗口关闭 / 主动 quit）；
+    // 若日志里只有 start 没有这一行，就是被外部终止。
+    persistence::log_session("event loop returned, exiting");
 }

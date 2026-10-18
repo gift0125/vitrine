@@ -147,6 +147,11 @@ impl PlayerView {
         );
         // 退出应用时结束 mpv 子进程（避免孤儿进程）
         subscriptions.push(cx.on_app_quit(|this, _cx| {
+            let detail = match this.current {
+                Some(i) => format!("app_quit requested (video_active={}, current={i})", this.video_active),
+                None => format!("app_quit requested (video_active={}, current=none)", this.video_active),
+            };
+            persistence::log_session(&detail);
             this.shutdown_video();
             async {}
         }));
@@ -1116,6 +1121,18 @@ impl PlayerView {
                             })),
                     ),
             )
+    }
+}
+
+impl Drop for PlayerView {
+    fn drop(&mut self) {
+        // 退出路径留痕：`on_app_quit` 只在显式 quit 时触发，窗口关闭这条路径
+        // 不经过它（mpv 回收由 `VideoEngine::drop` 兜底）。要和
+        // main 里的 "event loop returned" 对照，才能判断进程是怎么结束的。
+        persistence::log_session(&format!(
+            "player_view dropped (video_active={}, current={:?}, cinema={})",
+            self.video_active, self.current, self.cinema
+        ));
     }
 }
 
