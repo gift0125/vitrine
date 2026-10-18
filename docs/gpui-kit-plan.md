@@ -961,6 +961,28 @@ OK: 全屏态点「最大化」回窗口 1800x1140
 ALL OK
 ```
 
+#### 打包与 release 验收
+
+debug 版跑绿之后，又用**打包出来的那个 exe**（用户真正双击的那份）重跑了一遍：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package.ps1 -WithMpv
+$env:SMP_EXE = "dist/simple-media-player-1.0.0/simple-media-player.exe"
+python scripts/verify_floating_chrome.py   # → ALL OK（14 项）
+```
+
+结论：14 项全绿，与 debug 版一致（`1280x720` 1:1 起播、圆角、胶囊透画面、歌单加回区域、
+窗口态顶栏铺到最左/最右一列、双击进全屏 `3840x2160`、Esc 回窗口 `1800x1140`、
+全屏点最大化回窗口、拖动 `144,72` 且叠加窗跟得上）。打包产物：
+`dist/simple-media-player-1.0.0/`（`simple-media-player.exe` 25.6 MB + `mpv.exe` 110.4 MB
++ `README.md` + `licenses/` + `MANIFEST.txt`），`simple-media-player.exe` 的 PE
+`Subsystem = 2 (GUI)`——双击不会先弹 cmd。
+
+顺手修掉 `scripts/package.ps1` 的一个假失败：cargo 把进度写到 stderr，而脚本头部
+`$ErrorActionPreference = "Stop"` 会让原生命令的 stderr 变成终止性错误
+（`NativeCommandError`）——**打包其实成功、退出码却是 1**。改成构建期间临时
+`Continue`、只认 `$LASTEXITCODE`，跑完立刻还原。现在退出码 0。
+
 #### 已知限制
 
 - 影院模式下 chrome（标题带 + 胶囊）一直可见，没有做"IINA 那样鼠标静止 2 秒自动隐藏"；

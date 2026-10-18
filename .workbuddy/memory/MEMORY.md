@@ -41,6 +41,8 @@
 - 连带两条：① GPUI 用创建时记的 `border_offset` 算 `ptMinTrackSize` → 720p 片子被顶成 `720+11`，拦 `WM_GETMINMAXINFO` 减掉；② 单纯改尺寸那路（`wParam==0`）GPUI 不管，同一条 NCCALCSIZE 分支一并处理，免得每次改尺寸靠 tick 自愈补一次（会抖）。
 - **GPUI 会丢掉进出全屏那一次的尺寸通知**（`WM_SIZE` 在 `SetWindowPos` 里同步派发，App 正被 update 借用 → resize 回调 `handle.update()` 失败、`log_err` 静默）→ `window.bounds()` 已是新尺寸、布局用的 `viewport_size` 还是旧的：画面铺满、顶栏只画在左上角一小块、右上角按钮不存在、点哪都没反应（Esc 反而正常，键盘不走命中测试）。`refresh()` 治不好；`bounds_changed(cx)` 会跑 `bounds_observers` → 对本视图 `update` → panic。正解 `window_actions::kick_layout()`：`PostMessage` 补一条 `WM_SIZE`（lparam = 真实客户区，幂等），tick 里比 `viewport_size` vs `window.bounds()`，不一致就补、300ms 限流。
 - 验收脚本侧：双击**别用模拟光标**（两次按下之间漏一条 `WM_MOUSEMOVE` 就变成拖窗体），直接 PostMessage `DOWN→UP→DBLCLK→UP` 给叠加窗；改尺寸后要 `wait_settled()`（外框对齐 + 顶栏两端/胶囊都回到窗口区域）否则测的是过渡态；顶栏明暗按**三通道之和**比（testsrc2 最左色条近黑，均值差只有 19 卡阈值）。
+- 发布验收要看**打包后的 exe**：`SMP_EXE=dist/simple-media-player-1.0.0/simple-media-player.exe python scripts/verify_floating_chrome.py`。release 是 GUI 子系统、无 stderr，但判定只读像素与窗口状态，不受影响；PE `Subsystem` 用读头的方式核（2=GUI）。
+- **`package.ps1` 曾"成功却退出码 1"**：cargo 进度写 stderr，脚本头 `$ErrorActionPreference = "Stop"` 把原生命令的 stderr 当 `NativeCommandError` 终止。构建期间临时 `Continue`、只认 `$LASTEXITCODE`，跑完还原。（同源坑：任何 `$ErrorActionPreference="Stop"` 的 .ps1 里调 cargo/git 都要这么包一层。）
 
 ## UI / 布局 / 样式（gpui-component 坑）
 - `ListItem::confirmed()` 无视觉；默认 `primary` 与正文色重合，不能用它表达"当前项" → 用 `list_active` / `list_active_border`。

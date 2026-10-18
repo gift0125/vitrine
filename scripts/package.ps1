@@ -34,8 +34,15 @@ Write-Host "==> 版本 $version"
 
 if (-not $SkipBuild) {
     Write-Host "==> cargo build --release"
-    cargo build --release -p simple-media-player
-    if ($LASTEXITCODE -ne 0) { throw "release 构建失败" }
+    # cargo 把进度和错误都写 stderr，而上面 `$ErrorActionPreference = "Stop"` 会让
+    # 原生命令的 stderr 输出变成终止性错误（NativeCommandError）——脚本其实跑完了，
+    # 退出码却是 1。这里干脆只信 `$LASTEXITCODE`：临时放宽，跑完立刻还原。
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & cargo build --release -p simple-media-player
+    $buildCode = $LASTEXITCODE
+    $ErrorActionPreference = $previousEap
+    if ($buildCode -ne 0) { throw "release 构建失败（cargo exit $buildCode）" }
 }
 
 $exe = Join-Path $root "target/release/simple-media-player.exe"
