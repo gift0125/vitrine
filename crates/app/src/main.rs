@@ -7,6 +7,7 @@ mod assets;
 mod persistence;
 mod player_view;
 mod playlist;
+mod theme;
 #[cfg(test)]
 mod ui_tests;
 mod video_overlay;
@@ -45,10 +46,8 @@ fn main() {
         .with_assets(AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
-
-            if start_dark {
-                gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
-            }
+            // 设计稿色板（Catppuccin Latte / Mocha），必须在 init 之后覆盖默认主题
+            theme::install(cx, start_dark);
 
             let w = settings.window_width.clamp(720.0, 4096.0);
             let h = settings.window_height.clamp(480.0, 4096.0);
@@ -60,7 +59,8 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(px(720.), px(480.))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Simple Media Player".into()),
+                    // 设计稿的产品名是 Chroma（音乐播放器的品牌名）
+                    title: Some("Chroma".into()),
                     ..Default::default()
                 }),
                 ..Default::default()

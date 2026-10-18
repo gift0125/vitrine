@@ -1,0 +1,285 @@
+//! Chroma 主题：把设计稿的 Catppuccin Latte 色板灌进 gpui-component。
+//!
+//! 之前整个应用用的是 gpui-component 的默认中性灰主题（`Theme::default()`），
+//! 和设计稿（Ardot file 737444551354649，Catppuccin Latte + Mauve 强调色）
+//! 完全是两套东西——这就是"样式差别很大"的根因。这里把设计稿的 token 逐项
+//! 映射过来，界面代码只读语义 token，不再出现任何写死的色值。
+//!
+//! 色板严格取 Catppuccin 官方值（Latte = 浅色，Mocha = 深色对应版）：
+//!
+//! | 角色 | Latte | 设计稿用途 |
+//! |------|-------|-----------|
+//! | Base | `#EFF1F5` | 窗口墙体、卡片、控制栏底 |
+//! | Mantle | `#E6E9EF` | 次级面（输入框、悬停底） |
+//! | Surface0 | `#CCD0DA` | 分隔线 |
+//! | Surface1 | `#BCC0CC` | 描边、进度轨道 |
+//! | Surface2 | `#ACB0BE` | 图标描边 |
+//! | Text | `#4C4F69` | 标题/主文案 |
+//! | Subtext1 | `#5C5F77` | 图标 |
+//! | Overlay1 | `#8C8FA1` | 描述、编号、未激活 |
+//! | Mauve | `#8839EF` | **唯一强调色**：播放按钮、进度已播放、当前播放项 |
+//!
+//! 设计稿明确「一个强调色」，所以 danger/success/warning 只用于语义反馈
+//! （toast），不参与常规视觉。
+
+use std::rc::Rc;
+
+use gpui_kit::component::{Theme, ThemeConfig, ThemeMode};
+use gpui_kit::{App, SharedString};
+
+/// 便捷构造：`c("#8839EF")`。
+fn c(hex: &'static str) -> Option<SharedString> {
+    Some(hex.into())
+}
+
+/// 一套完整配色（Latte / Mocha 结构相同，只有色值不同）。
+struct Palette {
+    base: &'static str,
+    mantle: &'static str,
+    crust: &'static str,
+    surface0: &'static str,
+    surface1: &'static str,
+    text: &'static str,
+    subtext1: &'static str,
+    overlay1: &'static str,
+    mauve: &'static str,
+    mauve_hover: &'static str,
+    mauve_active: &'static str,
+    /// Mauve 的极淡填充（当前播放行底色），8% 透明
+    mauve_veil: &'static str,
+    /// Mauve 的选中底色，20% 透明
+    mauve_selection: &'static str,
+    on_mauve: &'static str,
+    red: &'static str,
+    green: &'static str,
+    yellow: &'static str,
+    blue: &'static str,
+}
+
+const LATTE: Palette = Palette {
+    base: "#EFF1F5",
+    mantle: "#E6E9EF",
+    crust: "#DCE0E8",
+    surface0: "#CCD0DA",
+    surface1: "#BCC0CC",
+    text: "#4C4F69",
+    subtext1: "#5C5F77",
+    overlay1: "#8C8FA1",
+    mauve: "#8839EF",
+    mauve_hover: "#7726E0",
+    mauve_active: "#6C1FD1",
+    mauve_veil: "#8839EF14",
+    mauve_selection: "#8839EF33",
+    on_mauve: "#FFFFFF",
+    red: "#D20F39",
+    green: "#40A02B",
+    yellow: "#DF8E1D",
+    blue: "#1E66F5",
+};
+
+const MOCHA: Palette = Palette {
+    base: "#1E1E2E",
+    mantle: "#181825",
+    crust: "#11111B",
+    surface0: "#313244",
+    surface1: "#45475A",
+    text: "#CDD6F4",
+    subtext1: "#BAC2DE",
+    overlay1: "#7F849C",
+    mauve: "#CBA6F7",
+    mauve_hover: "#D7B8F9",
+    mauve_active: "#B98CF5",
+    mauve_veil: "#CBA6F71F",
+    mauve_selection: "#CBA6F73D",
+    on_mauve: "#11111B",
+    red: "#F38BA8",
+    green: "#A6E3A1",
+    yellow: "#F9E2AF",
+    blue: "#89B4FA",
+};
+
+/// 把一套色板翻译成 gpui-component 的语义 token。
+///
+/// 没有列出的 token 会回落到该模式的默认中性色，所以这里只覆盖界面真正
+/// 用到的那些；后续换肤也只需要动这张表。
+///
+/// 注意：`ThemeConfigColors` 里的 base.* 色板字段是私有的，不能用结构体字面量
+/// 构造，只能先 `default()` 再逐字段赋值。
+fn config(name: &str, mode: ThemeMode, p: &Palette) -> ThemeConfig {
+    let mut cfg = ThemeConfig {
+        name: name.into(),
+        mode,
+        // 设计稿：正文 13px / 辅助 11px / 标题 15px，基准字号 16 让 rem 阶梯对齐
+        font_family: Some("Noto Sans SC".into()),
+        font_size: Some(16.0),
+        mono_font_family: Some("Consolas".into()),
+        mono_font_size: Some(12.0),
+        // 设计稿：条目/卡片圆角 8，大面板 12
+        radius: Some(8),
+        radius_lg: Some(12),
+        // 设计稿是纯平面层级，没有按钮投影
+        shadow: Some(false),
+        ..Default::default()
+    };
+
+    let col = &mut cfg.colors;
+
+    // ---- 基础面 ----
+    col.background = c(p.base);
+    col.foreground = c(p.text);
+    // Surface0：设计稿里唯一的分隔线色
+    col.border = c(p.surface0);
+    col.window_border = c(p.surface0);
+    col.muted = c(p.mantle);
+    col.muted_foreground = c(p.overlay1);
+    col.secondary = c(p.mantle);
+    col.secondary_foreground = c(p.subtext1);
+    col.secondary_hover = c(p.crust);
+    col.secondary_active = c(p.surface0);
+    col.input = c(p.surface1);
+    col.popover = c(p.base);
+    col.popover_foreground = c(p.text);
+    col.group_box = c(p.base);
+    col.group_box_foreground = c(p.text);
+    col.group_box_title_foreground = c(p.text);
+
+    // ---- 强调色：Mauve 独家 ----
+    col.primary = c(p.mauve);
+    col.primary_foreground = c(p.on_mauve);
+    col.primary_hover = c(p.mauve_hover);
+    col.primary_active = c(p.mauve_active);
+    // ghost 按钮悬停底：设计稿没有色块，用极淡的 Crust
+    col.accent = c(p.crust);
+    col.accent_foreground = c(p.text);
+    col.ring = c(p.mauve);
+    col.caret = c(p.mauve);
+    col.selection = c(p.mauve_selection);
+    col.link = c(p.mauve);
+    col.link_hover = c(p.mauve_hover);
+    col.link_active = c(p.mauve_active);
+
+    // ---- 主按钮（播放按钮） ----
+    col.button_primary = c(p.mauve);
+    col.button_primary_foreground = c(p.on_mauve);
+    col.button_primary_hover = c(p.mauve_hover);
+    col.button_primary_active = c(p.mauve_active);
+    col.button = c(p.mantle);
+    col.button_foreground = c(p.text);
+    col.button_hover = c(p.crust);
+    col.button_active = c(p.surface0);
+
+    // ---- 播放列表 ----
+    col.list = c(p.base);
+    col.list_hover = c(p.mantle);
+    col.list_active = c(p.mauve_veil);
+    col.list_active_border = c(p.mauve);
+    col.list_head = c(p.base);
+    col.list_even = c(p.base);
+
+    // ---- 进度/音量 ----
+    // Slider 的 bg 即"已播放段"，轨道是它的 20% 透明度版本
+    col.slider_bar = c(p.mauve);
+    col.slider_thumb = c(p.mauve);
+    col.progress_bar = c(p.mauve);
+    col.switch = c(p.surface1);
+    col.switch_thumb = c(p.base);
+
+    // ---- 滚动条 ----
+    col.scrollbar = c(p.base);
+    col.scrollbar_thumb = c(p.surface1);
+    col.scrollbar_thumb_hover = c(p.surface1);
+
+    // ---- 标题栏 ----
+    col.title_bar = c(p.base);
+    col.title_bar_border = c(p.surface1);
+    col.status_bar = c(p.base);
+    col.status_bar_border = c(p.surface0);
+
+    // ---- 交互反馈（toast） ----
+    col.danger = c(p.red);
+    col.danger_foreground = c(p.base);
+    col.danger_hover = c(p.red);
+    col.danger_active = c(p.red);
+    col.success = c(p.green);
+    col.success_foreground = c(p.base);
+    col.success_hover = c(p.green);
+    col.success_active = c(p.green);
+    col.warning = c(p.yellow);
+    col.warning_foreground = c(p.base);
+    col.warning_hover = c(p.yellow);
+    col.warning_active = c(p.yellow);
+    col.info = c(p.blue);
+    col.info_foreground = c(p.base);
+    col.info_hover = c(p.blue);
+    col.info_active = c(p.blue);
+    col.drag_border = c(p.mauve);
+    col.drop_target = c(p.mauve_veil);
+
+    cfg
+}
+
+/// 安装 Chroma 主题（浅色 Latte 为默认，深色 Mocha 备切换）。
+///
+/// 必须在 `gpui_kit::init(cx)` 之后调用：那一步会先装一份默认主题并
+/// `Theme::change(Light)`，这里再把它替换成设计稿的色板。
+pub fn install(cx: &mut App, dark: bool) {
+    let light = Rc::new(config("Chroma Latte", ThemeMode::Light, &LATTE));
+    let dark_cfg = Rc::new(config("Chroma Mocha", ThemeMode::Dark, &MOCHA));
+
+    Theme::update(cx, |theme| {
+        // 先登记两套配置，再让 apply_config 把浅色应用上去
+        theme.light_theme = light.clone();
+        theme.dark_theme = dark_cfg;
+        theme.apply_config(&light);
+    });
+
+    if dark {
+        Theme::change(ThemeMode::Dark, None, cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui_kit::component::ActiveTheme as _;
+    use gpui_kit::Hsla;
+
+    /// 颜色比较统一走 `rgb() -> Hsla`，两端同一条转换路径，避免浮点误差。
+    fn hex(value: u32) -> Hsla {
+        gpui_kit::rgb(value).into()
+    }
+
+    /// 主题必须真的落到全局状态上——否则界面又回到默认中性灰。
+    #[gpui_kit::test]
+    fn install_applies_latte_palette(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install(cx, false);
+
+            let theme = cx.theme();
+            assert!(!theme.mode.is_dark(), "默认应为浅色 Latte");
+            assert_eq!(theme.theme_name().as_ref(), "Chroma Latte");
+            assert_eq!(
+                theme.background,
+                hex(0xEFF1F5),
+                "窗口底色应为 Catppuccin Latte 的 Base"
+            );
+            assert_eq!(theme.primary, hex(0x8839EF), "强调色应为 Mauve");
+            assert_eq!(theme.border, hex(0xCCD0DA), "分隔线应为 Surface0");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn dark_mode_uses_mocha_palette(cx: &mut gpui_kit::TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            install(cx, true);
+
+            let theme = cx.theme();
+            assert!(theme.mode.is_dark());
+            assert_eq!(theme.theme_name().as_ref(), "Chroma Mocha");
+            assert_eq!(theme.background, hex(0x1E1E2E), "深色应为 Mocha Base");
+            assert_eq!(theme.primary, hex(0xCBA6F7), "深色强调色为 Mocha Mauve");
+        });
+    }
+}

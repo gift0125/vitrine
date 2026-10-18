@@ -23,7 +23,6 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{List, ListEvent, ListState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::slider::{Slider, SliderEvent, SliderState};
@@ -871,42 +870,55 @@ impl PlayerView {
     // ------------------------------------------------------------------
     // 渲染
     // ------------------------------------------------------------------
+    //
+    // 尺寸全部取设计稿（Ardot 主播放窗口 1280×800）：
+    //   - 播放列表面板：右侧 320 宽，padding 20，gap 10，条目 48 高
+    //   - 1px 分隔线：Surface0（唯一分隔手段，不做卡片投影）
+    //   - 控制栏：padding 16 + gap 12，进度轨道在上、时间行在下、控制行最底
+    //   - 播放按钮：44 正圆，Mauve 填充，白色图标
 
+    /// 播放列表面板：右侧固定 320 宽（设计稿 x=960、w=320）。
     fn render_playlist_panel(&self, cx: &Context<Self>) -> Div {
         let theme = cx.theme();
         let count = self.playlist.read(cx).delegate().track_count();
 
         v_flex()
             .h_full()
-            .w(px(280.))
+            .w(px(320.))
             .flex_shrink_0()
-            .border_r_1()
+            .bg(theme.background)
+            .border_l_1()
             .border_color(theme.border)
+            .px(px(20.))
+            .pt(px(20.))
+            .pb(px(12.))
+            .gap(px(10.))
             .child(
                 h_flex()
+                    .w_full()
                     .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2p5()
-                    .border_b_1()
-                    .border_color(theme.border)
+                    .gap(px(2.))
                     .child(
-                        Icon::new(IconName::ListMusic)
-                            .small()
-                            .text_color(theme.primary),
+                        div()
+                            .text_size(px(15.))
+                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                            .text_color(theme.foreground)
+                            .child("播放列表"),
                     )
-                    .child(Label::new("播放列表").text_sm())
+                    .child(div().flex_1())
                     .child(
-                        div().flex_1().child(
-                            Label::new(format!("{count} 首"))
-                                .text_xs()
-                                .text_color(theme.muted_foreground),
-                        ),
+                        div()
+                            .pr(px(4.))
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child(format!("{count} 个文件")),
                     )
+                    // 设计稿没有这三个入口，但功能上必须有；收成 20px 的 ghost 图标，
+                    // 颜色交给 muted 层级，不抢"播放列表"标题的视觉权重。
                     .child(
                         Button::new("add-file")
                             .ghost()
-                            .small()
+                            .xsmall()
                             .icon(IconName::Plus)
                             .tooltip("添加文件")
                             .accessibility_label("添加文件")
@@ -917,7 +929,7 @@ impl PlayerView {
                     .child(
                         Button::new("add-folder")
                             .ghost()
-                            .small()
+                            .xsmall()
                             .icon(IconName::FolderOpen)
                             .tooltip("添加文件夹")
                             .accessibility_label("添加文件夹")
@@ -928,7 +940,7 @@ impl PlayerView {
                     .child(
                         Button::new("clear-playlist")
                             .ghost()
-                            .small()
+                            .xsmall()
                             .icon(IconName::Delete)
                             .tooltip("清空播放列表")
                             .accessibility_label("清空播放列表")
@@ -937,47 +949,66 @@ impl PlayerView {
                             })),
                     ),
             )
-            .child(div().flex_1().min_h_0().child(List::new(&self.playlist)))
+            // 1px Surface0 分隔线（设计稿唯一的分隔方式）
+            .child(div().w_full().h(px(1.)).flex_shrink_0().bg(theme.border))
+            // List 默认带 8px 左右内边距（会把条目挤得比标题缩进一格），
+            // 设计稿里条目只靠自身 8px padding 缩进，所以这里压成 0。
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(List::new(&self.playlist).px(px(0.))),
+            )
     }
 
-    /// 音频：封面 + 曲目信息。
+    /// 音频：居中封面 + 曲目信息（对应设计稿「音乐模式」窗口的封面块）。
     fn render_cover(&self, cx: &Context<Self>) -> Div {
         let theme = cx.theme();
         let track = self.current_track(cx);
-        let has_track = track.is_some();
+        let empty = self.playlist.read(cx).delegate().track_count() == 0;
 
-        v_flex()
+        let mut cover = v_flex()
             .flex_1()
             .h_full()
             .items_center()
             .justify_center()
-            .gap_5()
-            .p_6()
+            .gap(px(20.))
+            .px(px(40.))
             .child(
                 div()
-                    .size(px(220.))
-                    .rounded(px(28.))
+                    .size(px(300.))
+                    .flex_shrink_0()
+                    .rounded(px(18.))
                     .bg(theme.secondary)
                     .border_1()
                     .border_color(theme.border)
+                    .shadow_sm()
                     .flex()
                     .items_center()
                     .justify_center()
                     .child(
                         Icon::new(IconName::Music)
-                            .large()
+                            .size(px(64.))
                             .text_color(theme.muted_foreground),
                     ),
-            )
-            .when_some(track, |el, track| {
-                el.child(
+            );
+
+        if let Some(track) = track {
+            cover = cover
+                .child(
                     v_flex()
                         .items_center()
-                        .gap_1()
-                        .child(div().text_xl().child(track.title.clone()))
+                        .gap(px(6.))
                         .child(
                             div()
-                                .text_sm()
+                                .text_size(px(22.))
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_color(theme.foreground)
+                                .child(track.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.))
                                 .text_color(theme.muted_foreground)
                                 .child(format!(
                                     "{} · {}",
@@ -985,22 +1016,25 @@ impl PlayerView {
                                     fmt_time(track.duration_secs.unwrap_or(0.0))
                                 )),
                         ),
-                )
-            })
-            .when(!has_track, |el| {
-                el.child(div().text_sm().text_color(theme.muted_foreground).child(
-                    if self.playlist.read(cx).delegate().track_count() == 0 {
-                        "播放列表为空，点击左上角 + 添加媒体"
+                );
+        } else {
+            cover = cover.child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(theme.muted_foreground)
+                    .child(if empty {
+                        "播放列表为空，点击右上角 + 添加媒体"
                     } else {
-                        "从左侧播放列表选择一项开始播放"
-                    },
-                ))
-            })
+                        "从右侧播放列表选择一项开始播放"
+                    }),
+            );
+        }
+
+        cover
     }
 
     /// 视频：舞台区（mpv 渲染进叠加窗口，这里只提供位置与占位背景）。
-    fn render_video_stage(&self, cx: &Context<Self>) -> Div {
-        let theme = cx.theme();
+    fn render_video_stage(&self, _cx: &Context<Self>) -> Div {
         let base = div()
             .flex_1()
             .h_full()
@@ -1014,18 +1048,23 @@ impl PlayerView {
             return base.child(
                 v_flex()
                     .items_center()
-                    .gap_2()
-                    .p_6()
+                    .gap(px(10.))
+                    .p(px(24.))
                     .child(
                         Icon::new(IconName::CircleAlert)
-                            .large()
-                            .text_color(theme.danger),
+                            .size(px(32.))
+                            .text_color(gpui_kit::rgb(0xF38BA8)),
                     )
-                    .child(div().text_sm().text_color(gpui_kit::rgb(0xdddddd)).child(err.clone()))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(gpui_kit::rgb(0x888888))
+                            .text_size(px(13.))
+                            .text_color(gpui_kit::rgb(0xCDD6F4))
+                            .child(err.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(gpui_kit::rgb(0x7F849C))
                             .child("提示：安装 mpv 或设置 SMP_MPV_PATH 指向 mpv.exe"),
                     ),
             );
@@ -1049,6 +1088,7 @@ impl PlayerView {
         base.child(stage)
     }
 
+    /// 进度区：4px 轨道 + 下一行「当前 / 剩余」（设计稿把时间放在轨道下方）。
     fn render_seek_row(&self, cx: &Context<Self>) -> Div {
         let theme = cx.theme();
         let track = self.current_track(cx);
@@ -1083,40 +1123,52 @@ impl PlayerView {
                 .map(|e| e.position_secs())
                 .unwrap_or(0.0)
         };
+        let remaining = (duration - position).max(0.0);
+        let mono = theme.mono_font_family.clone();
 
-        h_flex()
+        v_flex()
             .w_full()
-            .items_center()
-            .gap_3()
+            .gap(px(6.))
             .child(
-                div()
-                    .w(px(44.))
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(fmt_time(position)),
-            )
-            // Slider 自身没有 id / 无障碍信息（上游未实现），用带 id 的容器承载，
-            // 既给读屏软件一个可命名的分组，也让 UI 测试能定位到进度条几何。
-            .child(
+                // Slider 自身没有 id / 无障碍信息（上游未实现），用带 id 的容器承载，
+                // 既给读屏软件一个可命名的分组，也让 UI 测试能定位到进度条几何。
                 div()
                     .id("seek-bar")
                     .aria_label("播放进度")
-                    .flex_1()
-                    .min_w_0()
+                    .w_full()
                     .flex()
                     .test_support()
-                    .child(Slider::new(&self.seek).flex_1().disabled(self.current.is_none())),
+                    .child(
+                        Slider::new(&self.seek)
+                            .flex_1()
+                            // bg 即「已播放段」，轨道自动取它的 20% 透明度版本
+                            .bg(theme.primary)
+                            .disabled(self.current.is_none()),
+                    ),
             )
             .child(
-                div()
-                    .w(px(44.))
-                    .text_xs()
-                    .text_right()
-                    .text_color(theme.muted_foreground)
-                    .child(fmt_time(duration)),
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_family(mono.clone())
+                            .text_size(px(11.))
+                            .text_color(theme.secondary_foreground)
+                            .child(fmt_time(position)),
+                    )
+                    .child(
+                        div()
+                            .font_family(mono)
+                            .text_size(px(11.))
+                            .text_color(theme.muted_foreground)
+                            .child(format!("剩余 {}", fmt_time(remaining))),
+                    ),
             )
     }
 
+    /// 控制行：左（上一首 / 播放 / 下一首 / 音量）· 右（全屏 / 换肤）。
     fn render_controls_row(&self, cx: &mut Context<Self>) -> Div {
         let theme = cx.theme();
         let is_dark = theme.mode.is_dark();
@@ -1138,39 +1190,16 @@ impl PlayerView {
         h_flex()
             .w_full()
             .items_center()
-            .gap_3()
-            // 左：音量
+            .justify_between()
+            // ---- 左：走带控制 + 音量 ----
             .child(
                 h_flex()
-                    .w(px(180.))
                     .items_center()
-                    .gap_2()
-                    .child(
-                        Icon::new(volume_icon)
-                            .small()
-                            .text_color(theme.muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .id("volume-bar")
-                            .aria_label("音量")
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .test_support()
-                            .child(Slider::new(&self.volume).flex_1()),
-                    ),
-            )
-            // 中：上一首 / 播放暂停 / 下一首
-            .child(
-                h_flex()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
+                    .gap(px(14.))
                     .child(
                         Button::new("prev")
                             .ghost()
+                            .with_size(px(30.))
                             .icon(IconName::SkipBack)
                             .tooltip("上一首")
                             .accessibility_label("上一首")
@@ -1178,10 +1207,12 @@ impl PlayerView {
                                 this.skip(-1, cx);
                             })),
                     )
+                    // 设计稿：44 正圆、Mauve 实心、白色图标
                     .child(
                         Button::new("play-pause")
                             .primary()
-                            .large()
+                            .with_size(px(44.))
+                            .rounded(px(22.))
                             .icon(play_icon)
                             .tooltip(if playing { "暂停" } else { "播放" })
                             .accessibility_label(if playing { "暂停" } else { "播放" })
@@ -1192,25 +1223,45 @@ impl PlayerView {
                     .child(
                         Button::new("next")
                             .ghost()
+                            .with_size(px(30.))
                             .icon(IconName::SkipForward)
                             .tooltip("下一首")
                             .accessibility_label("下一首")
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.skip(1, cx);
                             })),
+                    )
+                    .child(
+                        h_flex()
+                            .ml(px(8.))
+                            .items_center()
+                            .gap(px(8.))
+                            .child(
+                                Icon::new(volume_icon)
+                                    .size(px(16.))
+                                    .text_color(theme.secondary_foreground),
+                            )
+                            .child(
+                                div()
+                                    .id("volume-bar")
+                                    .aria_label("音量")
+                                    .w(px(88.))
+                                    .flex()
+                                    .test_support()
+                                    .child(Slider::new(&self.volume).bg(theme.primary)),
+                            ),
                     ),
             )
-            // 右：全屏（仅视频） + 主题切换
+            // ---- 右：全屏（仅视频） + 明暗切换 ----
             .child(
                 h_flex()
-                    .w(px(96.))
                     .items_center()
-                    .justify_end()
-                    .gap_1()
+                    .gap(px(4.))
                     .when(is_video, |el| {
                         el.child(
                             Button::new("cinema")
                                 .ghost()
+                                .with_size(px(30.))
                                 .icon(if cinema {
                                     IconName::Minimize
                                 } else {
@@ -1226,6 +1277,7 @@ impl PlayerView {
                     .child(
                         Button::new("theme-toggle")
                             .ghost()
+                            .with_size(px(30.))
                             .icon(if is_dark { IconName::Sun } else { IconName::Moon })
                             .tooltip("明暗主题切换")
                             .accessibility_label(if is_dark {
@@ -1243,6 +1295,23 @@ impl PlayerView {
                             })),
                     ),
             )
+    }
+
+    /// 控制栏外壳：Base 底 + 顶部 1px Surface0，padding 16 / gap 12。
+    fn render_control_bar(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .bg(theme.background)
+            .border_t_1()
+            .border_color(theme.border)
+            .px(px(16.))
+            .pt(px(14.))
+            .pb(px(12.))
+            .gap(px(12.))
+            .child(self.render_seek_row(cx))
+            .child(self.render_controls_row(cx))
     }
 }
 
@@ -1296,30 +1365,20 @@ impl Render for PlayerView {
             .size_full()
             .bg(theme.background)
             .text_color(theme.foreground)
-            // 主区域：左歌单 + 右封面/视频舞台
+            // 主区域：左封面/视频舞台 + 右播放列表（设计稿 x=960 w=320，贴右边缘）
             .child(
                 h_flex()
                     .flex_1()
                     .min_h_0()
-                    .when(!cinema, |el| el.child(self.render_playlist_panel(cx)))
                     .child(if video_active {
                         self.render_video_stage(cx)
                     } else {
                         self.render_cover(cx)
-                    }),
+                    })
+                    .when(!cinema, |el| el.child(self.render_playlist_panel(cx))),
             )
-            // 底部控制栏
-            .child(
-                v_flex()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .bg(theme.secondary)
-                    .px_4()
-                    .py_3()
-                    .gap_2()
-                    .child(self.render_seek_row(cx))
-                    .child(self.render_controls_row(cx)),
-            )
+            // 底部控制栏（设计稿 y=694 h=106）
+            .child(self.render_control_bar(cx))
     }
 }
 

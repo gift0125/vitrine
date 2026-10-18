@@ -3,7 +3,11 @@
 一个用 Rust + [GPUI Kit](https://gpui-kit.com) 写的轻量桌面媒体播放器：单窗口、原生渲染、启动快，
 音频走 [rodio](https://github.com/RustAudio/rodio)，视频交给 mpv。
 
-![音频模式（浅色）](docs/screenshots/v1-audio-light.png)
+窗口标题用设计稿的产品名 **Chroma**（仓库/二进制名沿用 `simple-media-player`）。
+配色严格对齐设计稿的 **Catppuccin Latte** 色板，强调色只用 **Mauve `#8839EF`** 一个，
+所以界面里不会出现第二种彩色——这套映射集中在 `crates/app/src/theme.rs`，改一处即整体换肤。
+
+![音频模式（Latte 浅色）](docs/screenshots/chroma-light.png)
 
 ## 功能
 
@@ -20,7 +24,7 @@
 | 错误提示 | 文件损坏、格式不支持、mpv 缺失等都有右上角 toast 提示 |
 | 无障碍 | 所有图标按钮都有可读名称（`aria_label`） |
 
-![视频播放（深色）](docs/screenshots/v1-video-dark.png)
+![视频播放（Latte 浅色）](docs/screenshots/chroma-video.png)
 
 ## 环境要求
 
@@ -107,8 +111,9 @@ UI 测试把持久化目录重定向到临时目录（见 `persistence::set_conf
 ```
 crates/
 ├── app/                 # GPUI 应用：窗口、视图状态、播放列表、顶层叠加窗口
-│   ├── player_view.rs   # 三栏布局 + 双引擎路由 + 100ms 状态轮询
+│   ├── player_view.rs   # 主区域 + 底部控制栏 + 双引擎路由 + 100ms 状态轮询
 │   ├── playlist.rs      # 列表 delegate（虚拟滚动、拖拽排序）
+│   ├── theme.rs         # 设计稿色板 → gpui-component 主题 token（Latte / Mocha）
 │   ├── video_overlay.rs # Win32 顶层叠加窗口（纯 FFI，无额外 crate）
 │   └── persistence.rs   # 配置与会话日志
 └── player-core/         # 播放内核（无 UI 依赖）
@@ -134,6 +139,33 @@ GPUI 的 Windows 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`）
 > 踩坑记录：Windows 命名管道上挂起的 `ReadFile` 会阻塞 `WriteFile`（即使句柄是 `try_clone` 出来的），
 > 所以 IPC 不能「读线程 + 写线程」并发，必须单线程串行 + `PeekNamedPipe` 非阻塞探测。
 > 详见 `crates/player-core/src/video.rs` 模块注释。
+
+## 视觉规范（对齐设计稿）
+
+设计稿（Ardot `737444551354649`）的名义色板是 **Catppuccin Latte**，单一强调色 **Mauve**。
+`crates/app/src/theme.rs` 把这些值翻译成 gpui-component 的语义 token，界面代码只读 token，
+不出现写死的颜色：
+
+| 角色 | Token | Latte | 用在哪 |
+|---|---|---|---|
+| 墙体 | `background` | `#EFF1F5` | 窗口、播放列表面板、控制栏底 |
+| 次级面 | `muted` / `secondary` | `#E6E9EF` | 封面占位、ghost 悬停底 |
+| 分隔线 | `border` | `#CCD0DA` | 面板竖线、控制栏顶线、列表分隔 |
+| 主文案 | `foreground` | `#4C4F69` | 标题、曲名 |
+| 辅助文案 | `muted_foreground` | `#8C8FA1` | 编号、时长、提示 |
+| 强调 | `primary` | `#8839EF` | 播放按钮、进度已播放、当前曲目、滑块拇指 |
+
+深色模式用同一结构的 **Mocha** 版本（`#1E1E2E` / `#CBA6F7`），保证切换时不跳出这套体系。
+
+尺寸取设计稿的实测值：播放列表 **320px**（padding 20、条目 48、圆角 8）、
+控制栏 padding 16 + gap 12、播放按钮 **44 正圆**、正文字号 13 / 辅助 11 / 标题 15。
+
+刻意与设计稿不同的三处，都是为了适配 mpv 叠加窗口这一架构约束：
+
+1. **视频不铺满整窗**，只占歌单左侧区域 —— 设计稿里歌单是浮在视频上的玻璃面板，
+   但 mpv 渲染在独立的顶层窗口里，会盖住任何 GPUI 控件（见上一节）。
+2. 控制栏在视频**下方**而不是浮在视频上，原因同上。
+3. 设计稿控制行右侧的 CC / 音轨 / 设置 / PiP 图标本版本没有对应功能，因此不画。
 
 ## 已知限制
 

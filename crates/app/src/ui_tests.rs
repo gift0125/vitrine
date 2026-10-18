@@ -78,6 +78,8 @@ fn open_view(
     cx.update(|cx| {
         // 主题 / 组件插件必须先初始化，否则渲染时取不到 Theme 全局状态。
         gpui_kit::init(cx);
+        // 测试跑的是真实皮肤（Catppuccin Latte），别让断言在别一套配色下通过
+        crate::theme::install(cx, false);
         gpui_kit::open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds {

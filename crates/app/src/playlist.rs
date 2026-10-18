@@ -12,7 +12,9 @@ use gpui_kit::component::label::Label;
 use gpui_kit::component::list::{ListDelegate, ListItem, ListState};
 use gpui_kit::component::{h_flex, v_flex, ActiveTheme as _, Icon, IndexPath, Sizable as _};
 use gpui_kit::prelude::*;
-use gpui_kit::{div, transparent_black, App, Context, FontWeight, SharedString, WeakEntity, Window};
+use gpui_kit::{
+    div, px, transparent_black, App, Context, FontWeight, SharedString, WeakEntity, Window,
+};
 
 use crate::player_view::PlayerView;
 
@@ -145,38 +147,33 @@ impl ListDelegate for PlaylistDelegate {
         let theme = cx.theme();
         let view = self.view.clone();
 
-        // 当前曲目的四重视觉线索：行底色 + 左侧强调条 + 图标换 Volume2 + 标题半粗。
-        //
-        // 早期用 `theme.primary` 给标题着色，但默认主题里 primary 与正文色几乎重合
-        // （light: neutral-900 vs neutral-950；dark: neutral-50 vs neutral-50），
-        // 等于没有区分度。改用列表专门的语义色 list_active / list_active_border，
-        // 后续换肤（Chroma）只需改主题 token，这里不用动。
-        let accent = theme.list_active_border;
-        let bar_color = if is_current {
+        // 当前曲目的视觉线索按设计稿来：行底色（Mauve 8%）+ 标题 Mauve + 序号位换成
+        // 均衡器图标。**不做左侧强调条**——设计稿的列表行是纯平面，没有装饰条。
+        let accent = theme.primary;
+        let title_color = if is_current {
             accent
         } else {
-            transparent_black()
+            theme.foreground
         };
         let row_bg = if is_current {
             theme.list_active
         } else {
             transparent_black()
         };
-        let icon = if is_current {
-            IconName::Volume2
-        } else {
-            IconName::Music
-        };
-        let icon_color = if is_current {
-            accent
-        } else {
-            theme.muted_foreground
-        };
+        let mono = theme.mono_font_family.clone();
+        let secondary = theme.muted_foreground;
 
         let artist = track
             .artist
             .clone()
             .unwrap_or_else(|| "未知艺术家".to_string());
+        let duration = fmt_duration(track.duration_secs);
+        // 设计稿：当前项第二行是「正在播放 · 42:17」，其余是「4K HDR · 52:10」
+        let meta = if is_current {
+            format!("正在播放 · {duration}")
+        } else {
+            format!("{artist} · {duration}")
+        };
 
         let drag = DragTrack {
             title: track.title.clone(),
@@ -187,6 +184,10 @@ impl ListDelegate for PlaylistDelegate {
 
         Some(
             ListItem::new(ix)
+                .h(px(48.))
+                .px(px(8.))
+                .py(px(0.))
+                .rounded(px(8.))
                 .bg(row_bg)
                 .accessibility_label(SharedString::from(format!(
                     "{}{}",
@@ -198,42 +199,68 @@ impl ListDelegate for PlaylistDelegate {
                         .flex_1()
                         .min_w_0()
                         .items_center()
-                        .gap_2()
-                        // 左侧强调条：始终占位，非当前曲目为透明，避免行内容左右跳动
-                        .child(div().w_0p5().h_4().rounded_full().bg(bar_color))
-                        .child(Icon::new(icon).small().text_color(icon_color))
+                        .gap(px(12.))
+                        // 序号列（JetBrains Mono 风格等宽数字）：当前项换成均衡器图标
+                        .child(
+                            div()
+                                .w(px(22.))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(is_current, |el| {
+                                    el.child(
+                                        Icon::new(IconName::Volume2)
+                                            .size(px(14.))
+                                            .text_color(accent),
+                                    )
+                                })
+                                .when(!is_current, |el| {
+                                    el.child(
+                                        div()
+                                            .font_family(mono.clone())
+                                            .text_size(px(11.))
+                                            .text_color(secondary)
+                                            .child(format!("{:02}", ix.row + 1)),
+                                    )
+                                }),
+                        )
                         .child(
                             v_flex()
                                 .min_w_0()
                                 .flex_1()
-                                .gap_0p5()
+                                .gap(px(3.))
                                 .child(
-                                    Label::new(track.title.clone())
-                                        .text_sm()
-                                        .text_color(theme.foreground)
-                                        .when(is_current, |l| {
-                                            l.font_weight(FontWeight::SEMIBOLD)
-                                        }),
+                                    div()
+                                        .text_size(px(13.))
+                                        .text_color(title_color)
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .when(is_current, |el| {
+                                            el.font_weight(FontWeight::SEMIBOLD)
+                                        })
+                                        .child(track.title.clone()),
                                 )
                                 .child(
-                                    Label::new(artist)
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground),
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(secondary)
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .child(meta),
                                 ),
-                        )
-                        .child(
-                            Label::new(fmt_duration(track.duration_secs))
-                                .text_xs()
-                                .text_color(theme.muted_foreground),
                         ),
                 )
-                // 行尾删除按钮
-                .suffix(move |_, _| {
+                // 行尾删除按钮（设计稿没有这个入口，压到最弱层级，别抢标题）
+                .suffix(move |_, cx| {
                     let view = view_remove.clone();
                     Button::new(SharedString::from(format!("remove-{from_row}")))
                         .ghost()
                         .xsmall()
                         .icon(IconName::Close)
+                        .text_color(cx.theme().muted_foreground)
                         .tooltip("从播放列表移除")
                         .accessibility_label(remove_label.clone())
                         .on_click(move |_, _, cx| {

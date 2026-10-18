@@ -201,7 +201,7 @@ GPUI 的 Windows 后端使用 `DirectComposition + WS_EX_NOREDIRECTIONBITMAP`，
   - `scripts/package.ps1`：release 构建 → `dist/simple-media-player-1.0.0/`（exe + README + MANIFEST 校验和）
     → 同名 zip（8.7 MB）；`-WithMpv` 可把 mpv.exe 一并打入（GPL 合规需自行确认）。
   - 实测：解压到临时目录 + 全新 `APPDATA` 启动，视频/音频/影院/错误提示全部正常，mpv 进程随窗口关闭回收。
-- [x] README + 截图（`docs/screenshots/v1-*.png`）
+- [x] README + 截图（`docs/screenshots/chroma-{light,dark,video}.png`）
 
 **验收**：release 包在干净目录 + 全新配置下可运行 ✅；测试套件 15（player-core）+ 11（app）全绿 ✅；
 release 1080p H.264 播放 mpv 峰值 10.85% 单核（整机 ~0.68%），满足 < 15% ✅。
@@ -211,6 +211,35 @@ release 1080p H.264 播放 mpv 峰值 10.85% 单核（整机 ~0.68%），满足 
 2. 进度条/音量条仅支持鼠标（上游 Slider 缺键盘与 ARIA 支持）。
 3. mpv 默认不随包分发，需 `-WithMpv` 或用户自备。
 4. 仅在 Windows 实机验证；macOS / Linux 分支未测。
+
+---
+
+### 🎨 设计稿对齐（2026-10-18 补做）
+
+**问题**：Stage 1–5 一直用 gpui-component 的默认中性灰主题，而设计稿（Ardot `737444551354649`）
+是 Catppuccin Latte + 单一 Mauve 强调色——两套视觉体系，所以"样式差别很大"。
+
+**做法**：新增 `crates/app/src/theme.rs`，把设计稿色板翻译成 gpui-component 的语义 token
+（`ThemeConfig` → `Theme::update` + `apply_config`），界面代码只读 token，不再出现写死色值。
+
+| 项 | 设计稿 | 落地 |
+|---|---|---|
+| 墙体 / 分隔 / 文案 | Base `#EFF1F5` · Surface0 `#CCD0DA` · Text `#4C4F69` | `background` / `border` / `foreground` |
+| 强调色 | Mauve `#8839EF`（唯一彩色） | `primary` + 播放按钮 / 进度已播放 / 当前曲目 / 滑块拇指 |
+| 播放列表 | 右侧 320、padding 20、条目 48、圆角 8 | 面板 `w(320).px(20)`，`ListItem::h(48).rounded(8)` |
+| 条目内容 | 序号（等宽 11）/ 曲名 13 / 元信息 11 | 序号列 22 宽，当前项换成均衡器图标 |
+| 控制栏 | padding 16 + gap 12，进度在上、时间在下 | `render_control_bar` / `render_seek_row` |
+| 播放按钮 | 44 正圆、Mauve 实心 | `Button.with_size(44).rounded(22).primary()` |
+| 字体 | Noto Sans SC（CJK）+ 等宽 | `font_family` / `mono_font_family`，字号 13/11/15 |
+
+深色模式用同结构的 Catppuccin **Mocha**（`#1E1E2E` / `#CBA6F7`），切换时不跳出这套体系。
+
+**刻意保留的偏差**（都源于 mpv 叠加窗口这一架构约束，已写入 README「视觉规范」）：
+视频不铺满整窗、控制栏在视频下方而非浮于其上、右侧 CC/音轨/设置/PiP 图标因无对应功能不画。
+
+**验证**：`theme::tests` 两个用例断言 token 真的落到全局（Base/Mauve/Mocha）；
+UI 测试改为先装真实皮肤再断言；`scripts/shot.py` 按 DPI 缩放截图，产出
+`docs/screenshots/chroma-{light,dark,video}.png` 三张对照图。
 
 ---
 

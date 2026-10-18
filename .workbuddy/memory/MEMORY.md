@@ -22,8 +22,11 @@
 - `cargo update -p X --precise` 在互相咬死的依赖图上会死循环 → 直接删 `Cargo.lock` 里对应 `[[package]]` 块让 cargo 重解（`test-support` → `gpui-fast-macos` 要求 cocoa 0.26.0 就是一例）。
 - 含中文的 `.ps1` **必须存成 UTF-8 with BOM**，否则 PowerShell 5.1 按 GBK 解 → 乱码 + 语法报错。
 - 诊断开关（保留）：`SMP_MPV_LOG` 存 mpv stderr、`SMP_MPV_TRACE` 存 JSON IPC 双向报文。mpv 对路径重复分隔符不宽容（`C://` → `end-file reason=error file_error="loading failed"`），且该失败在 `--msg-level=all=error` 下 stderr 是空的，只有 IPC 报文能看出真相。
+- 换肤：`ThemeConfig`（`#[serde(default)]` + Default）配 `Theme::update` + `apply_config`。**`ThemeConfigColors` 的 `blue/red/green/cyan/magenta/yellow`(±`_light`) 是私有字段**，crate 外不能用结构体字面量 + `..Default::default()`，只能 `default()` 后逐字段赋值。别在同一个 closure 里既换 mode 又换 config（`installed_by_edit` 会跳过 `apply_config`）。
+- 截图工具（`scripts/shot.py`）**必须先 `SetProcessDpiAwareness(2)`**：否则 Python 按 96dpi 虚拟化，`GetClientRect` 尺寸缩水、`ImageGrab` 只截到窗口左上角（表现为"界面只剩封面，歌单和控制栏消失"）。
 
 ## 设计稿要点（详见 2026-10-17 日志）
 - 色板严格取 Catppuccin Latte 官方值；Mauve #8839EF 唯一强调色。
+- **皮肤落地在 `crates/app/src/theme.rs`**：设计稿色板 → gpui-component 语义 token（Latte/Mocha 两套），界面只读 token。改动前一直用默认中性灰主题，这是"与设计稿差别很大"的根因（2026-10-18 修复）。
 - 图标规范：播放三角占圆直径 48%（B 档），32px 以下重绘而非缩放（占比 50-54%、去描边）；图标为正圆。
 - Ardot 可用字体仅 Inter / Noto 系列 / JetBrains Mono。
