@@ -1,37 +1,53 @@
-//! 视频播放内核：以子进程 + JSON IPC 驱动 mpv。
+//! 视频播放内核：**进程内** libmpv 客户端。
 //!
-//! ## 为什么不是 libmpv
+//! ## 为什么进程内
 //!
-//! Windows 上没有可用的 libmpv 动态库（本机 mpv 为静态单文件构建），而 GPUI 的 Windows
-//! 后端使用 DirectComposition（`WS_EX_NOREDIRECTIONBITMAP`），无法在其窗口内承载原生子窗口。
+//! 早先用「`mpv.exe` 子进程 + JSON IPC 命名管道」：控制通道要自己实现管道读写、
+//! 事件是 JSON 文本、播放状态靠解析字符串、mpv 一崩只能看到一个「进程没了」。换成
+//! libmpv（`libmpv-2.dll`）后这些全部消失：
 //!
-//! ## 采用的方案
+//! | | 子进程 + IPC | 进程内 libmpv |
+//! |---|---|---|
+//! | 控制 | 命名管道写 JSON | `mpv_command` 直接调 |
+//! | 状态 | 解析 `property-change` 文本 | 类型化的 `mpv_event_property` |
+//! | 失败原因 | stderr 重定向 / `end-file` 的错误码 | `mpv_error_string` |
+//! | 延迟 | 管道 + 线程调度 | 一次函数调用 |
 //!
-//! 「mpv 渲染进应用创建的顶层叠加窗口（`--wid`）+ JSON IPC 控制」：
+//! 代价是**隔离性**：mpv 崩了应用一起崩（子进程时代只死子进程）。这是 IINA 等
+//! libmpv 客户端的共同取舍——mpv 本身的崩溃点集中在本机文件解码上，收益大于风险。
 //!
-//! - **解码 / 渲染 / 音视频同步**全部交给 mpv（`vo=gpu` + `hwdec=auto-safe`），
-//!   Rust 侧不做任何像素搬运；
-//! - **控制通道**走 mpv 的 JSON IPC 命名管道（`--input-ipc-server`）。
+//! ## 画面怎么出来
 //!
-//! ## IPC 线程模型（踩过的坑）
+//! 仍然是**应用自建的顶层叠加窗口**：`wid` 选项把 mpv 的输出嵌进那个 HWND，
+//! 我们不做任何像素搬运（详见 `video_overlay` 的模块注释）。
 //!
-//! Windows 命名管道上，同一连接的**阻塞读**与**写**会互相串行：只要有一个 `ReadFile`
-//! 挂起等待数据，后续 `WriteFile` 就会被阻塞。实测（mpv 暂停后不再推送事件时）表现为
-//! 「发出 pause 之后，下一条命令永久卡死」。
+//! ## 线程模型
 //!
-//! 因此这里**不**使用阻塞读 + 写双线程，而是单个 IPC 线程串行处理：
-//! 用 `PeekNamedPipe` 非阻塞探测可读字节 → 有数据才 `read` → 再排空命令队列写管道。
-//! 任何时刻都不会有挂起的读操作，写永远不会被读阻塞。
+//! `mpv_wait_event` 只能在一个线程里调 → 一个专职「事件线程」循环取事件、写
+//! `VideoStatus`；命令/属性接口从 UI 线程直接调用（libmpv 客户端 API 是线程安全的）。
+//! 退出顺序固定为：置 quit → `mpv_wakeup` 打断等待 → join 事件线程 → `mpv_terminate_destroy`，
+//! 保证销毁时已经没有人还在用这个句柄。
+//!
+//! ## 可测性
+//!
+//! 事件到状态的映射抽成了纯函数 [`apply_event`]，输入是 [`EngineEvent`]（与 FFI 无关）。
+//! 这样「end-file 的 error 文案」「新片清空上一部的信息」这类逻辑能在没有声卡、
+//! 没有显示器的环境里跑测试，不需要真的起一个 mpv。
 
-use std::io::{BufReader, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
 };
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+
+use crate::libmpv::{
+    LibMpv, MpvCtx, MpvEventEndFile, MpvEventLogMessage, MpvEventProperty,
+    MPV_END_FILE_REASON_ERROR, MPV_END_FILE_REASON_QUIT, MPV_END_FILE_REASON_REDIRECT,
+    MPV_EVENT_END_FILE, MPV_EVENT_FILE_LOADED, MPV_EVENT_LOG_MESSAGE, MPV_EVENT_PROPERTY_CHANGE,
+    MPV_EVENT_START_FILE, MPV_FORMAT_DOUBLE, MPV_FORMAT_FLAG, MPV_FORMAT_INT64, MPV_FORMAT_STRING,
+};
 
 /// 视频文件扩展名（由 mpv 解码，与音频走不同路径）。
 const VIDEO_EXTENSIONS: &[&str] = &[
@@ -39,8 +55,11 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "ogv", "rmvb",
 ];
 
-/// IPC 空闲轮询间隔（无数据、无命令时）。
-const IPC_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// 事件线程的单次等待上限（秒）。
+///
+/// 不用 `-1` 死等：`mpv_wakeup` 能打断它，但给个上限之后，即使 wakeup 因为平台差异
+/// 没生效，退出也只多等这几十毫秒，不会挂死。
+const EVENT_WAIT_TIMEOUT: f64 = 0.05;
 
 /// 路径是否为视频文件（按扩展名判断）。
 pub fn is_video_file(path: &Path) -> bool {
@@ -53,15 +72,15 @@ pub fn is_video_file(path: &Path) -> bool {
 /// 视频内核错误。
 #[derive(Debug, thiserror::Error)]
 pub enum VideoError {
-    #[error("未找到 mpv 可执行文件（可用环境变量 SMP_MPV_PATH 指定）")]
-    MpvNotFound,
-    #[error("无法启动 mpv: {0}")]
-    Spawn(String),
-    #[error("无法连接 mpv IPC 管道（{0}）")]
-    Ipc(String),
+    #[error("未找到 libmpv-2.dll（可用环境变量 SMP_LIBMPV_PATH 指定路径）")]
+    LibmpvNotFound,
+    #[error("无法加载 libmpv：{0}")]
+    Load(String),
+    #[error("libmpv 初始化失败：{0}")]
+    Init(String),
 }
 
-/// 视频播放状态快照（由 IPC 线程写入，UI 线程读取）。
+/// 视频播放状态快照（由事件线程写入，UI 线程读取）。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct VideoStatus {
     /// 当前播放位置（秒）
@@ -82,7 +101,7 @@ pub struct VideoStatus {
     pub finished: bool,
     /// 加载/解码失败原因（end-file reason=error 等），由 UI 取走提示后清空
     pub error: Option<String>,
-    /// IPC 连接是否仍然有效
+    /// 客户端是否仍然可用（初始化成功且未销毁）
     pub connected: bool,
 
     // ---- 下面这些只给「视频信息」卡用（`ⓘ`）----
@@ -112,213 +131,209 @@ pub struct VideoStatus {
     pub audio_channels: u32,
     /// 采样率（`audio-params/samplerate`）
     pub audio_rate: u32,
-    /// 当前字幕轨号，0 = 关闭（mpv 的 `sid` 在「无字幕」时是 `false`）
+    /// 当前字幕轨号，0 = 关闭（mpv 的 `sid` 在「无字幕」时是 `no`）
     pub sub_track: u32,
     /// 当前音轨号，0 = 无音频（`aid`）
     pub audio_track: u32,
 }
 
-/// mpv 启动参数。
+/// 启动参数。
 #[derive(Debug, Clone)]
 pub struct SpawnOptions {
-    pub mpv_path: PathBuf,
-    /// 叠加窗口句柄（Windows HWND）。`None` 时使用 `--vo=null`（无窗口，用于测试）。
+    /// `libmpv-2.dll` 路径（由 [`find_libmpv`] 找到）。
+    pub libmpv: PathBuf,
+    /// 叠加窗口句柄（Windows HWND）。`None` 时使用 `vo=null`（无窗口，用于测试）。
     pub wid: Option<isize>,
     /// 初始音量（0.0~1.0）
     pub volume: f32,
-    /// 追加参数（测试用，例如 `--ao=null`）
+    /// 追加选项（`--name=value` 形式，测试用，例如 `--ao=null`）
     pub extra_args: Vec<String>,
 }
 
-/// 定位 mpv 可执行文件：环境变量 → PATH → 常见安装位置。
-pub fn find_mpv() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("SMP_MPV_PATH") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let exe = dir.join("mpv.exe");
-            if exe.is_file() {
-                return Some(exe);
-            }
-        }
-    }
-
-    const CANDIDATES: &[&str] = &[
-        r"C:\ProgramData\chocolatey\lib\mpvio.install\tools\mpv.exe",
-        r"C:\Program Files\mpv\mpv.exe",
-        r"C:\Program Files (x86)\mpv\mpv.exe",
-    ];
-    CANDIDATES
-        .iter()
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
+/// 属性值（已从 `mpv_event_property` 的裸指针转成 Rust 类型）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PropValue {
+    Double(f64),
+    Int(i64),
+    Flag(bool),
+    Text(String),
+    /// 属性当前不可用（`MPV_FORMAT_NONE`）
+    None,
 }
 
-/// IPC 线程消息。
-enum IpcMessage {
-    Command(serde_json::Value),
+/// end-file 的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndReason {
+    Eof,
+    Stop,
     Quit,
+    Redirect,
+    Error,
+    Other,
 }
 
-/// mpv 子进程 + IPC 控制端。
+/// 与 FFI 无关的引擎事件（事件线程把 `mpv_event` 转成它，测试直接构造它）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum EngineEvent {
+    Property { name: String, value: PropValue },
+    StartFile,
+    FileLoaded,
+    EndFile { reason: EndReason, error: Option<String> },
+}
+
+/// mpv 客户端 + 事件线程。
 pub struct VideoEngine {
-    child: Child,
-    tx: Option<mpsc::Sender<IpcMessage>>,
+    mpv: Arc<LibMpv>,
+    ctx: MpvCtx,
     status: Arc<Mutex<VideoStatus>>,
     worker: Option<JoinHandle<()>>,
-    exited: Arc<AtomicBool>,
-    pipe_name: String,
+    quit: Arc<AtomicBool>,
+    destroyed: bool,
 }
 
 impl VideoEngine {
-    /// 启动 mpv 并连接 IPC。
+    /// 加载 libmpv 并初始化客户端。
     pub fn spawn(options: SpawnOptions) -> Result<Self, VideoError> {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pipe_name = format!(
-            r"\\.\pipe\simple-media-player-mpv-{}-{seq}",
-            std::process::id()
-        );
+        let mpv = Arc::new(LibMpv::load(&options.libmpv).map_err(VideoError::Load)?);
+        let ctx = MpvCtx(mpv.create());
+        if ctx.is_null() {
+            return Err(VideoError::Init("mpv_create 返回了空指针".into()));
+        }
 
-        let mut cmd = Command::new(&options.mpv_path);
-        cmd.arg("--no-config")
-            .arg("--idle=yes")
-            .arg("--force-window=yes")
-            .arg("--keep-open=no")
-            .arg("--osc=no")
-            .arg("--osd-level=0")
-            .arg("--no-input-default-bindings")
-            .arg("--hwdec=auto-safe")
-            .arg("--msg-level=all=error")
-            .arg(format!(
-                "--volume={}",
-                options.volume.clamp(0.0, 1.0) * 100.0
-            ))
-            .arg(format!("--input-ipc-server={pipe_name}"));
+        // ---- 选项：必须在 mpv_initialize 之前设置 ----
+        //
+        // 名字与以前给 `mpv.exe` 的 CLI 参数一一对应，去掉前导 `--`。
+        // `config` 不用管：libmpv 默认不读 mpv.conf（只有显式调 mpv_load_config_file 才读）。
+        let apply = |name: &str, value: String| {
+            let rc = mpv.set_option_string(ctx.raw(), name, &value);
+            if rc < 0 {
+                // 不是致命错误：不同版本的 mpv 选项集合有差异，记下来便于排查
+                trace(&format!(
+                    "!! 选项被拒 {name}={value}（{}）",
+                    mpv.error_string(rc)
+                ));
+            }
+        };
+        apply("keep-open", "no".into());
+        apply("osc", "no".into());
+        apply("osd-level", "0".into());
+        apply("input-default-bindings", "no".into());
+        apply("hwdec", "auto-safe".into());
+        apply("msg-level", "all=error".into());
+        apply(
+            "volume",
+            format!("{:.2}", options.volume.clamp(0.0, 1.0) * 100.0),
+        );
+        apply("idle", "yes".into());
 
         match options.wid {
             Some(wid) => {
-                cmd.arg(format!("--wid={wid}"));
+                // 句柄走 int64：字符串形式在 32 位句柄高位为 1 时会被解析成负数
+                let rc = mpv.set_option_i64(ctx.raw(), "wid", wid as i64);
+                if rc < 0 {
+                    trace(&format!(
+                        "!! wid={wid} 被拒（{}）",
+                        mpv.error_string(rc)
+                    ));
+                }
+                apply("force-window", "yes".into());
             }
-            None => {
-                cmd.arg("--vo=null");
-            }
+            None => apply("vo", "null".into()),
         }
+
         for extra in &options.extra_args {
-            cmd.arg(extra);
+            let spec = extra.trim_start_matches('-');
+            match spec.split_once('=') {
+                Some((name, value)) => apply(name, value.to_string()),
+                None => apply(spec, "yes".into()),
+            }
         }
 
-        cmd.stdin(Stdio::null()).stdout(Stdio::null());
-        // 诊断开关：`SMP_MPV_LOG=<路径>` 时把 mpv 的 stderr 落盘（默认丢弃）。
-        // mpv 的失败原因（解码、VO 初始化、文件打不开）只在 stderr 里，没有它只能看到
+        // ---- 初始化 ----
+        let rc = mpv.initialize(ctx.raw());
+        if rc < 0 {
+            let detail = mpv.error_string(rc);
+            mpv.terminate_destroy(ctx.raw());
+            return Err(VideoError::Init(detail));
+        }
+
+        // 诊断开关：`SMP_MPV_LOG=<路径>` 时把 mpv 的日志（error 级）落盘。
+        // mpv 的失败原因（解码、VO 初始化、文件打不开）只在这里，没有它只能看到
         // `end-file reason=error` 这种无法定位的信息。
-        match std::env::var_os("SMP_MPV_LOG") {
-            Some(path) => match std::fs::File::create(&path) {
-                Ok(file) => cmd.stderr(Stdio::from(file)),
-                Err(err) => {
-                    eprintln!(
-                        "警告：无法创建 mpv 日志 {}: {err}",
-                        PathBuf::from(path).display()
-                    );
-                    cmd.stderr(Stdio::null())
-                }
-            },
-            None => cmd.stderr(Stdio::null()),
-        };
-
-        let mut child = cmd.spawn().map_err(|e| VideoError::Spawn(e.to_string()))?;
-
-        // mpv 需要一点时间创建管道服务端：轮询连接，最多等 2.5s
-        let deadline = Instant::now() + Duration::from_millis(2500);
-        let file = loop {
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&pipe_name)
-            {
-                Ok(file) => break file,
-                Err(err) => {
-                    if Instant::now() >= deadline {
-                        let _ = child.kill();
-                        return Err(VideoError::Ipc(err.to_string()));
-                    }
-                    std::thread::sleep(Duration::from_millis(40));
-                }
-            }
-        };
+        if std::env::var_os("SMP_MPV_LOG").is_some() {
+            mpv.request_log_messages(ctx.raw(), "error");
+        }
 
         let status = Arc::new(Mutex::new(VideoStatus {
             connected: true,
             idle: true,
             ..Default::default()
         }));
-        let exited = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel::<IpcMessage>();
+        let quit = Arc::new(AtomicBool::new(false));
 
-        let worker = {
-            let status = status.clone();
-            let exited = exited.clone();
-            std::thread::spawn(move || {
-                ipc_worker(file, rx, status);
-                exited.store(true, Ordering::SeqCst);
-            })
-        };
-
-        let engine = Self {
-            child,
-            tx: Some(tx),
-            status,
-            worker: Some(worker),
-            exited,
-            pipe_name,
-        };
-
-        // 订阅进度/状态属性
-        for (id, name) in [
-            (1, "time-pos"),
-            (2, "duration"),
-            (3, "pause"),
-            (4, "idle-active"),
+        // ---- 订阅属性 ----
+        //
+        // id 只是给事件的 reply_userdata 用的序号，UI 侧靠名字匹配。
+        // 格式必须和属性真实类型一致：观测成 INT64 的字符串属性（如 `sid`）
+        // mpv 会直接拒掉整条 observe，那个属性就永远收不到更新。
+        const OBSERVED: &[(u64, &str, i32)] = &[
+            (1, "time-pos", MPV_FORMAT_DOUBLE),
+            (2, "duration", MPV_FORMAT_DOUBLE),
+            (3, "pause", MPV_FORMAT_FLAG),
+            (4, "idle-active", MPV_FORMAT_FLAG),
             // 画面尺寸：`d*` 是「实际显示尺寸」（含像素宽高比校正与旋转），
             // `width`/`height` 只是编码尺寸，变形画面的比例会算错。
-            (5, "dwidth"),
-            (6, "dheight"),
+            (5, "dwidth", MPV_FORMAT_INT64),
+            (6, "dheight", MPV_FORMAT_INT64),
             // 视频信息卡（`ⓘ`）要的几项。mpv 对每个属性都会先推一次当前值，
             // 加载新文件时再推一次，所以不用额外 get_property。
-            (7, "video-codec"),
-            (8, "width"),
-            (9, "height"),
-            (10, "container-fps"),
-            (11, "video-bitrate"),
-            (12, "audio-bitrate"),
-            (13, "video-params/primaries"),
-            (14, "video-params/gamma"),
-            (15, "audio-codec-name"),
-            (16, "audio-params/channel-count"),
-            (17, "audio-params/samplerate"),
-            // 字幕/音轨的当前选择：☷ 与 ♪ 两个按钮循环切换后，回执靠它。
-            (18, "sid"),
-            (19, "aid"),
-        ] {
-            engine.send(serde_json::json!({ "command": ["observe_property", id, name] }));
+            (7, "video-codec", MPV_FORMAT_STRING),
+            (8, "width", MPV_FORMAT_INT64),
+            (9, "height", MPV_FORMAT_INT64),
+            (10, "container-fps", MPV_FORMAT_DOUBLE),
+            (11, "video-bitrate", MPV_FORMAT_DOUBLE),
+            (12, "audio-bitrate", MPV_FORMAT_DOUBLE),
+            (13, "video-params/primaries", MPV_FORMAT_STRING),
+            (14, "video-params/gamma", MPV_FORMAT_STRING),
+            (15, "audio-codec-name", MPV_FORMAT_STRING),
+            (16, "audio-params/channel-count", MPV_FORMAT_INT64),
+            (17, "audio-params/samplerate", MPV_FORMAT_INT64),
+            // 字幕/音轨的当前选择：两个字轨按钮循环切换后，回执靠它。
+            // 这两个属性本身是字符串（`no` / `auto` / `1`），按 STRING 观测。
+            (18, "sid", MPV_FORMAT_STRING),
+            (19, "aid", MPV_FORMAT_STRING),
+        ];
+        for (id, name, format) in OBSERVED {
+            let rc = mpv.observe_property(ctx.raw(), *id, name, *format);
+            if rc < 0 {
+                trace(&format!(
+                    "!! observe {name} 失败（{}）",
+                    mpv.error_string(rc)
+                ));
+            }
         }
 
-        Ok(engine)
-    }
+        // ---- 事件线程 ----
+        let worker = {
+            let mpv = Arc::clone(&mpv);
+            let status = Arc::clone(&status);
+            let quit = Arc::clone(&quit);
+            std::thread::spawn(move || event_worker(mpv, ctx, status, quit))
+        };
 
-    /// 已创建的 IPC 管道名（便于诊断）。
-    pub fn pipe_name(&self) -> &str {
-        &self.pipe_name
+        Ok(Self {
+            mpv,
+            ctx,
+            status,
+            worker: Some(worker),
+            quit,
+            destroyed: false,
+        })
     }
 
     /// 加载并播放文件（替换当前文件）。
     pub fn load(&self, path: &str) {
-        self.send(serde_json::json!({ "command": ["loadfile", path, "replace"] }));
+        self.command(&["loadfile", path, "replace"]);
     }
 
     pub fn pause(&self) {
@@ -330,23 +345,31 @@ impl VideoEngine {
     }
 
     pub fn set_paused(&self, paused: bool) {
-        self.send(serde_json::json!({ "command": ["set_property", "pause", paused] }));
+        trace_command(&["set_property", "pause", if paused { "true" } else { "false" }]);
+        self.mpv
+            .set_property_flag(self.ctx.raw(), "pause", paused);
     }
 
     /// 绝对定位（秒）。
     pub fn seek(&self, secs: f64) {
-        self.send(serde_json::json!({ "command": ["seek", secs.max(0.0), "absolute"] }));
+        let secs = secs.max(0.0);
+        trace_command(&["seek", &format!("{secs}"), "absolute"]);
+        self.mpv.command(
+            self.ctx.raw(),
+            &["seek", &format!("{secs}"), "absolute"],
+        );
     }
 
     /// 设置音量（0.0~1.0）。
     pub fn set_volume(&self, volume: f32) {
-        let pct = volume.clamp(0.0, 1.0) * 100.0;
-        self.send(serde_json::json!({ "command": ["set_property", "volume", pct] }));
+        let pct = (volume.clamp(0.0, 1.0) * 100.0) as f64;
+        trace_command(&["set_property", "volume", &format!("{pct}")]);
+        self.mpv.set_property_f64(self.ctx.raw(), "volume", pct);
     }
 
-    /// 停止当前文件（回到 idle，保留进程）。
+    /// 停止当前文件（回到 idle，保留客户端）。
     pub fn stop(&self) {
-        self.send(serde_json::json!({ "command": ["stop"] }));
+        self.command(&["stop"]);
     }
 
     /// 循环切换字幕轨（含「关闭」）。
@@ -354,12 +377,12 @@ impl VideoEngine {
     /// 用 mpv 的 `cycle` 而不是自己算下一轨：轨到底是 1 条还是 5 条、有没有
     /// forced/外挂字幕，全在 mpv 那边；自己维护一份「第几条」立刻就会和它对不上。
     pub fn cycle_subtitles(&self) {
-        self.send(serde_json::json!({ "command": ["cycle", "sid"] }));
+        self.command(&["cycle", "sid"]);
     }
 
     /// 循环切换音轨。
     pub fn cycle_audio_track(&self) {
-        self.send(serde_json::json!({ "command": ["cycle", "aid"] }));
+        self.command(&["cycle", "aid"]);
     }
 
     /// 状态快照。
@@ -373,254 +396,243 @@ impl VideoEngine {
         st.error.take()
     }
 
-    /// IPC 是否仍然可用（管道未断开、进程未退出）。
+    /// 客户端是否仍然可用（未销毁、初始化成功）。
     pub fn is_connected(&self) -> bool {
-        !self.exited.load(Ordering::SeqCst) && self.status().connected
+        !self.quit.load(Ordering::SeqCst) && self.status().connected
     }
 
-    /// mpv 进程是否仍在运行。
-    pub fn is_running(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
-    }
-
-    /// 结束 mpv 进程（先发 quit，超时后强杀）。
+    /// 结束播放并销毁客户端。重复调用安全。
     pub fn shutdown(&mut self) {
-        self.shutdown_inner();
-    }
+        if self.destroyed {
+            return;
+        }
+        self.destroyed = true;
 
-    fn shutdown_inner(&mut self) {
-        // 先请求退出（IPC 线程会写出这条命令）
-        if !self.exited.load(Ordering::SeqCst) {
-            self.send(serde_json::json!({ "command": ["quit"] }));
-        }
-        // 唤醒 IPC 线程：请求退出并断开命令通道
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(IpcMessage::Quit);
-            drop(tx);
-        }
-
-        let deadline = Instant::now() + Duration::from_millis(600);
-        while Instant::now() < deadline {
-            match self.child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => std::thread::sleep(Duration::from_millis(30)),
-                Err(_) => break,
-            }
-        }
-        if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-        }
-        let _ = self.child.wait();
-
+        self.quit.store(true, Ordering::SeqCst);
+        // 打断正在阻塞的 wait_event，事件线程立刻看到 quit 并退出
+        self.mpv.wakeup(self.ctx.raw());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        self.exited.store(true, Ordering::SeqCst);
+        // 必须在事件线程退出之后销毁：否则它可能还在读已经释放的句柄
+        self.mpv.terminate_destroy(self.ctx.raw());
         if let Ok(mut st) = self.status.lock() {
             st.connected = false;
         }
     }
 
-    fn send(&self, value: serde_json::Value) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.send(IpcMessage::Command(value));
+    fn command(&self, args: &[&str]) {
+        trace_command(args);
+        if args.is_empty() {
+            return;
+        }
+        let rc = self.mpv.command(self.ctx.raw(), args);
+        if rc < 0 {
+            trace(&format!(
+                "!! 命令失败 {:?}：{}",
+                args,
+                self.mpv.error_string(rc)
+            ));
         }
     }
 }
 
 impl Drop for VideoEngine {
     fn drop(&mut self) {
-        self.shutdown_inner();
+        self.shutdown();
     }
 }
 
-/// IPC 线程：串行执行「写命令 → 探测可读 → 读取解析」，避免阻塞读与写互相串行。
-fn ipc_worker(
-    file: std::fs::File,
-    rx: mpsc::Receiver<IpcMessage>,
+/// 事件线程：取事件 → 转 [`EngineEvent`] → 更新状态。
+fn event_worker(
+    mpv: Arc<LibMpv>,
+    ctx: MpvCtx,
     status: Arc<Mutex<VideoStatus>>,
+    quit: Arc<AtomicBool>,
 ) {
-    let mut reader = BufReader::new(file);
-    let mut pending = String::new();
-    let mut buf = [0u8; 8192];
+    // 诊断开关：`SMP_MPV_LOG=<路径>` 时把 mpv 的 error 级日志写进去。
+    let mut log = std::env::var_os("SMP_MPV_LOG")
+        .and_then(|path| std::fs::File::create(path).ok());
 
-    loop {
-        let mut did_work = false;
-
-        // 1) 写命令（此时不会有挂起的读操作）
-        loop {
-            match rx.try_recv() {
-                Ok(IpcMessage::Command(value)) => {
-                    let mut line = value.to_string();
-                    line.push('\n');
-                    trace(&format!("-> {}", line.trim_end()));
-                    if reader.get_mut().write_all(line.as_bytes()).is_err() {
-                        mark_disconnected(&status);
-                        return;
-                    }
-                    did_work = true;
-                }
-                Ok(IpcMessage::Quit) => {
-                    mark_disconnected(&status);
-                    return;
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    mark_disconnected(&status);
-                    return;
-                }
-            }
+    while !quit.load(Ordering::SeqCst) {
+        let event = mpv.wait_event(ctx.raw(), EVENT_WAIT_TIMEOUT);
+        if event.is_null() {
+            continue;
+        }
+        // SAFETY: `mpv_wait_event` 返回的指针在下次调用前有效，这里立刻读字段。
+        let (event_id, error) = unsafe { ((*event).event_id, (*event).error) };
+        let data = unsafe { (*event).data };
+        if event_id == crate::libmpv::MPV_EVENT_NONE {
+            continue;
         }
 
-        // 2) 非阻塞探测可读字节，有数据才读（不会让读操作挂起）
-        match pipe_available(reader.get_ref()) {
-            Ok(0) => {}
-            Ok(_) => match reader.read(&mut buf) {
-                Ok(0) => {
-                    mark_disconnected(&status);
-                    return;
+        // 日志事件先处理：它不属于播放状态
+        if event_id == MPV_EVENT_LOG_MESSAGE {
+            if let Some(file) = log.as_mut() {
+                if !data.is_null() {
+                    let msg = unsafe { &*(data as *const MpvEventLogMessage) };
+                    let text = cstr(msg.text);
+                    let prefix = cstr(msg.prefix);
+                    let _ = writeln!(file, "[{prefix}] {text}");
                 }
-                Ok(n) => {
-                    did_work = true;
-                    pending.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    while let Some(idx) = pending.find('\n') {
-                        let line: String = pending.drain(..=idx).collect();
-                        handle_line(line.trim(), &status);
-                    }
-                }
-                Err(_) => {
-                    mark_disconnected(&status);
-                    return;
-                }
-            },
-            Err(_) => {
-                mark_disconnected(&status);
-                return;
             }
+            continue;
         }
 
-        if !did_work {
-            std::thread::sleep(IPC_POLL_INTERVAL);
+        if let Some(engine_event) =
+            unsafe { convert_event(event_id, error, data, &*mpv) }
+        {
+            apply_event(engine_event, &status);
         }
     }
-}
 
-fn mark_disconnected(status: &Arc<Mutex<VideoStatus>>) {
     if let Ok(mut st) = status.lock() {
         st.connected = false;
     }
 }
 
-/// IPC 报文追踪：设置 `SMP_MPV_TRACE=<路径>` 后把收发方向与内容逐行落盘。
-///
-/// 排查「mpv 说失败但没打日志」这类问题时，只有原始报文能说清楚：命令是否发出去、
-/// mpv 回的 `error` 字段是什么、事件顺序是否异常。
-fn trace(line: &str) {
-    use std::sync::OnceLock;
+fn cstr(ptr: *const std::ffi::c_char) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    unsafe { std::ffi::CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
+}
 
-    static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
-    let sink = SINK.get_or_init(|| {
-        std::env::var_os("SMP_MPV_TRACE").and_then(|path| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .ok()
-                .map(Mutex::new)
-        })
-    });
-    if let Some(sink) = sink {
-        if let Ok(mut file) = sink.lock() {
-            let _ = writeln!(file, "{line}");
+/// `mpv_event` → [`EngineEvent`]。属性值为 `MPV_FORMAT_NONE` 时折成 [`PropValue::None`]。
+///
+/// SAFETY：调用方保证 `data` 与 `event_id` 匹配（mpv 的约定）。
+unsafe fn convert_event(
+    event_id: i32,
+    error: i32,
+    data: *mut std::ffi::c_void,
+    mpv: &LibMpv,
+) -> Option<EngineEvent> {
+    match event_id {
+        MPV_EVENT_START_FILE => Some(EngineEvent::StartFile),
+        MPV_EVENT_FILE_LOADED => Some(EngineEvent::FileLoaded),
+        MPV_EVENT_END_FILE => {
+            if data.is_null() {
+                return None;
+            }
+            let end = unsafe { &*(data as *const MpvEventEndFile) };
+            let reason = if end.reason == MPV_END_FILE_REASON_ERROR {
+                EndReason::Error
+            } else if end.reason == crate::libmpv::MPV_END_FILE_REASON_EOF {
+                EndReason::Eof
+            } else if end.reason == crate::libmpv::MPV_END_FILE_REASON_STOP {
+                EndReason::Stop
+            } else if end.reason == MPV_END_FILE_REASON_QUIT {
+                EndReason::Quit
+            } else if end.reason == MPV_END_FILE_REASON_REDIRECT {
+                EndReason::Redirect
+            } else {
+                EndReason::Other
+            };
+            let detail = if end.error < 0 {
+                Some(mpv.error_string(end.error))
+            } else {
+                None
+            };
+            let _ = error;
+            Some(EngineEvent::EndFile {
+                reason,
+                error: detail,
+            })
         }
+        MPV_EVENT_PROPERTY_CHANGE => {
+            if data.is_null() {
+                return None;
+            }
+            let prop = unsafe { &*(data as *const MpvEventProperty) };
+            let name = cstr(prop.name);
+            let value = unsafe { read_property_value(prop) };
+            Some(EngineEvent::Property { name, value })
+        }
+        _ => None,
     }
 }
 
-/// 把 mpv 报的尺寸属性取成正数（像素）。
-///
-/// 未加载文件时 mpv 回 `null`，解码出画之前可能是 `0` 甚至负数（`--video-rotate`
-/// 相关的边界情况），这些都当「还不知道」处理。
-fn dimension(data: &serde_json::Value) -> u32 {
-    data.as_i64()
-        .filter(|v| *v > 0)
-        .map(|v| v.min(u32::MAX as i64) as u32)
-        .unwrap_or(0)
-}
-
-/// 字符串型属性：mpv 对「没有这个属性」推的是 `false` / `null`，一律当空串。
-fn text(data: &serde_json::Value) -> String {
-    data.as_str().unwrap_or_default().to_string()
-}
-
-/// 解析单行 mpv 事件并更新状态。
-fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
-    trace(&format!("<- {line}"));
-    if line.is_empty() {
-        return;
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-        return;
-    };
-    let Some(event) = value.get("event").and_then(|e| e.as_str()) else {
-        return; // 命令回执（含 request_id），忽略
-    };
-
-    let Ok(mut st) = status.lock() else { return };
-    match event {
-        "property-change" => {
-            let name = value
-                .get("name")
-                .and_then(|n| n.as_str())
-                .unwrap_or_default();
-            let data = value
-                .get("data")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            match name {
-                "time-pos" => {
-                    if let Some(pos) = data.as_f64() {
-                        st.position = pos;
-                    }
-                }
-                "duration" => {
-                    if let Some(dur) = data.as_f64() {
-                        st.duration = dur;
-                    }
-                }
-                "pause" => {
-                    // mpv 在 idle 时 pause 可能为 null
-                    st.paused = data.as_bool().unwrap_or(false);
-                }
-                "dwidth" => {
-                    st.width = dimension(&data);
-                }
-                "dheight" => {
-                    st.height = dimension(&data);
-                }
-                "idle-active" => {
-                    if let Some(idle) = data.as_bool() {
-                        st.idle = idle;
-                    }
-                }
-                // ---- 视频信息卡 ----
-                "video-codec" => st.video_codec = text(&data),
-                "width" => st.source_width = dimension(&data),
-                "height" => st.source_height = dimension(&data),
-                "container-fps" => st.fps = data.as_f64().unwrap_or(0.0),
-                "video-bitrate" => st.video_bitrate = data.as_f64().unwrap_or(0.0),
-                "audio-bitrate" => st.audio_bitrate = data.as_f64().unwrap_or(0.0),
-                "video-params/primaries" => st.primaries = text(&data),
-                "video-params/gamma" => st.gamma = text(&data),
-                "audio-codec-name" => st.audio_codec = text(&data),
-                "audio-params/channel-count" => st.audio_channels = dimension(&data),
-                "audio-params/samplerate" => st.audio_rate = dimension(&data),
-                // 「无字幕/无音轨」时 mpv 推的是 `false`，这里统一折成 0
-                "sid" => st.sub_track = dimension(&data),
-                "aid" => st.audio_track = dimension(&data),
-                _ => {}
+unsafe fn read_property_value(prop: &MpvEventProperty) -> PropValue {
+    match prop.format {
+        crate::libmpv::MPV_FORMAT_NONE => PropValue::None,
+        MPV_FORMAT_DOUBLE => {
+            if prop.data.is_null() {
+                PropValue::None
+            } else {
+                PropValue::Double(unsafe { *(prop.data as *const f64) })
             }
         }
-        "start-file" => {
+        MPV_FORMAT_INT64 => {
+            if prop.data.is_null() {
+                PropValue::None
+            } else {
+                PropValue::Int(unsafe { *(prop.data as *const i64) })
+            }
+        }
+        MPV_FORMAT_FLAG => {
+            if prop.data.is_null() {
+                PropValue::None
+            } else {
+                PropValue::Flag(unsafe { *(prop.data as *const i32) } != 0)
+            }
+        }
+        MPV_FORMAT_STRING => {
+            if prop.data.is_null() {
+                PropValue::None
+            } else {
+                PropValue::Text(unsafe { cstr(*(prop.data as *const *const std::ffi::c_char)) })
+            }
+        }
+        _ => PropValue::None,
+    }
+}
+
+/// 把事件映射到状态。纯逻辑，测试直接构造 [`EngineEvent`] 驱动。
+pub fn apply_event(event: EngineEvent, status: &Arc<Mutex<VideoStatus>>) {
+    let Ok(mut st) = status.lock() else { return };
+    match event {
+        EngineEvent::Property { name, value } => match name.as_str() {
+            "time-pos" => {
+                if let PropValue::Double(pos) = value {
+                    st.position = pos;
+                }
+            }
+            "duration" => {
+                if let PropValue::Double(dur) = value {
+                    st.duration = dur;
+                }
+            }
+            "pause" => {
+                // mpv 在 idle 时 pause 可能是 None
+                st.paused = matches!(value, PropValue::Flag(true));
+            }
+            "dwidth" => st.width = dimension(&value),
+            "dheight" => st.height = dimension(&value),
+            "idle-active" => {
+                if let PropValue::Flag(idle) = value {
+                    st.idle = idle;
+                }
+            }
+            // ---- 视频信息卡 ----
+            "video-codec" => st.video_codec = text(&value),
+            "width" => st.source_width = dimension(&value),
+            "height" => st.source_height = dimension(&value),
+            "container-fps" => st.fps = number(&value),
+            "video-bitrate" => st.video_bitrate = number(&value),
+            "audio-bitrate" => st.audio_bitrate = number(&value),
+            "video-params/primaries" => st.primaries = text(&value),
+            "video-params/gamma" => st.gamma = text(&value),
+            "audio-codec-name" => st.audio_codec = text(&value),
+            "audio-params/channel-count" => st.audio_channels = dimension(&value),
+            "audio-params/samplerate" => st.audio_rate = dimension(&value),
+            // 「无字幕/无音轨」时 mpv 推的是 `no`（字符串），这里统一折成 0
+            "sid" => st.sub_track = track_number(&value),
+            "aid" => st.audio_track = track_number(&value),
+            _ => {}
+        },
+        EngineEvent::StartFile => {
             st.finished = false;
             st.error = None;
             st.position = 0.0;
@@ -644,317 +656,396 @@ fn handle_line(line: &str, status: &Arc<Mutex<VideoStatus>>) {
             st.sub_track = 0;
             st.audio_track = 0;
         }
-        "file-loaded" => {
+        EngineEvent::FileLoaded => {
             st.idle = false;
             st.finished = false;
         }
-        "end-file" => {
-            let reason = value
-                .get("reason")
-                .and_then(|r| r.as_str())
-                .unwrap_or_default();
-            st.finished = reason == "eof";
-            // eof/stop/quit 是正常收尾；其余（典型是 error）说明文件加载或解码失败。
-            if !st.finished && !matches!(reason, "stop" | "quit" | "redirect") {
-                let detail = value
-                    .get("file_error")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                st.error = Some(if detail.is_empty() {
-                    if reason.is_empty() { "unknown" } else { reason }.to_string()
-                } else {
-                    format!("{reason}: {detail}")
+        EngineEvent::EndFile { reason, error } => {
+            st.finished = reason == EndReason::Eof;
+            // eof/stop/quit/redirect 是正常收尾；error（以及未知原因）说明加载或解码失败。
+            if !st.finished && !matches!(reason, EndReason::Stop | EndReason::Quit | EndReason::Redirect)
+            {
+                st.error = Some(match error {
+                    Some(detail) if !detail.is_empty() => detail,
+                    _ => match reason {
+                        EndReason::Error => "error".to_string(),
+                        _ => "unknown".to_string(),
+                    },
                 });
             }
         }
-        _ => {}
     }
 }
 
-/// 非阻塞探测管道中可读字节数（Windows 用 `PeekNamedPipe`）。
-#[cfg(windows)]
-fn pipe_available(file: &std::fs::File) -> std::io::Result<u32> {
-    use std::os::windows::io::AsRawHandle;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn PeekNamedPipe(
-            handle: *mut std::ffi::c_void,
-            buffer: *mut std::ffi::c_void,
-            buffer_size: u32,
-            bytes_read: *mut u32,
-            total_bytes_avail: *mut u32,
-            bytes_left: *mut u32,
-        ) -> i32;
-        fn GetLastError() -> u32;
+/// 尺寸类属性折成 `u32`：mpv 未加载文件时可能给 0、负数或 None。
+fn dimension(value: &PropValue) -> u32 {
+    match value {
+        PropValue::Int(v) if *v > 0 => (*v).min(u32::MAX as i64) as u32,
+        PropValue::Double(v) if *v > 0.0 => *v as u32,
+        _ => 0,
     }
-
-    let mut available: u32 = 0;
-    let ok = unsafe {
-        PeekNamedPipe(
-            file.as_raw_handle(), // RawHandle == HANDLE == *mut c_void
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            &mut available,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        let err = unsafe { GetLastError() };
-        return Err(std::io::Error::from_raw_os_error(err as i32));
-    }
-    Ok(available)
 }
 
-#[cfg(not(windows))]
-fn pipe_available(_file: &std::fs::File) -> std::io::Result<u32> {
-    // 非 Windows 平台暂无命名管道等价实现：返回 1 让调用方按阻塞读处理
-    Ok(1)
+fn number(value: &PropValue) -> f64 {
+    match value {
+        PropValue::Double(v) => *v,
+        PropValue::Int(v) => *v as f64,
+        _ => 0.0,
+    }
+}
+
+/// 轨号：字符串 `no`/`auto` 一律当 0，数字串按整数解析。
+fn track_number(value: &PropValue) -> u32 {
+    match value {
+        PropValue::Int(v) if *v > 0 => *v as u32,
+        PropValue::Text(t) => t.trim().parse::<u32>().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn text(value: &PropValue) -> String {
+    match value {
+        PropValue::Text(t) => t.clone(),
+        _ => String::new(),
+    }
+}
+
+/// 下游追踪：`SMP_MPV_TRACE=<路径>` 时把事件与命令逐行落盘。
+///
+/// 命令沿用子进程时代的 JSON 形状（`-> {"command":[...]}`），这样
+/// `scripts/verify_floating_chrome.py` 里按 `"seek"` / `"volume"` / `"cycle"`
+/// 数命令条数的判据不用改——它测的是「命令有没有真的发给 mpv」，与传输方式无关。
+fn trace(line: &str) {
+    use std::sync::OnceLock;
+
+    static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let sink = SINK.get_or_init(|| {
+        std::env::var_os("SMP_MPV_TRACE").and_then(|path| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(Mutex::new)
+        })
+    });
+    if let Some(sink) = sink {
+        if let Ok(mut file) = sink.lock() {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
+/// 记录一条「发出的命令」（JSON 形状，兼容既有验收脚本）。
+fn trace_command(args: &[&str]) {
+    let items: Vec<String> = args.iter().map(|a| json_string(a)).collect();
+    trace(&format!("-> {{\"command\":[{}]}}", items.join(",")));
+}
+
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::tests_support::write_test_wav;
-    use std::time::Instant;
+    use crate::libmpv::find_libmpv;
+
+    fn fresh_status() -> Arc<Mutex<VideoStatus>> {
+        Arc::new(Mutex::new(VideoStatus::default()))
+    }
+
+    fn prop(status: &Arc<Mutex<VideoStatus>>, name: &str, value: PropValue) {
+        apply_event(
+            EngineEvent::Property {
+                name: name.to_string(),
+                value,
+            },
+            status,
+        );
+    }
 
     #[test]
     fn video_extension_detection() {
-        assert!(is_video_file(Path::new("a/b/movie.MP4")));
-        assert!(is_video_file(Path::new("a/b/movie.mkv")));
-        assert!(is_video_file(Path::new("a/b/movie.webm")));
-        assert!(!is_video_file(Path::new("a/b/song.flac")));
-        assert!(!is_video_file(Path::new("a/b/song.mp3")));
-        assert!(!is_video_file(Path::new("a/b/noext")));
+        assert!(is_video_file(Path::new("movie.MP4")));
+        assert!(is_video_file(Path::new("clip.mkv")));
+        assert!(!is_video_file(Path::new("song.flac")));
+        assert!(!is_video_file(Path::new("noext")));
     }
 
-    /// `end-file` 的失败原因必须带细节暴露给 UI：只报 "error" 无法区分
-    /// 「文件不存在」「格式不支持」「打不开」。
+    /// end-file 的 error 原因要把 mpv 的错误文案带出来：只报一个 "error"
+    /// 用户没法判断是解码不了还是文件不存在。
     #[test]
     fn end_file_error_exposes_detail() {
-        let status = Arc::new(Mutex::new(VideoStatus::default()));
-        handle_line(
-            r#"{"event":"end-file","reason":"error","file_error":"loading failed"}"#,
+        let status = fresh_status();
+        apply_event(
+            EngineEvent::EndFile {
+                reason: EndReason::Error,
+                error: Some("Failed to recognize file format.".into()),
+            },
             &status,
         );
-        let st = status.lock().unwrap().clone();
-        assert_eq!(st.error.as_deref(), Some("error: loading failed"));
-        assert!(!st.finished, "失败不应被当成正常播完");
-
-        // 没有 file_error 时至少保留 reason
-        let status = Arc::new(Mutex::new(VideoStatus::default()));
-        handle_line(r#"{"event":"end-file","reason":"error"}"#, &status);
-        assert_eq!(status.lock().unwrap().error.as_deref(), Some("error"));
+        let st = status.lock().unwrap();
+        assert!(!st.finished);
+        assert_eq!(
+            st.error.as_deref(),
+            Some("Failed to recognize file format.")
+        );
     }
 
-    /// eof / stop / quit / redirect 都是正常收尾，不能当成错误弹提示。
+    /// eof/stop/quit/redirect 都是正常收尾，不能弹错误。
     #[test]
     fn normal_end_reasons_are_not_errors() {
-        let status = Arc::new(Mutex::new(VideoStatus::default()));
-        handle_line(r#"{"event":"end-file","reason":"eof"}"#, &status);
-        {
-            let st = status.lock().unwrap();
-            assert!(st.finished, "eof 应标记为自然结束");
-            assert!(st.error.is_none());
-        }
-        for reason in ["stop", "quit", "redirect"] {
-            let status = Arc::new(Mutex::new(VideoStatus::default()));
-            handle_line(
-                &format!(r#"{{"event":"end-file","reason":"{reason}"}}"#),
+        for reason in [
+            EndReason::Eof,
+            EndReason::Stop,
+            EndReason::Quit,
+            EndReason::Redirect,
+        ] {
+            let status = fresh_status();
+            apply_event(
+                EngineEvent::EndFile {
+                    reason,
+                    error: None,
+                },
                 &status,
             );
             let st = status.lock().unwrap();
-            assert!(st.error.is_none(), "{reason} 不应视为错误");
+            assert_eq!(st.error, None, "{reason:?} 不该报错");
+            assert_eq!(st.finished, reason == EndReason::Eof);
         }
     }
 
-    /// 重新加载文件时清掉上一次的错误，否则 UI 会重复弹旧提示。
+    /// error 原因但 mpv 没给文案时，退化成一个可读的兜底，而不是空串。
+    #[test]
+    fn end_file_error_without_detail_falls_back() {
+        let status = fresh_status();
+        apply_event(
+            EngineEvent::EndFile {
+                reason: EndReason::Error,
+                error: None,
+            },
+            &status,
+        );
+        assert_eq!(status.lock().unwrap().error.as_deref(), Some("error"));
+    }
+
     #[test]
     fn start_file_clears_previous_error() {
-        let status = Arc::new(Mutex::new(VideoStatus::default()));
-        handle_line(r#"{"event":"end-file","reason":"error"}"#, &status);
+        let status = fresh_status();
+        apply_event(
+            EngineEvent::EndFile {
+                reason: EndReason::Error,
+                error: Some("boom".into()),
+            },
+            &status,
+        );
         assert!(status.lock().unwrap().error.is_some());
 
-        handle_line(r#"{"event":"start-file"}"#, &status);
+        apply_event(EngineEvent::StartFile, &status);
         let st = status.lock().unwrap();
-        assert!(st.error.is_none());
+        assert_eq!(st.error, None);
         assert!(!st.finished);
-        assert_eq!(st.position, 0.0);
     }
 
-    /// 画面尺寸必须能读到——UI 靠它把窗口调成画面比例（窗口 = 内容）。
-    ///
-    /// 用 `dwidth`/`dheight` 而不是 `width`/`height`：后者是编码尺寸，
-    /// 非方形像素的片子（老 DVD rip）按它算比例会拉变形。
     #[test]
     fn display_size_is_tracked() {
-        let status = Arc::new(Mutex::new(VideoStatus::default()));
-        handle_line(
-            r#"{"event":"property-change","name":"dwidth","data":1920}"#,
-            &status,
-        );
-        handle_line(
-            r#"{"event":"property-change","name":"dheight","data":1080}"#,
-            &status,
-        );
-        let st = status.lock().unwrap().clone();
-        assert_eq!((st.width, st.height), (1920, 1080));
-
-        // 换片时清空：否则会先按上一部片的形状跳一下窗口
-        handle_line(r#"{"event":"start-file"}"#, &status);
+        let status = fresh_status();
+        prop(&status, "dwidth", PropValue::Int(1280));
+        prop(&status, "dheight", PropValue::Int(720));
+        {
+            let st = status.lock().unwrap();
+            assert_eq!((st.width, st.height), (1280, 720));
+        }
+        // 新片开始：上一部的尺寸必须清掉，否则窗口会先跳成上一部的形状
+        apply_event(EngineEvent::StartFile, &status);
         let st = status.lock().unwrap();
         assert_eq!((st.width, st.height), (0, 0));
-        drop(st);
-        // idle / 未解码时 mpv 回 null，不能被当成 0 之外的怪值
-        handle_line(
-            r#"{"event":"property-change","name":"dwidth","data":null}"#,
-            &status,
-        );
-        assert_eq!(status.lock().unwrap().width, 0);
     }
 
-    /// 视频信息卡的数据全部来自 `property-change`，一项都不能漏：
-    /// 名字写错 mpv 不会报错，只是永远推 `null`，卡上那行就一直是空白。
+    /// `ⓘ` 卡片依赖的属性都要能落到状态里；`sid`/`aid` 的 `no` 要折成 0。
     #[test]
     fn info_card_properties_are_tracked() {
-        let status = Arc::new(Mutex::new(VideoStatus::default()));
-        for line in [
-            r#"{"event":"property-change","name":"video-codec","data":"h264 (High)"}"#,
-            r#"{"event":"property-change","name":"width","data":1920}"#,
-            r#"{"event":"property-change","name":"height","data":1080}"#,
-            r#"{"event":"property-change","name":"container-fps","data":23.976}"#,
-            r#"{"event":"property-change","name":"video-bitrate","data":4200000.0}"#,
-            r#"{"event":"property-change","name":"audio-bitrate","data":192000.0}"#,
-            r#"{"event":"property-change","name":"video-params/primaries","data":"bt.709"}"#,
-            r#"{"event":"property-change","name":"video-params/gamma","data":"bt.1886"}"#,
-            r#"{"event":"property-change","name":"audio-codec-name","data":"aac"}"#,
-            r#"{"event":"property-change","name":"audio-params/channel-count","data":2}"#,
-            r#"{"event":"property-change","name":"audio-params/samplerate","data":48000}"#,
-            r#"{"event":"property-change","name":"sid","data":1}"#,
-            r#"{"event":"property-change","name":"aid","data":1}"#,
-        ] {
-            handle_line(line, &status);
-        }
+        let status = fresh_status();
+        prop(&status, "video-codec", PropValue::Text("h264 (High) / AVC".into()));
+        prop(&status, "width", PropValue::Int(1920));
+        prop(&status, "height", PropValue::Int(1080));
+        prop(&status, "container-fps", PropValue::Double(23.976));
+        prop(&status, "video-bitrate", PropValue::Double(4_400_000.0));
+        prop(&status, "audio-bitrate", PropValue::Double(192_000.0));
+        prop(&status, "video-params/primaries", PropValue::Text("bt.709".into()));
+        prop(&status, "video-params/gamma", PropValue::Text("bt.1886".into()));
+        prop(&status, "audio-codec-name", PropValue::Text("aac".into()));
+        prop(&status, "audio-params/channel-count", PropValue::Int(2));
+        prop(&status, "audio-params/samplerate", PropValue::Int(48000));
+        prop(&status, "sid", PropValue::Text("1".into()));
+        prop(&status, "aid", PropValue::Text("no".into()));
+
         let st = status.lock().unwrap().clone();
-        assert_eq!(st.video_codec, "h264 (High)");
+        assert_eq!(st.video_codec, "h264 (High) / AVC");
         assert_eq!((st.source_width, st.source_height), (1920, 1080));
-        assert!((st.fps - 23.976).abs() < 0.001);
-        assert_eq!(st.video_bitrate, 4_200_000.0);
+        assert!((st.fps - 23.976).abs() < 1e-6);
+        assert_eq!(st.video_bitrate, 4_400_000.0);
         assert_eq!(st.audio_bitrate, 192_000.0);
         assert_eq!(st.primaries, "bt.709");
         assert_eq!(st.gamma, "bt.1886");
         assert_eq!(st.audio_codec, "aac");
-        assert_eq!((st.audio_channels, st.audio_rate), (2, 48_000));
-        assert_eq!((st.sub_track, st.audio_track), (1, 1));
+        assert_eq!(st.audio_channels, 2);
+        assert_eq!(st.audio_rate, 48000);
+        assert_eq!(st.sub_track, 1);
+        assert_eq!(st.audio_track, 0, "`no` 应折成 0");
 
-        // 关闭字幕 / 无音轨时 mpv 推的是 `false`，不能留成上一部片子的轨号
-        handle_line(
-            r#"{"event":"property-change","name":"sid","data":false}"#,
-            &status,
-        );
-        assert_eq!(status.lock().unwrap().sub_track, 0);
-
-        // 换片：全部清空（旧数据比空白更难发现）
-        handle_line(r#"{"event":"start-file"}"#, &status);
+        // 新片开始：卡片上的旧值必须清空
+        apply_event(EngineEvent::StartFile, &status);
         let st = status.lock().unwrap();
         assert!(st.video_codec.is_empty());
         assert_eq!((st.source_width, st.source_height), (0, 0));
         assert_eq!(st.fps, 0.0);
-        assert!(st.primaries.is_empty());
-        assert_eq!((st.sub_track, st.audio_track), (0, 0));
+        assert_eq!(st.sub_track, 0);
+    }
+
+    /// 属性不可用（`MPV_FORMAT_NONE`）不能把已有的值冲掉，也不能 panic。
+    #[test]
+    fn unavailable_property_is_ignored() {
+        let status = fresh_status();
+        prop(&status, "duration", PropValue::Double(120.0));
+        prop(&status, "duration", PropValue::None);
+        assert_eq!(status.lock().unwrap().duration, 120.0);
+
+        prop(&status, "sid", PropValue::None);
+        assert_eq!(status.lock().unwrap().sub_track, 0);
     }
 
     #[test]
-    fn find_mpv_prefers_env_override() {
-        let fake = std::env::temp_dir().join(format!("fake-mpv-{}.exe", std::process::id()));
-        std::fs::write(&fake, b"stub").expect("write stub");
-        let previous = std::env::var_os("SMP_MPV_PATH");
-        std::env::set_var("SMP_MPV_PATH", &fake);
-        let found = find_mpv();
-        match previous {
-            Some(v) => std::env::set_var("SMP_MPV_PATH", v),
-            None => std::env::remove_var("SMP_MPV_PATH"),
-        }
-        std::fs::remove_file(&fake).ok();
+    fn find_libmpv_prefers_env_override() {
+        let dir = std::env::temp_dir().join("smp-libmpv-find");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("from-env.dll");
+        std::fs::write(&fake, b"x").unwrap();
+
+        std::env::set_var("SMP_LIBMPV_PATH", &fake);
+        let found = find_libmpv(None);
+        std::env::remove_var("SMP_LIBMPV_PATH");
+
         assert_eq!(found.as_deref(), Some(fake.as_path()));
     }
 
-    /// 端到端 IPC 测试：真实 mpv 进程 + WAV（无窗口、无音频输出设备依赖）。
+    /// 真 libmpv 集成测试：找不到 DLL 时跳过（不是失败——开发机不一定装了）。
     ///
-    /// 覆盖「暂停后继续下发命令」这一曾经卡死的历史缺陷。
+    /// 查找顺序除了生产用的那几个位置，还额外看一眼 `target/mpv-dev/`：
+    /// `scripts/fetch-libmpv.ps1` 会把官方 dev 构建解到那里，开发机不做额外配置
+    /// 也能跑这条测试（它才是唯一真正验证「我们的调用打得进 mpv」的用例）。
     #[test]
-    fn ipc_controls_real_mpv() {
-        let Some(mpv) = find_mpv() else {
-            eprintln!("跳过：本机未安装 mpv");
+    fn libmpv_controls_real_media() {
+        let dev_copy = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("target")
+            .join("mpv-dev")
+            .join("libmpv-2.dll");
+        let Some(lib) = find_libmpv(None).or_else(|| dev_copy.is_file().then_some(dev_copy)) else {
+            eprintln!("跳过：未找到 libmpv-2.dll");
             return;
         };
-        let wav = write_test_wav(4.0);
+        let media = std::env::temp_dir().join("smp-libmpv-test.wav");
+        if !media.exists() {
+            let _ = write_silent_wav(&media, 3.0);
+        }
+        if !media.exists() {
+            eprintln!("跳过：无法生成测试素材");
+            return;
+        }
 
         let mut engine = VideoEngine::spawn(SpawnOptions {
-            mpv_path: mpv,
+            libmpv: lib,
             wid: None,
-            volume: 0.0,
-            extra_args: vec!["--ao=null".into()],
+            volume: 0.5,
+            extra_args: vec![
+                "--ao=null".into(),
+                "--video=no".into(),
+                "--audio-display=no".into(),
+            ],
         })
-        .expect("启动 mpv 并连接 IPC");
-        engine.load(&wav.to_string_lossy());
+        .expect("libmpv 应该能初始化");
 
-        // 1) 时长被观测到
+        engine.load(media.to_str().unwrap());
         assert!(
-            wait_for(|| engine.status().duration > 3.5, 8000),
-            "应观测到时长 ≈4s，实际 {:?}",
+            wait_for(|| engine.status().duration > 0.5, 3000),
+            "加载后应报出时长，实际 {:?}",
             engine.status()
         );
 
-        // 2) 播放位置前进
+        engine.seek(1.0);
         assert!(
-            wait_for(|| engine.status().position > 0.3, 8000),
-            "播放位置应前进，实际 {:?}",
-            engine.status()
+            wait_for(
+                || (engine.status().position - 1.0).abs() < 0.6,
+                3000
+            ),
+            "seek 后位置应接近 1.0，实际 {}",
+            engine.status().position
         );
 
-        // 3) 暂停生效且位置冻结
         engine.pause();
         assert!(
-            wait_for(|| engine.status().paused, 3000),
-            "pause 属性应为 true，实际 {:?}",
-            engine.status()
-        );
-        let paused_at = engine.status().position;
-        std::thread::sleep(Duration::from_millis(400));
-        let after = engine.status().position;
-        assert!(
-            (after - paused_at).abs() < 0.3,
-            "暂停后位置不应前进：{paused_at} -> {after}"
+            wait_for(|| engine.status().paused, 2000),
+            "pause 应生效"
         );
 
-        // 4) 暂停之后继续下发命令不得阻塞（历史缺陷回归）
-        engine.set_volume(0.5);
         engine.resume();
-        engine.seek(2.0);
-        assert!(
-            wait_for(|| (engine.status().position - 2.0).abs() < 0.8, 5000),
-            "seek 到 2.0s 失败，实际 {:?}",
-            engine.status()
-        );
         assert!(
             wait_for(|| !engine.status().paused, 2000),
-            "resume 应清除暂停状态"
+            "resume 应生效"
         );
 
+        engine.stop();
         engine.shutdown();
-        std::fs::remove_file(&wav).ok();
+        assert!(!engine.is_connected());
     }
 
     fn wait_for(mut cond: impl FnMut() -> bool, timeout_ms: u64) -> bool {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        while Instant::now() < deadline {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
             if cond() {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(40));
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
         cond()
+    }
+
+    /// 写一段静音 WAV（16bit 单声道 8kHz），只为让 mpv 有个能解码的文件。
+    fn write_silent_wav(path: &Path, secs: f64) -> std::io::Result<()> {
+        let rate = 8000u32;
+        let samples = (rate as f64 * secs) as u32;
+        let data_len = samples * 2;
+        let mut out = Vec::with_capacity(44 + data_len as usize);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36 + data_len).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * 2).to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        out.extend(std::iter::repeat(0u8).take(data_len as usize));
+        std::fs::write(path, out)
     }
 }

@@ -9,3 +9,5 @@ serde_json = { workspace = true }
 rodio = "0.21"
 lofty = "0.22"
 thiserror = "2"
+# 运行时加载 libmpv-2.dll（构建机不需要 DLL，找不到也能给出可见提示）
+libloading = "0.8"

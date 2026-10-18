@@ -16,7 +16,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use player_core::{
-    find_mpv, is_video_file, load_track_meta, scan_dir_for_tracks, AudioEngine, PlaybackState,
+    find_libmpv, is_video_file, load_track_meta, scan_dir_for_tracks, AudioEngine, PlaybackState,
     SpawnOptions, TrackMeta, VideoEngine, VideoStatus,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1193,15 +1193,16 @@ impl PlayerView {
             None => true,
         };
         if need_spawn {
-            let Some(mpv) = find_mpv() else {
+            // 进程内 libmpv：只找 DLL，不再起子进程
+            let Some(libmpv) = find_libmpv(None) else {
                 self.video_active = false;
                 self.video_error =
-                    Some("未找到 mpv.exe（可用环境变量 SMP_MPV_PATH 指定路径）".into());
-                self.report_error("视频不可用：未找到 mpv.exe（设置 SMP_MPV_PATH 可指定路径）");
+                    Some("未找到 libmpv-2.dll（可用环境变量 SMP_LIBMPV_PATH 指定路径）".into());
+                self.report_error("视频不可用：未找到 libmpv-2.dll（设置 SMP_LIBMPV_PATH 可指定路径）");
                 return;
             };
             match VideoEngine::spawn(SpawnOptions {
-                mpv_path: mpv,
+                libmpv,
                 wid: Some(wid),
                 volume: self.settings.volume,
                 extra_args: Vec::new(),
@@ -1209,8 +1210,8 @@ impl PlayerView {
                 Ok(engine) => self.video.engine = Some(engine),
                 Err(err) => {
                     self.video_active = false;
-                    self.video_error = Some(format!("mpv 启动失败：{err}"));
-                    self.report_error(format!("视频不可用：mpv 启动失败（{err}）"));
+                    self.video_error = Some(format!("libmpv 初始化失败：{err}"));
+                    self.report_error(format!("视频不可用：libmpv 初始化失败（{err}）"));
                     return;
                 }
             }
@@ -2188,7 +2189,7 @@ impl PlayerView {
                         div()
                             .text_size(px(11.))
                             .text_color(overlay::dim())
-                            .child("提示：安装 mpv 或设置 SMP_MPV_PATH 指向 mpv.exe"),
+                            .child("提示：把 libmpv-2.dll 放到程序目录，或用 SMP_LIBMPV_PATH 指定路径"),
                     ),
             );
         }
