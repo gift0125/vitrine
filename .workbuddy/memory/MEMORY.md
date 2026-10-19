@@ -37,10 +37,12 @@
   （`window_actions::client_size`）对账，命中就 `kick_layout`。
 - `Div::bg()` 和 **`border`** 都画在**子节点之前**；`on_double_click` 只在 `Stateful<Div>` 上；
   `start_window_move()` 在 Win 后端**没有实现**。
-- **玻璃贴图里不裁圆角**：贴图是半分辨率再放大的，二值裁切 + 清黑会糊出灰黑毛边。
-  贴图铺满矩形（`d` 夹 0、alpha 255），圆角交给外层 `rounded + overflow_hidden`；
+- **玻璃贴图按屏幕 1:1 出**（`window.scale_factor()`，单面 22 万像素封顶）：圆角是曲率，
+  比直边更吃分辨率，半分辨率放大时弧上只剩几个采样点，必然阶梯。alpha 用**物理 1 像素**
+  覆盖率裁圆角（`clamp(0.5 − d·dpi, 0, 1)`），过渡带宽度与分辨率无关。
   描边另做一个 `.absolute().size_full().rounded().border_1()` 覆盖层压在贴图之上，
   否则根节点的 border 会被贴图整个盖掉（圆角处的边"消失"）。
+  「只有新帧」的重烤节流 20ms，布局变化不节流。
 - `SetWindowPos` / `ShowWindow` **不能**在 `Context::update` 里同步调 → 丢进 `cx.spawn_in`。
 - 快捷键必须走 `App::intercept_keystrokes`（`bind_keys` + `on_action` 收不到，无焦点时派发给根）。
 - 字体只取系统自带族（Win `Microsoft YaHei UI`）；浅底面板上的按钮用主题色，别用 `overlay::*`。

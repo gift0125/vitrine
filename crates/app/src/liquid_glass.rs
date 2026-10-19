@@ -11,6 +11,11 @@
 //!
 //! 模糊用三次盒式模糊逼近高斯（半径跟 σ 走，单像素代价与半径无关），边圈缓冲
 //! 长边封顶 1280、体部封顶 480：σ=30 的霜面本来就没有高频，没必要按窗口原尺寸算。
+//!
+//! 但**贴图本身按屏幕 1:1 出**（逻辑像素 × 缩放比，单块面 22 万像素封顶）。
+//! 圆角是曲率，比直边更吃分辨率：半分辨率再放大时，14px 的折射带在弧上只剩
+//! 几个采样点，圆角就成了阶梯加一圈灰黑毛边。边缘 alpha 的过渡带固定 1 个
+//! **物理**像素，所以无论分辨率高低，圆角的柔软度都一样。
 
 use std::time::{Duration, Instant};
 
@@ -35,15 +40,25 @@ const CANVAS_BGRA: [u8; 3] = [0x0C, 0x09, 0x08];
 const RIM_MAX_LONG: f32 = 420.0;
 /// 体部缓冲长边上限。σ=30 的霜面没有高频。
 const SOFT_MAX_LONG: f32 = 220.0;
-/// 玻璃贴图相对逻辑像素的缩放。内容是糊的，半分辨率拉上去看不出阶梯，
-/// 歌单 320×633 就能少算四分之三的像素。
-const PLATE_SCALE: f32 = 0.5;
+/// 玻璃贴图的目标分辨率：和屏幕 **1:1**（逻辑像素 × 屏幕缩放比）。
+///
+/// 这里以前是 0.5（半分辨率再放大），圆角就是被它毁掉的：折射带 14px 宽在
+/// 贴图里只剩 7 个像素，弧上这 7 个采样点再被拉成 21 个物理像素，于是圆角
+/// 呈阶梯、边缘带在弧上糊成一坨。圆角是**曲率**，比直边更吃分辨率。
+const PLATE_MAX_SCALE: f32 = 2.0;
+/// 一块面的贴图像素上限。超了才按面积降分辨率（胶囊在 150% 缩放下是
+/// 157k，正好在预算内；歌单 320×633 会超，见 [`plate_scale`]）。
+const PLATE_BUDGET: f32 = 220_000.0;
+/// 浅底（歌单）的奶白盖到 0.87 以上，折射只剩边上一圈，分辨率可以省。
+const LIGHT_PLATE_RATIO: f32 = 0.72;
 /// 覆盖区比玻璃面多出来的边（窗口像素）。要罩住边圈模糊核和朝外的那几像素位移。
 const COVERAGE_MARGIN: f32 = 36.0;
-/// 调试构建不做优化，整帧烘焙会拖垮 UI 线程。播放中最多按这个间隔重算；
-/// 开合面板、改窗口仍然马上算。发行构建每帧都算。
-const BAKE_MIN_INTERVAL: Duration =
-    Duration::from_millis(if cfg!(debug_assertions) { 90 } else { 0 });
+/// 播放中玻璃底图的重烤间隔。
+///
+/// 贴图是屏幕 1:1 的，胶囊一块就 15.7 万像素、三块面一起 47 万（约 14ms CPU），
+/// 每帧重烤会把预算吃满。玻璃里装的是模糊过的倒影，慢一两帧看不出来，所以
+/// 只在**有画面在跑**时才节流；开合面板、改窗口这种布局变化照旧立刻重烤。
+const BAKE_MIN_INTERVAL: Duration = Duration::from_millis(20);
 /// 模糊用的源图长边上限。再大的帧先做面积平均，边圈 σ=7 用不上那些高频。
 const SOURCE_MAX_LONG: f32 = 1920.0;
 
@@ -140,6 +155,8 @@ struct BakeKey {
     win_w: u32,
     win_h: u32,
     hue: u16,
+    /// 缩放比（×64 定点）。换了显示器就得按新倍率重烤。
+    dpi_q: u16,
     jobs: [Option<JobKey>; 3],
 }
 
@@ -165,6 +182,26 @@ fn backdrop_limits(polarity: Polarity) -> (f32, f32) {
     match polarity {
         Polarity::Dark => (RIM_MAX_LONG, SOFT_MAX_LONG),
         Polarity::Light => (200.0, 110.0),
+    }
+}
+
+/// 这块面按多少倍**逻辑像素**烘焙。目标就是屏幕的物理像素（`dpi`），
+/// 超出面积预算才降——降的时候圆角先糊，所以能撑就撑。
+fn plate_scale(job: &GlassJob, dpi: f32) -> f32 {
+    let dpi = if dpi.is_finite() && dpi > 0.5 {
+        dpi.min(PLATE_MAX_SCALE)
+    } else {
+        1.0
+    };
+    let want = match job.polarity {
+        Polarity::Dark => dpi,
+        Polarity::Light => dpi * LIGHT_PLATE_RATIO,
+    };
+    let area = (job.w * job.h * want * want).max(1.0);
+    if area <= PLATE_BUDGET {
+        want
+    } else {
+        (PLATE_BUDGET / area).sqrt() * want
     }
 }
 
@@ -240,14 +277,24 @@ impl GlassBaker {
     }
 
     /// 按当前帧和这组玻璃面出图。什么都没变就返回 `false`（贴图不用重传）。
-    pub fn sync(&mut self, win_w: f32, win_h: f32, jobs: &[GlassJob], hue: Option<f32>) -> bool {
+    ///
+    /// `dpi` 是窗口的缩放比（每逻辑像素多少物理像素）：贴图按它烘焙才能和屏幕
+    /// 1:1，圆角和 14px 折射带才不糊。
+    pub fn sync(
+        &mut self,
+        win_w: f32,
+        win_h: f32,
+        jobs: &[GlassJob],
+        hue: Option<f32>,
+        dpi: f32,
+    ) -> bool {
         if !self.has_source() || win_w < 8.0 || win_h < 8.0 {
             let had = !self.plates.is_empty();
             self.plates.clear();
             self.key = None;
             return had;
         }
-        let key = bake_key(self.generation, win_w, win_h, hue, jobs);
+        let key = bake_key(self.generation, win_w, win_h, hue, dpi, jobs);
         if self.key == Some(key) {
             return false;
         }
@@ -256,6 +303,7 @@ impl GlassBaker {
             let layout_same = prev.win_w == key.win_w
                 && prev.win_h == key.win_h
                 && prev.hue == key.hue
+                && prev.dpi_q == key.dpi_q
                 && prev.jobs == key.jobs;
             if layout_same
                 && self
@@ -279,6 +327,7 @@ impl GlassBaker {
             let (rim_max, soft_max) = backdrop_limits(job.polarity);
             self.rebuild_backdrop(win_w, win_h, Space { x, y, w, h }, rim_max, soft_max);
             let space = self.space;
+            let scale = plate_scale(job, dpi);
             let mut plate = self.take_plate(job.id);
             render_plate(
                 &self.soft,
@@ -292,11 +341,12 @@ impl GlassBaker {
                 tint,
                 has_tint,
                 Tier::Edge,
-                PLATE_SCALE,
+                scale,
+                dpi,
                 &mut plate.bgra,
             );
-            plate.w = (job.w * PLATE_SCALE).round().max(1.0) as usize;
-            plate.h = (job.h * PLATE_SCALE).round().max(1.0) as usize;
+            plate.w = (job.w * scale).round().max(1.0) as usize;
+            plate.h = (job.h * scale).round().max(1.0) as usize;
             plate.dirty = true;
             next.push(plate);
         }
@@ -368,7 +418,14 @@ impl GlassBaker {
     }
 }
 
-fn bake_key(gen: u64, win_w: f32, win_h: f32, hue: Option<f32>, jobs: &[GlassJob]) -> BakeKey {
+fn bake_key(
+    gen: u64,
+    win_w: f32,
+    win_h: f32,
+    hue: Option<f32>,
+    dpi: f32,
+    jobs: &[GlassJob],
+) -> BakeKey {
     let mut slots = [None; 3];
     for job in jobs {
         if job.id > 2 || job.w < 8.0 || job.h < 8.0 {
@@ -385,11 +442,17 @@ fn bake_key(gen: u64, win_w: f32, win_h: f32, hue: Option<f32>, jobs: &[GlassJob
         Some(h) => (h.round() as i32).rem_euclid(360) as u16,
         None => 0xFFFF,
     };
+    let dpi_q = if dpi.is_finite() && dpi > 0.0 {
+        (dpi * 64.0).round().min(65535.0) as u16
+    } else {
+        0
+    };
     BakeKey {
         gen,
         win_w: win_w.round().max(0.0) as u32,
         win_h: win_h.round().max(0.0) as u32,
         hue,
+        dpi_q,
         jobs: slots,
     }
 }
@@ -589,6 +652,7 @@ fn box_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
 }
 
 /// 双线性采样。坐标是像素索引（0 = 第一个像素的左/上沿），返回 RGB 0..255。
+#[inline(always)]
 fn sample(data: &[u8], w: usize, h: usize, x: f32, y: f32) -> [f32; 3] {
     if w == 0 || h == 0 {
         return [0.0; 3];
@@ -609,15 +673,21 @@ fn sample(data: &[u8], w: usize, h: usize, x: f32, y: f32) -> [f32; 3] {
     let i10 = (y0 * w + x1) * 4;
     let i01 = (y1 * w + x0) * 4;
     let i11 = (y1 * w + x1) * 4;
-    let mut rgb = [0.0; 3];
-    // 内存是 BGRA，算式用 RGB。
-    for (channel, src_off) in [(0, 2), (1, 1), (2, 0)] {
-        rgb[channel] = data[i00 + src_off] as f32 * w00
-            + data[i10 + src_off] as f32 * w10
-            + data[i01 + src_off] as f32 * w01
-            + data[i11 + src_off] as f32 * w11;
-    }
-    rgb
+    // 内存是 BGRA，返回值用 RGB。三个通道写开，别指望迭代器在热路径里展开。
+    [
+        data[i00 + 2] as f32 * w00
+            + data[i10 + 2] as f32 * w10
+            + data[i01 + 2] as f32 * w01
+            + data[i11 + 2] as f32 * w11,
+        data[i00 + 1] as f32 * w00
+            + data[i10 + 1] as f32 * w10
+            + data[i01 + 1] as f32 * w01
+            + data[i11 + 1] as f32 * w11,
+        data[i00] as f32 * w00
+            + data[i10] as f32 * w10
+            + data[i01] as f32 * w01
+            + data[i11] as f32 * w11,
+    ]
 }
 
 fn map_xy(buf_w: usize, buf_h: usize, space: Space, wx: f32, wy: f32) -> (f32, f32) {
@@ -684,6 +754,7 @@ fn render_plate(
     has_tint: bool,
     tier: Tier,
     scale: f32,
+    dpi: f32,
     out: &mut Vec<u8>,
 ) {
     let scale = if scale.is_finite() && scale > 0.05 {
@@ -708,68 +779,120 @@ fn render_plate(
     let radius = job.radius;
     let band = job.band.max(0.001);
     let maxd = job.maxd;
+    // 圆角覆盖率：过渡带正好 1 个**物理**像素（= `1/dpi` 逻辑像素）。
+    //
+    // 贴图和屏幕 1:1 时就是 1 个贴图像素，是矢量级的干净边缘；分辨率被预算
+    // 压下来时过渡带在贴图里更宽，双线性拉上去仍是同样的柔软度。之前用的是
+    // 二值裁切（`d > 0` 清黑），半分辨率放大后就变成 2~3 物理像素的灰黑毛边
+    // ——圆角"烧焦"就是这么来的。
+    let aa = if dpi.is_finite() && dpi > 0.01 { dpi } else { 1.0 };
+
+    // ---- 行/列预计算 ----
+    //
+    // 贴图现在是屏幕 1:1 的（一块胶囊 1140×138），逐像素的除法和 abs 撑不住。
+    // SDF 的 `qx` 只跟 x 走、`qy` 只跟 y 走，`map_xy` 的除数也是常量 —— 全部
+    // 提到循环外，内层只剩一次 sqrt、一次除法（求法线）和两次双线性采样。
+    let dx = job.w / pw as f32;
+    let dy = job.h / ph as f32;
+    let k_soft_x = soft_w as f32 / space.w;
+    let k_soft_y = soft_h as f32 / space.h;
+    let k_rim_x = rim_w as f32 / space.w;
+    let k_rim_y = rim_h as f32 / space.h;
+    let half_w = (hw - radius).max(0.0);
+    let half_h = (hh - radius).max(0.0);
+
+    let mut col_qx = vec![0.0f32; pw];
+    let mut col_bx = vec![0.0f32; pw];
+    let mut col_sgx = vec![1.0f32; pw];
+    let mut col_sx = vec![0.0f32; pw];
+    let mut col_rx = vec![0.0f32; pw];
+    for ox in 0..pw {
+        let wx = job.x + (ox as f32 + 0.5) * dx;
+        let rel = wx - cx;
+        let qx = rel.abs() - half_w;
+        col_qx[ox] = qx;
+        col_bx[ox] = qx.max(0.0);
+        col_sgx[ox] = if rel > 0.0 { 1.0 } else { -1.0 };
+        col_sx[ox] = (wx - space.x) * k_soft_x;
+        col_rx[ox] = (wx - space.x) * k_rim_x;
+    }
 
     for oy in 0..ph {
-        let wy = job.y + (oy as f32 + 0.5) * job.h / ph as f32;
+        let wy = job.y + (oy as f32 + 0.5) * dy;
         let ty = (oy as f32 + 0.5) / ph as f32;
+        let rel_y = wy - cy;
+        let qy = rel_y.abs() - half_h;
+        let by = qy.max(0.0);
+        let sgy = if rel_y > 0.0 { 1.0 } else { -1.0 };
+        let sy = (wy - space.y) * k_soft_y;
+        let ry_base = (wy - space.y) * k_rim_y;
+        // 暗底的两层压暗（0.45 平铺 + 渐变）合成一次仿射，逐行算一次。
+        let flat_a = scrim * 0.45;
+        let (gr, gg, gb, ga) = scrim_gradient(ty, tint, has_tint, scrim);
+        let keep = (1.0 - flat_a) * (1.0 - ga);
+        let add_r = SCRIM_RGB[0] * flat_a * (1.0 - ga) + gr * ga;
+        let add_g = SCRIM_RGB[1] * flat_a * (1.0 - ga) + gg * ga;
+        let add_b = SCRIM_RGB[2] * flat_a * (1.0 - ga) + gb * ga;
+
         for ox in 0..pw {
-            let wx = job.x + (ox as f32 + 0.5) * job.w / pw as f32;
-            let (d_raw, nx, ny, _) = sdf_normal(wx, wy, cx, cy, hw, hh, radius);
+            let qx = col_qx[ox];
+            let bx = col_bx[ox];
+            let len = (bx * bx + by * by).sqrt();
+            let d_raw = len + qx.max(qy).min(0.0) - radius;
             let o = (oy * pw + ox) * 4;
-            // 圆角**不在贴图里裁**：这里只算折射，alpha 恒 255，整块矩形都填满。
-            //
-            // 原因有两条：贴图是半分辨率（`PLATE_SCALE`）再被拉到物理像素的，
-            // 二值裁切会被双线性插值糊成 2~3 物理像素的毛边；而 `d > 0` 时把 RGB
-            // 清 0，插值又会把那条毛边压成灰黑——玻璃角上看着像烧焦了一圈。
-            // 圆角统一交给外层的 `rounded + overflow_hidden`：那是矢量绘制，
-            // 1:1 物理像素带抗锯齿，比在贴图里切干净得多，也省掉一次 AA 估算。
-            let d = d_raw.min(0.0);
-            let t = (-d / band).clamp(0.0, 1.0);
+            let cover = (0.5 - d_raw * aa).clamp(0.0, 1.0);
+            if cover <= 0.002 {
+                out[o..o + 4].copy_from_slice(&[0, 0, 0, 0]);
+                continue;
+            }
+            // 颜色照旧按 `d = 0`（贴边）算：圆角外那半个像素仍然取边缘色，
+            // 免得插值时把黑色拖进来。alpha 才是裁切。
+            let t = ((-d_raw).max(0.0) / band).clamp(0.0, 1.0);
             let u = 1.0 - t;
             let u2 = u * u;
             let m = maxd * u2;
 
-            let (sx, sy) = map_xy(soft_w, soft_h, space, wx, wy);
-            let mut rgb = sample(soft, soft_w, soft_h, sx, sy);
+            let mut rgb = sample(soft, soft_w, soft_h, col_sx[ox], sy);
+            let inv = if len > 1e-6 { 1.0 / len } else { 0.0 };
+            let ny = sgy * by * inv;
             if u2 > 0.001 {
-                let (rx, ry) = map_xy(rim_w, rim_h, space, wx + nx * m, wy + ny * m);
+                let rx = col_rx[ox] + col_sgx[ox] * bx * inv * m * k_rim_x;
+                let ry = ry_base + ny * m * k_rim_y;
                 let rim_rgb = sample(rim, rim_w, rim_h, rx, ry);
                 for c in 0..3 {
                     rgb[c] += (rim_rgb[c] - rgb[c]) * u2;
                 }
                 if full {
                     const DISPERSION: f32 = 0.07;
-                    let (rx, ry) = map_xy(
+                    let far = sample(
+                        rim,
                         rim_w,
                         rim_h,
-                        space,
-                        wx + nx * m * (1.0 + DISPERSION),
-                        wy + ny * m * (1.0 + DISPERSION),
+                        col_rx[ox] + col_sgx[ox] * bx * inv * m * (1.0 + DISPERSION) * k_rim_x,
+                        ry_base + ny * m * (1.0 + DISPERSION) * k_rim_y,
                     );
-                    let far = sample(rim, rim_w, rim_h, rx, ry);
                     rgb[0] += (far[0] - rgb[0]) * u2;
-                    let (rx, ry) = map_xy(
+                    let near = sample(
+                        rim,
                         rim_w,
                         rim_h,
-                        space,
-                        wx + nx * m * (1.0 - DISPERSION),
-                        wy + ny * m * (1.0 - DISPERSION),
+                        col_rx[ox] + col_sgx[ox] * bx * inv * m * (1.0 - DISPERSION) * k_rim_x,
+                        ry_base + ny * m * (1.0 - DISPERSION) * k_rim_y,
                     );
-                    let near = sample(rim, rim_w, rim_h, rx, ry);
                     rgb[2] += (near[2] - rgb[2]) * u2;
                 }
             }
 
             if light {
                 let v = veil - (veil - LIGHT_VEIL_RIM) * u2;
-                for c in 0..3 {
-                    rgb[c] += (MILK[c] - rgb[c]) * v;
-                }
+                let iv = 1.0 - v;
+                rgb[0] = rgb[0] * iv + MILK[0] * v;
+                rgb[1] = rgb[1] * iv + MILK[1] * v;
+                rgb[2] = rgb[2] * iv + MILK[2] * v;
             } else {
-                let flat_a = scrim * 0.45;
-                rgb = over(rgb, SCRIM_RGB, flat_a);
-                let (gr, gg, gb, ga) = scrim_gradient(ty, tint, has_tint, scrim);
-                rgb = over(rgb, [gr, gg, gb], ga);
+                rgb[0] = rgb[0] * keep + add_r;
+                rgb[1] = rgb[1] * keep + add_g;
+                rgb[2] = rgb[2] * keep + add_b;
             }
 
             if full && u2 > 0.001 {
@@ -800,14 +923,16 @@ fn render_plate(
             out[o] = rgb[2].round().clamp(0.0, 255.0) as u8;
             out[o + 1] = rgb[1].round().clamp(0.0, 255.0) as u8;
             out[o + 2] = rgb[0].round().clamp(0.0, 255.0) as u8;
-            // 边缘 alpha 是覆盖率（内部恒 255）。直通 alpha 与预乘的差别只在
-            // 这 1px 过渡带里，而那里的颜色本来就和画面接近，不会看出色偏。
-            out[o + 3] = 255;
+            out[o + 3] = (cover * 255.0).round() as u8;
         }
     }
 }
 
 /// 圆角矩形 SDF 和边缘法线。`d < 0` 在内部。直边法线取轴向，圆角取径向。
+///
+/// 贴着贴图跑的那份把 x/y 分量拆成行/列预计算了（见 [`render_plate`]），
+/// 这份留作单点参考答案，测试用它核对拆分没算错。
+#[cfg(test)]
 fn sdf_normal(
     wx: f32,
     wy: f32,
@@ -884,15 +1009,6 @@ fn scrim_gradient(ty: f32, tint: [f32; 3], has_tint: bool, scrim: f32) -> (f32, 
     }
 }
 
-fn over(dst: [f32; 3], src: [f32; 3], a: f32) -> [f32; 3] {
-    let ia = 1.0 - a;
-    [
-        src[0] * a + dst[0] * ia,
-        src[1] * a + dst[1] * ia,
-        src[2] * a + dst[2] * ia,
-    ]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,25 +1074,21 @@ mod tests {
             false,
             Tier::Edge,
             1.0,
+            1.0,
             &mut out,
         );
         let center = rgb_at(&out, 80, 40, 20);
         let left = rgb_at(&out, 80, 1, 20);
-        let corner = rgb_at(&out, 80, 0, 0);
         let l = |c: [u8; 3]| c[0] as i32 + c[1] as i32 + c[2] as i32;
         assert!(
             l(left) > l(center) + 20,
             "左缘应比中心亮：edge={left:?} center={center:?}"
         );
-        // 圆角交给外层的 `rounded + overflow_hidden` 裁，贴图本身铺满矩形：
-        // 四角也必须不透明，且颜色沿用边缘色而不是朝黑收敛——贴图是半分辨率
-        // 放大上去的，清成黑色会在圆角处糊出一圈灰黑毛边。
-        assert_eq!(out[3], 255, "贴图四角不透明");
-        assert!(
-            l(corner) > l(center) - 10,
-            "角上应沿用边缘色，不该被压成黑：corner={corner:?} center={center:?}"
-        );
-        assert_eq!(out[(20 * 80 + 40) * 4 + 3], 255);
+        // 圆角裁在贴图里（带 1 物理像素的覆盖率），外层 `overflow_hidden`
+        // 只是双保险：贴图四角必须已经透明，否则弧上的边缘带会被整块露出。
+        assert_eq!(out[3], 0, "圆角外要透明，圆角才是圆的");
+        assert_eq!(out[(20 * 80 + 40) * 4 + 3], 255, "中心不透明");
+        assert_eq!(out[(20 * 80 + 5) * 4 + 3], 255, "贴着左缘内侧不透明");
     }
 
     #[test]
@@ -1024,6 +1136,7 @@ mod tests {
             [0.0; 3],
             false,
             Tier::Edge,
+            1.0,
             1.0,
             &mut out,
         );
@@ -1079,6 +1192,7 @@ mod tests {
             false,
             Tier::Edge,
             1.0,
+            1.0,
             &mut out,
         );
         let center = rgb_at(&out, w, w / 2, h / 2);
@@ -1116,14 +1230,14 @@ mod tests {
         let mut baker = GlassBaker::default();
         baker.ingest(320, 180, &frame);
         let jobs = [GlassJob::capsule(40.0, 280.0, 240.0, 60.0)];
-        assert!(baker.sync(320.0, 360.0, &jobs, Some(200.0)));
+        assert!(baker.sync(320.0, 360.0, &jobs, Some(200.0), 1.0));
         let first = baker.last_ms();
         assert!(first > 0.0);
-        assert!(!baker.sync(320.0, 360.0, &jobs, Some(200.0)));
+        assert!(!baker.sync(320.0, 360.0, &jobs, Some(200.0), 1.0));
         baker.ingest(320, 180, &frame);
-        // 调试构建会把「只有新帧」的重算节流到大约 50ms，布局变化则不节流。
+        // 「只有新帧」的重烤有 20ms 节流，布局变化不节流，所以这里要等一下。
         std::thread::sleep(BAKE_MIN_INTERVAL + Duration::from_millis(5));
-        assert!(baker.sync(320.0, 360.0, &jobs, Some(200.0)));
+        assert!(baker.sync(320.0, 360.0, &jobs, Some(200.0), 1.0));
     }
 
     #[test]
@@ -1144,20 +1258,20 @@ mod tests {
         let mut baker = GlassBaker::default();
         baker.ingest(w, h, &frame);
         let jobs = [GlassJob::capsule(260.0, 684.0, 760.0, 92.0)];
-        assert!(baker.sync(1280.0, 800.0, &jobs, Some(197.0)));
+        assert!(baker.sync(1280.0, 800.0, &jobs, Some(197.0), 1.5));
         let ms = baker.last_ms();
         eprintln!("liquid glass capsule bake {ms:.1} ms");
         assert!(ms < 40.0, "胶囊一帧的烘焙应留在交互预算里，实际 {ms:.1} ms");
         let plate = baker.plates().find(|(id, ..)| *id == 0).expect("应有胶囊");
-        assert!(plate.1 >= 300 && plate.1 <= 760, "胶囊贴图宽 {}", plate.1);
-        assert!(plate.2 >= 40 && plate.2 <= 92, "胶囊贴图高 {}", plate.2);
+        // 150% 缩放 → 贴图就是 1140×138 的物理像素（和屏幕 1:1）。
+        assert!(plate.1 >= 600 && plate.1 <= 1140, "胶囊贴图宽 {}", plate.1);
+        assert!(plate.2 >= 80 && plate.2 <= 138, "胶囊贴图高 {}", plate.2);
 
         // 三块面（胶囊 + 信息卡 + 歌单）同时开，是播放中最贵的一帧。
         //
         // 取 3 次里最小的那次：这是**墙钟**耗时，而 `cargo test` 默认并行跑，
-        // 别的用例抢 CPU 时同一次烘焙会从 65ms 涨到 116ms（实测）。最小值才代表
-        // 这段代码自己的开销，阈值不动。改一下胶囊 x 让布局变化强制重烤
-        // （只有新帧的路径在调试构建里有 90ms 节流，这里不睡）。
+        // 别的用例抢 CPU 时同一次烘焙能翻一倍。最小值才代表这段代码自己的开销。
+        // 改一下胶囊 x 让布局变化强制重烤（只有新帧的路径有 20ms 节流，这里不睡）。
         let mut best = f32::MAX;
         for dx in [0.0, 1.0, 2.0] {
             let jobs = [
@@ -1165,7 +1279,7 @@ mod tests {
                 GlassJob::info(24.0, 488.0, 240.0, 180.0),
                 GlassJob::playlist(936.0, 48.0, 320.0, 633.0),
             ];
-            assert!(baker.sync(1280.0, 800.0, &jobs, Some(197.0)));
+            assert!(baker.sync(1280.0, 800.0, &jobs, Some(197.0), 1.5));
             best = best.min(baker.last_ms());
         }
         eprintln!("liquid glass three surfaces {best:.1} ms (best of 3)");
@@ -1199,10 +1313,11 @@ mod tests {
         baker.ingest(w, h, &frame);
         // 窗口 640×400，画面 contain 后上下各留 20。胶囊左缘落在白缝右边。
         let job = GlassJob::capsule(214.0, 250.0, 360.0, 80.0);
-        assert!(baker.sync(640.0, 400.0, &[job], Some(320.0)));
+        assert!(baker.sync(640.0, 400.0, &[job], Some(320.0), 1.0));
         let (_, pw, ph, bytes, _) = baker.plates().next().expect("plate");
+        let scale = plate_scale(&job, 1.0);
         let edge = rgb_at(bytes, pw, 1, ph / 2);
-        let inside = rgb_at(bytes, pw, (24.0 * PLATE_SCALE) as usize + 2, ph / 2);
+        let inside = rgb_at(bytes, pw, (24.0 * scale) as usize + 2, ph / 2);
         let lum = |c: [u8; 3]| c[0] as i32 + c[1] as i32 + c[2] as i32;
         assert!(
             lum(edge) > lum(inside) + 15,

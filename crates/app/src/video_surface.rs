@@ -107,6 +107,9 @@ impl VideoSurface {
     }
 
     /// 按窗口里这几块玻璃面的位置重烤贴图。位置和帧都没变就什么也不做。
+    ///
+    /// 贴图按 `window.scale_factor()` 烘到物理像素（1:1），圆角和 14px 折射
+    /// 带才不会在半分辨率放大后糊成阶梯。
     pub fn sync_glass(
         &mut self,
         win_w: f32,
@@ -115,7 +118,8 @@ impl VideoSurface {
         hue: Option<f32>,
         window: &mut Window,
     ) {
-        if !self.glass.sync(win_w, win_h, jobs, hue) {
+        let dpi = window.scale_factor();
+        if !self.glass.sync(win_w, win_h, jobs, hue, dpi) {
             return;
         }
         let dirty: Vec<(u8, usize, usize, Vec<u8>)> = self

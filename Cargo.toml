@@ -10,3 +10,18 @@ serde_json = "1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# 液态玻璃每帧都在跑（两档模糊 + 逐像素折射），opt-level=0 下要慢一个数量级，
+# debug 构建的窗口会卡成幻灯片，验收截图也可能拍在过期的贴图上。依赖保持 0
+# （它们编译快，慢也慢在启动上），只给自己的两个 crate 开 2。
+[profile.dev.package.simple-media-player]
+opt-level = 2
+
+[profile.dev.package.player-core]
+opt-level = 2
+
+[profile.test.package.simple-media-player]
+opt-level = 2
+
+[profile.test.package.player-core]
+opt-level = 2
