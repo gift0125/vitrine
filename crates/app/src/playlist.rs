@@ -48,6 +48,8 @@ pub struct PlaylistDelegate {
     /// 曲目路径的**加入顺序**（第一次排序时拍快照），用于「排序：加入顺序」还原
     added: Vec<String>,
     view: WeakEntity<PlayerView>,
+    /// 视频播放时列表面板是浅底液态玻璃，字色固定 Latte，不跟深色主题走。
+    light_glass: bool,
 }
 
 impl PlaylistDelegate {
@@ -58,7 +60,17 @@ impl PlaylistDelegate {
             confirmed: None,
             added: Vec::new(),
             view,
+            light_glass: false,
         }
+    }
+
+    /// 切换「浅底玻璃」字色。没变就返回 `false`，调用方不必刷新列表。
+    pub fn set_light_glass(&mut self, on: bool) -> bool {
+        if self.light_glass == on {
+            return false;
+        }
+        self.light_glass = on;
+        true
     }
 
     pub fn tracks(&self) -> &[TrackMeta] {
@@ -253,15 +265,30 @@ impl ListDelegate for PlaylistDelegate {
         // 当前曲目的视觉线索按设计稿来：行底色（Mauve 12%）+ 1px Mauve 描边 +
         // 标题 Mauve + 序号位换成均衡器图标。**不做左侧强调条**——设计稿的列表行
         // 是一颗圆角胶囊，没有装饰条。
-        let accent = theme.primary;
-        let title_color = if is_current { accent } else { theme.foreground };
-        let row_bg = if is_current {
-            theme.list_active
+        let (accent, title_color, row_bg, secondary) = if self.light_glass {
+            let accent = crate::theme::latte::accent();
+            let title = if is_current {
+                accent
+            } else {
+                crate::theme::latte::text()
+            };
+            let row = if is_current {
+                crate::theme::latte::row()
+            } else {
+                transparent_black()
+            };
+            (accent, title, row, crate::theme::latte::subtext())
         } else {
-            transparent_black()
+            let accent = theme.primary;
+            let title = if is_current { accent } else { theme.foreground };
+            let row = if is_current {
+                theme.list_active
+            } else {
+                transparent_black()
+            };
+            (accent, title, row, theme.muted_foreground)
         };
         let mono = theme.mono_font_family.clone();
-        let secondary = theme.muted_foreground;
 
         let artist = track
             .artist
@@ -406,7 +433,11 @@ impl ListDelegate for PlaylistDelegate {
             .justify_center()
             .gap_2()
             .py_8()
-            .text_color(cx.theme().muted_foreground)
+            .text_color(if self.light_glass {
+                crate::theme::latte::subtext()
+            } else {
+                cx.theme().muted_foreground
+            })
             .child(Icon::new(IconName::ListMusic).size_10())
             .child(Label::new("播放列表为空"))
             .child(
@@ -414,7 +445,11 @@ impl ListDelegate for PlaylistDelegate {
                 // 别再写「上方」——那会把人指到标题栏去
                 Label::new("用底部的 + 添加文件，或 📁 添加文件夹")
                     .text_xs()
-                    .text_color(cx.theme().muted_foreground),
+                    .text_color(if self.light_glass {
+                        crate::theme::latte::subtext()
+                    } else {
+                        cx.theme().muted_foreground
+                    }),
             )
     }
 }

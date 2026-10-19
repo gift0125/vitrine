@@ -403,17 +403,20 @@ def wait_trace(needle, count, timeout=3.0):
     return hits
 
 
-def wait_darker(pt, base, timeout=2.5, gap=80):
+def wait_darker(pt, base, timeout=2.5, gap=80, ratio=None):
     """等 `pt` 比 `base` 明显更暗（深玻璃卡片画上去了），返回最后一次采样。
 
-    判据同判定段：玻璃卡三通道之和比画面低一大截，用亮度差比用具体颜色稳
-    （换素材不会飘）。
+    两种判据：绝对差 `gap`（三通道之和），或**相对比例** `ratio`（`< base·ratio`）。
+    玻璃层是渐变压在画面上的，绝对差会跟着片源亮度飘，能用比例就别用绝对差。
     """
     deadline = time.time() + timeout
     px = sample(grab(), *pt)
     while time.time() < deadline:
         px = sample(grab(), *pt)
-        if sum(px[:3]) + gap < sum(base[:3]):
+        if ratio is not None:
+            if sum(px[:3]) < sum(base[:3]) * ratio:
+                return px
+        elif sum(px[:3]) + gap < sum(base[:3]):
             return px
         time.sleep(0.1)
     return px
@@ -1016,6 +1019,18 @@ print(f"字幕/音轨 → cycle 命令 {cycles_before}→{cycles_after} 条")
 #
 # 卡片是「画在画面上」的东西，判据同样有两层：探针里必须在（脚本要靠它算坐标），
 # 像素上必须真的变深（玻璃画上去了）。两者缺一，用户就是"点了没反应"。
+#
+# 先把窗口重新停到 (0,0)：前面拖过窗体、又进出过全屏，窗口可能被摆到屏幕边缘
+# 之外。`ImageGrab` 对越界的 bbox 是**裁剪语义**——拍出来的图左边会多一条黑边，
+# 整幅内容跟着右移，而卡片坐标是按客户区逻辑值算的，挪几十像素就落到画面上了
+# （这条踩过：卡片明明画出来了，判据却说"那块还是画面"）。
+_outer = wintypes.RECT()
+user32.GetWindowRect(hwnd, ctypes.byref(_outer))
+user32.SetWindowPos(
+    hwnd, HWND_TOPMOST, 0, 0,
+    _outer.right - _outer.left, _outer.bottom - _outer.top, SWP_SHOWWINDOW,
+)
+time.sleep(0.5)
 cw4, ch4 = client_rect()
 cw4, ch4 = cw4 / scale, ch4 / scale
 # ⓘ 是左侧组第一枚：胶囊左沿 + padding 20 + 半个 20 盒。胶囊左沿不是 `x = 24`
@@ -1025,7 +1040,16 @@ info_pt = (capsule_left() + CAPSULE_PAD_X + 10, controls_center_y())
 # 胶囊底边 24 + 胶囊高 92 + 间距 16 → 卡片底边，再往上 180 是顶边
 CARD_TOP = ch4 - (CAPSULE_INSET + CAPSULE_HEIGHT + INFO_GAP + INFO_HEIGHT)
 CARD_LEFT = CAPSULE_INSET
-card_probe = (CARD_LEFT + INFO_WIDTH / 2, CARD_TOP + INFO_HEIGHT / 2)  # 卡片正中
+# 卡片压在画面上会让取样点变暗多少：L4 之后不再是固定的一层 72%，而是**自适应
+# 压暗**（`liquid_glass`：`scrim = min(.72, .42 + .85·(L−.30))`，再加 0.45 的平铺
+# 底）。这层在面上是**渐变**的——顶部几乎不压、底部压到 scrim 上限，所以取样点放在
+# 卡片底部的 padding 上（`INFO_HEIGHT − 8`，避开文字行），那里信号最强。
+#
+# 判据用**相对比例**而不是三通道差值：差值跟着画面亮度走，换素材就飘（彩条红在
+# 卡片正中间只掉 30 出头，换成暗一点的片源就掉不到 20）。实测卡片画出来时这个点
+# 约为原来的 0.6，没画是 1.0——0.80 这条线两边都留得很开。
+CARD_RATIO = 0.80
+card_probe = (CARD_LEFT + INFO_WIDTH / 2, CARD_TOP + INFO_HEIGHT - 8)
 wait_chrome(*info_pt, True)
 info_before = sample(grab(out_dir / "verify-info-0-before.png"), *card_probe)
 
@@ -1040,8 +1064,8 @@ def info_toggle(want_open, tries=3):
     for attempt in range(1, tries + 1):
         click(*info_pt)
         if want_open:
-            px = wait_darker(card_probe, info_before)
-            if sum(px[:3]) + 80 < sum(info_before[:3]):
+            px = wait_darker(card_probe, info_before, ratio=CARD_RATIO)
+            if sum(px[:3]) < sum(info_before[:3]) * CARD_RATIO:
                 return True, px
         else:
             cleared = wait_chrome_clear(CARD_LEFT + 10, CARD_TOP + 10)
@@ -1195,8 +1219,8 @@ if not cycle_ok:
     ok = False
 else:
     print("OK: 字幕/音轨按钮各把一条 cycle 发给了 mpv")
-# 深玻璃 ≈ (27,29,20)，彩条那一块和 ≈ 300+：用亮度差而不是颜色值，换素材也不飘
-info_dark = sum(info_open_px[:3]) + 80 < sum(info_before[:3])
+# 卡片底部那一块该压到原来的 ~0.6：用亮度**比例**而不是绝对差值（见 `CARD_RATIO`）
+info_dark = sum(info_open_px[:3]) < sum(info_before[:3]) * CARD_RATIO
 if not info_dark or not info_opened:
     print(f"FAIL: 点 ⓘ 之后那块还是画面（{info_before} → {info_open_px}，卡片没画出来）")
     ok = False

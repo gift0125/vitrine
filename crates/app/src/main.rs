@@ -11,6 +11,7 @@
 //! 启动时恢复播放列表/音量/窗口尺寸；`--dark` 以深色主题启动。
 
 mod assets;
+mod liquid_glass;
 mod persistence;
 mod player_view;
 mod playlist;

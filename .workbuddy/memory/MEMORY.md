@@ -35,8 +35,12 @@
 - 每帧都是新 `ImageId`：送渲染的尺寸封顶 **2560×1440**，展示后 `drop_image()`、留 2 帧退役队列。
 - 改尺寸 / 进出全屏后布局可能停在旧值，而且 **`bounds()` 也会假**：只能和 `GetClientRect`
   （`window_actions::client_size`）对账，命中就 `kick_layout`。
-- `Div::bg()` 画在**子节点之前**；`on_double_click` 只在 `Stateful<Div>` 上；`start_window_move()`
-  在 Win 后端**没有实现**。
+- `Div::bg()` 和 **`border`** 都画在**子节点之前**；`on_double_click` 只在 `Stateful<Div>` 上；
+  `start_window_move()` 在 Win 后端**没有实现**。
+- **玻璃贴图里不裁圆角**：贴图是半分辨率再放大的，二值裁切 + 清黑会糊出灰黑毛边。
+  贴图铺满矩形（`d` 夹 0、alpha 255），圆角交给外层 `rounded + overflow_hidden`；
+  描边另做一个 `.absolute().size_full().rounded().border_1()` 覆盖层压在贴图之上，
+  否则根节点的 border 会被贴图整个盖掉（圆角处的边"消失"）。
 - `SetWindowPos` / `ShowWindow` **不能**在 `Context::update` 里同步调 → 丢进 `cx.spawn_in`。
 - 快捷键必须走 `App::intercept_keystrokes`（`bind_keys` + `on_action` 收不到，无焦点时派发给根）。
 - 字体只取系统自带族（Win `Microsoft YaHei UI`）；浅底面板上的按钮用主题色，别用 `overlay::*`。

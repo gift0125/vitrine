@@ -6,7 +6,7 @@
 //! | 产物 | 用途 | 大小 |
 //! |---|---|---|
 //! | 整帧 | 舞台上的画面 | 原生尺寸（≤2560×1440） |
-//! | 底部那块 48×20 的缩略图 | 胶囊玻璃的模糊底 | 每帧 ~3.8KB |
+//! | 液态玻璃贴图 | 胶囊 / 视频信息 / 播放列表的折射底 | 半分辨率，按面单独烤 |
 //! | 色相 | 玻璃染色 | 一个 f32 |
 //!
 //! ## 为什么要「退休队列」
@@ -28,15 +28,12 @@ use std::sync::Arc;
 use gpui_kit::{ImageSource, RenderImage, Window};
 use player_core::FrameRef;
 
-/// 胶囊玻璃用的缩略图尺寸。
-///
-/// 48×20 拉到 760×92 是十几倍的放大，GPU 的双线性插值本身就等价于一个半径很大的
-/// 模糊——所以这层「模糊」的代价只有每帧一次 3.8KB 的采样。
-const BLUR_WIDTH: usize = 48;
-const BLUR_HEIGHT: usize = 20;
+use crate::liquid_glass::{GlassBaker, GlassJob};
 
-/// 退休队列长度：留两帧，保证「上一帧还在上屏」时贴图仍在。
-const RETIRED_KEEP: usize = 2;
+/// 退休队列长度。
+///
+/// 每一帧可能同时换掉「画面 + 最多三块玻璃」。留两轮，上一轮还在上屏时贴图仍在。
+const RETIRED_KEEP: usize = 8;
 
 /// 一块 BGRA 像素 → `RenderImage`。
 ///
@@ -56,14 +53,16 @@ fn render_image(width: usize, height: usize, bgra: &[u8]) -> Option<Arc<RenderIm
 pub struct VideoSurface {
     /// 舞台上的整帧
     image: Option<Arc<RenderImage>>,
-    /// 胶囊玻璃的模糊底
-    blur: Option<Arc<RenderImage>>,
     /// 已经被换下来、但可能还在上屏的帧
     retired: Vec<Arc<RenderImage>>,
     /// 画面底部那块的色相（给玻璃染色用）
     tint: Option<f32>,
     /// 当前帧的像素尺寸（0×0 = 还没有画面）
     size: (usize, usize),
+    /// 液态玻璃的 CPU 烘焙器（两档模糊 + 边缘折射）
+    glass: GlassBaker,
+    /// 0 胶囊 / 1 视频信息 / 2 播放列表
+    plates: [Option<Arc<RenderImage>>; 3],
 }
 
 impl VideoSurface {
@@ -80,31 +79,67 @@ impl VideoSurface {
         self.image.clone().map(ImageSource::Render)
     }
 
-    /// 胶囊玻璃用的模糊底。
-    pub fn blur(&self) -> Option<ImageSource> {
-        self.blur.clone().map(ImageSource::Render)
+    /// 液态玻璃贴图。`0` 胶囊，`1` 视频信息，`2` 播放列表。还没烤出来时是 `None`。
+    pub fn glass(&self, id: u8) -> Option<ImageSource> {
+        self.plates
+            .get(id as usize)
+            .and_then(|slot| slot.clone())
+            .map(ImageSource::Render)
     }
 
-    /// 收下一帧：建纹理、算色相与缩略图，并把该退休的旧图从图集里删掉。
+    /// 收下一帧：建纹理、算色相，并把像素交给液态玻璃烘焙器。
+    ///
+    /// 玻璃贴图不在这里烤——那时候还不知道胶囊有没有被歌单挤到旁边。`sync_glass`
+    /// 在布局时按真实位置烤。
     pub fn accept(&mut self, frame: FrameRef<'_>, window: &mut Window) {
         // 纹理必须在窗口线程上建（`drop_image` 同理），所以这一整套都在 UI 线程。
         let Some(image) = render_image(frame.width, frame.height, frame.data) else {
             return;
         };
-        let blur_bytes = frame.band_thumbnail(BLUR_WIDTH, BLUR_HEIGHT);
-        let blur = blur_bytes
-            .as_deref()
-            .and_then(|bytes| render_image(BLUR_WIDTH, BLUR_HEIGHT, bytes));
-
+        self.glass.ingest(frame.width, frame.height, frame.data);
         self.tint = frame.band_hue();
         self.size = (frame.width, frame.height);
 
         if let Some(old) = self.image.replace(image) {
             self.retired.push(old);
         }
-        if let Some(new_blur) = blur {
-            if let Some(old) = self.blur.replace(new_blur) {
+        self.drain_retired(window);
+    }
+
+    /// 按窗口里这几块玻璃面的位置重烤贴图。位置和帧都没变就什么也不做。
+    pub fn sync_glass(
+        &mut self,
+        win_w: f32,
+        win_h: f32,
+        jobs: &[GlassJob],
+        hue: Option<f32>,
+        window: &mut Window,
+    ) {
+        if !self.glass.sync(win_w, win_h, jobs, hue) {
+            return;
+        }
+        let dirty: Vec<(u8, usize, usize, Vec<u8>)> = self
+            .glass
+            .plates()
+            .filter(|(_, _, _, _, dirty)| *dirty)
+            .map(|(id, w, h, bytes, _)| (id, w, h, bytes.to_vec()))
+            .collect();
+        let present: Vec<u8> = self.glass.plates().map(|(id, ..)| id).collect();
+        self.glass.clear_dirty();
+        for (id, w, h, bytes) in dirty {
+            let Some(image) = render_image(w, h, &bytes) else {
+                continue;
+            };
+            let slot = &mut self.plates[id as usize];
+            if let Some(old) = slot.replace(image) {
                 self.retired.push(old);
+            }
+        }
+        for (index, slot) in self.plates.iter_mut().enumerate() {
+            if !present.contains(&(index as u8)) {
+                if let Some(old) = slot.take() {
+                    self.retired.push(old);
+                }
             }
         }
         self.drain_retired(window);
@@ -113,9 +148,14 @@ impl VideoSurface {
     /// 退出视频 / 换片：把还挂着的贴图全部还给图集。
     pub fn clear(&mut self, window: &mut Window) {
         self.image = None;
-        self.blur = None;
         self.tint = None;
         self.size = (0, 0);
+        self.glass.clear();
+        for slot in &mut self.plates {
+            if let Some(old) = slot.take() {
+                self.retired.push(old);
+            }
+        }
         for image in self.retired.drain(..) {
             let _ = window.drop_image(image);
         }

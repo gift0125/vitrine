@@ -10,7 +10,7 @@
 //!
 //! 这条链路取代了上一代的 `--wid` 叠加窗：画面就在主窗口自己的渲染树里，不再需要
 //! 「窗口打洞 + 逐像素透明 + z 序自愈」，chrome 真的压在画面之上，画面像素还能顺手
-//! 拿来做胶囊染色（L2）和模糊底（L3）。
+//! 拿来做胶囊染色（L2）和液态玻璃（L4，见 `liquid_glass`）。
 //!
 //! 100ms 定时器轮询位置并同步 SeekBar，播放结束自动切下一首。
 
@@ -37,12 +37,50 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
+use crate::liquid_glass::GlassJob;
 use crate::persistence::{self, RepeatMode, Settings};
 use crate::playlist::PlaylistDelegate;
 use crate::theme::overlay;
 use crate::ui_state::{ChromeLayout, Rect as UiRect, UiState};
 use crate::video_surface::VideoSurface;
 use crate::window_actions::{self, Hwnd};
+
+/// 控制胶囊在窗口里的位置。歌单展开时居中于剩余画面（1280 宽时 x = 88）。
+fn capsule_box(win_w: f32, win_h: f32, playlist_open: bool) -> Option<(f32, f32, f32, f32)> {
+    let h = 92.0;
+    let y = win_h - CAPSULE_INSET - h;
+    let (left, right) = if playlist_open {
+        (0.0, PLAYLIST_WIDTH + PLAYLIST_INSET)
+    } else {
+        (CAPSULE_INSET, CAPSULE_INSET)
+    };
+    let content = win_w - left - right;
+    if content < 48.0 || y < -8.0 {
+        return None;
+    }
+    let w = CAPSULE_WIDTH.min(content);
+    Some((left + (content - w) * 0.5, y.max(0.0), w, h))
+}
+
+/// 视频信息卡：贴左，在胶囊上方 16px。
+fn info_box(win_w: f32, win_h: f32) -> Option<(f32, f32, f32, f32)> {
+    let y = win_h - CAPSULE_INSET - 92.0 - INFO_GAP - INFO_HEIGHT;
+    if y < 0.0 || CAPSULE_INSET + INFO_WIDTH > win_w {
+        return None;
+    }
+    Some((CAPSULE_INSET, y, INFO_WIDTH, INFO_HEIGHT))
+}
+
+/// 播放列表面板：贴右 24，顶边让开标题带，底边让开胶囊那条带。
+fn playlist_box(win_w: f32, win_h: f32) -> Option<(f32, f32, f32, f32)> {
+    let x = win_w - PLAYLIST_INSET - PLAYLIST_WIDTH;
+    let y = TITLE_BAND + PLAYLIST_TOP_GAP;
+    let h = win_h - y - PLAYLIST_BOTTOM;
+    if x < 0.0 || h < 48.0 {
+        return None;
+    }
+    Some((x, y, PLAYLIST_WIDTH, h))
+}
 
 /// 进度条量程未知时的兜底（元数据解析失败）。
 const SEEK_FALLBACK_MAX: f32 = 600.0;
@@ -85,9 +123,10 @@ const PROGRESS_GAP: f32 = 4.0;
 /// 轨道两端要和上面的图标字形对齐：图标在 20×20 盒子里图形只占 ~15（内缩
 /// 2.5），轨道贴盒子边就会比图标两端各宽 3px，看着像"轨道戳出来一截"。
 ///
-/// 这里写 2 而不是 3：胶囊自己还有 1px 描边，20 + 1 + 2 = 23 正好等于设计稿量到的
-/// 「时间码左沿 − 胶囊左沿 = 23」，轨道也就是 760 − 2×1 − 2×20 − 2×2 = 714。
-const PROGRESS_SIDE_PAD: f32 = 2.0;
+/// 这里取设计稿的 3：胶囊的 1px 描边改成了覆盖层（不再挤内容盒），
+/// 所以 20 + 3 = 23 就是设计稿量到的「时间码左沿 − 胶囊左沿」，
+/// 轨道也就是 760 − 2×20 − 2×3 = 714。
+const PROGRESS_SIDE_PAD: f32 = 3.0;
 /// 走带（播放控制）中点与相邻按钮的间距（设计稿实测 14）。
 ///
 /// 设计稿的节奏：播放键两侧各留 4 的呼吸（44 的圆 + 4 = 52 的视觉盒），
@@ -103,9 +142,10 @@ const CONTROLS_ROW: f32 = 44.0;
 const TIME_SIZE: f32 = 11.0;
 /// 音量条宽度（设计稿 96）。
 const VOLUME_WIDTH: f32 = 96.0;
-/// 视频信息卡宽度/高度（设计稿 240×180）。
+/// 视频信息卡宽度/高度（设计稿 240×180），圆角 12（比胶囊小一档）。
 const INFO_WIDTH: f32 = 240.0;
 const INFO_HEIGHT: f32 = 180.0;
+const INFO_RADIUS: f32 = 12.0;
 /// 信息卡与胶囊之间的间距（设计稿 16）。
 const INFO_GAP: f32 = 16.0;
 /// 底部为悬浮胶囊预留的高度。
@@ -526,6 +566,8 @@ pub struct PlayerView {
     cinema: bool,
     /// 悬浮播放列表面板是否展开（新版设计稿默认收起）
     playlist_open: bool,
+    /// 列表行是否已经切到浅底玻璃的字色（跟着 `video_active` 走）
+    playlist_on_glass: bool,
     /// 控制层（标题带 + 胶囊 + 底部遮罩）当前的透明度：1 全显、0 全隐。
     ///
     /// 视频播放中一段时间没有输入就淡到 0，鼠标一动淡回来（见 [`CHROME_IDLE`]）。
@@ -734,6 +776,7 @@ impl PlayerView {
             zoom_pending: None,
             cinema: false,
             playlist_open: false,
+            playlist_on_glass: false,
             chrome_alpha: 1.0,
             activity: Instant::now(),
             activity_moved: Rc::new(Cell::new(None)),
@@ -1323,7 +1366,8 @@ impl PlayerView {
 
         if self.info_open && self.video_active {
             if let Some((x, y, w, h)) = self.info_rect.get() {
-                layout.info_card = Some(UiRect::rounded(x, y, w, h, 12.).inflate(PAD));
+                layout.info_card =
+                    Some(UiRect::rounded(x, y, w, h, INFO_RADIUS).inflate(PAD));
             }
         }
 
@@ -2816,12 +2860,20 @@ impl PlayerView {
     /// 结构：头部 48（tab 切换 + 关闭）→ 分隔线 → 列表 → 分隔线 → 底部工具条 44。
     fn render_playlist_panel(&self, cx: &mut Context<Self>) -> impl gpui_kit::IntoElement {
         // 主题色先拷成局部量：下面要 `&mut cx` 建监听器，借着 `cx.theme()` 不放会冲突
-        let (bg, border) = {
+        let count = self.playlist.read(cx).delegate().track_count();
+        let chapter_tab = self.chapter_tab;
+        let glass = if self.video_active {
+            self.video.surface.glass(2)
+        } else {
+            None
+        };
+        let liquid = glass.is_some();
+        let (bg, border) = if self.video_active {
+            (overlay::milk(), crate::theme::latte::line())
+        } else {
             let t = cx.theme();
             (t.background, t.border)
         };
-        let count = self.playlist.read(cx).delegate().track_count();
-        let chapter_tab = self.chapter_tab;
 
         v_flex()
             .id("playlist-panel")
@@ -2832,11 +2884,34 @@ impl PlayerView {
             .bottom(px(PLAYLIST_BOTTOM))
             .w(px(PLAYLIST_WIDTH))
             .rounded(px(CAPSULE_RADIUS))
-            .bg(bg)
-            .border_1()
-            .border_color(border)
+            .when(!liquid, |el| el.bg(bg))
             .shadow_lg()
             .overflow_hidden()
+            .children(glass.map(|source| {
+                gpui_kit::img(source)
+                    .object_fit(gpui_kit::ObjectFit::Fill)
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .size_full()
+                    .into_any_element()
+            }))
+            // 描边压在贴图上面：GPUI 的 border 先于子节点绘制，留在根节点上会被
+            // 整幅玻璃盖掉（圆角那两段随之消失）。见 `render_capsule` 的说明。
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .size_full()
+                    .rounded(px(CAPSULE_RADIUS))
+                    .border_1()
+                    .border_color(if liquid {
+                        overlay::liquid_light_edge()
+                    } else {
+                        border
+                    }),
+            )
             .child(self.render_playlist_header(cx))
             .child(div().w_full().h(px(1.)).flex_shrink_0().bg(border))
             // List 默认带 8px 左右内边距；设计稿行胶囊离面板边 12，所以这里给 12。
@@ -2855,7 +2930,11 @@ impl PlayerView {
                         el.child(List::new(&self.playlist).px(px(12.)))
                     }),
             )
-            .child(div().w_full().h(px(1.)).flex_shrink_0().bg(border))
+            .child(div().w_full().h(px(1.)).flex_shrink_0().bg(if self.video_active {
+                crate::theme::latte::line()
+            } else {
+                cx.theme().border
+            }))
             .child(self.render_playlist_footer(count, cx))
     }
 
@@ -2864,7 +2943,11 @@ impl PlayerView {
     /// tab 是**药丸**（选中态 Mauve 12% 底 + Mauve 字），不是下划线——设计稿里
     /// 它和胶囊、信息卡一样都是圆角块，下划线那套在深色玻璃上太重。
     fn render_playlist_header(&self, cx: &mut Context<Self>) -> Div {
-        let muted_fg = cx.theme().muted_foreground;
+        let muted_fg = if self.video_active {
+            crate::theme::latte::subtext()
+        } else {
+            cx.theme().muted_foreground
+        };
         let active = self.chapter_tab;
 
         h_flex()
@@ -2902,7 +2985,13 @@ impl PlayerView {
         selected: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let (accent, muted, muted_fg) = {
+        let (accent, muted, muted_fg) = if self.video_active {
+            (
+                crate::theme::latte::accent(),
+                crate::theme::latte::mantle(),
+                crate::theme::latte::subtext(),
+            )
+        } else {
             let t = cx.theme();
             (t.primary, t.muted, t.muted_foreground)
         };
@@ -2931,7 +3020,13 @@ impl PlayerView {
 
     /// 「章节」页：mpv 的 `chapter-list`（没有章节时给一句实话）。
     fn render_chapter_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let (muted, muted_fg, fg) = {
+        let (muted, muted_fg, fg) = if self.video_active {
+            (
+                crate::theme::latte::mantle(),
+                crate::theme::latte::subtext(),
+                crate::theme::latte::text(),
+            )
+        } else {
             let t = cx.theme();
             (t.muted, t.muted_foreground, t.foreground)
         };
@@ -3012,9 +3107,16 @@ impl PlayerView {
     /// 三段都是 `flex_1`（等宽），中间那段才真的在面板正中——和胶囊一个道理，
     /// 只有 `justify_between` 会让中段被两侧宽度带偏。
     fn render_playlist_footer(&self, count: usize, cx: &mut Context<Self>) -> Div {
-        let muted_fg = cx.theme().muted_foreground;
-        let fg = cx.theme().foreground;
-        let accent = cx.theme().primary;
+        let (muted_fg, fg, accent) = if self.video_active {
+            (
+                crate::theme::latte::subtext(),
+                crate::theme::latte::text(),
+                crate::theme::latte::accent(),
+            )
+        } else {
+            let t = cx.theme();
+            (t.muted_foreground, t.foreground, t.primary)
+        };
         let repeat = self.settings.repeat;
         let shuffle = self.settings.shuffle;
         let sort = self.settings.sort;
@@ -3349,17 +3451,67 @@ impl PlayerView {
             ("音频", audio),
         ];
 
+        let glass = if self.video_active {
+            self.video.surface.glass(1)
+        } else {
+            None
+        };
+        let liquid = glass.is_some();
         div()
             .id("video-info-card")
             .test_support()
             .w(px(INFO_WIDTH))
             .h(px(INFO_HEIGHT))
-            .rounded(px(12.))
-            .bg(overlay::glass())
-            .border_1()
-            .border_color(overlay::border())
+            .rounded(px(INFO_RADIUS))
+            .overflow_hidden()
+            .when(!liquid, |el| el.bg(overlay::glass()))
             .shadow_lg()
             .p(px(12.))
+            .children(glass.map(|source| {
+                gpui_kit::img(source)
+                    .object_fit(gpui_kit::ObjectFit::Fill)
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .size_full()
+                    .into_any_element()
+            }))
+            // 描边画在贴图上面（GPUI 的 border 先于子节点绘制，留在根节点上会被
+            // 整幅玻璃盖掉），圆角因此左右两段都连续，见 `render_capsule` 的说明。
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.))
+                    .left(px(0.))
+                    .size_full()
+                    .rounded(px(INFO_RADIUS))
+                    .border_1()
+                    .border_color(if liquid {
+                        overlay::liquid_edge()
+                    } else {
+                        overlay::border()
+                    }),
+            )
+            .when(!liquid, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .h(px(1.))
+                        .bg(overlay::highlight()),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .h(px(1.))
+                        .bg(overlay::shade()),
+                )
+            })
             .child(
                 canvas(
                     move |bounds, _window, _cx| {
@@ -3399,7 +3551,7 @@ impl PlayerView {
                                     div()
                                         .flex_shrink_0()
                                         .text_size(px(11.))
-                                        .text_color(overlay::label())
+                                        .text_color(overlay::dim())
                                         .child(label),
                                 )
                                 .child(
@@ -3420,29 +3572,72 @@ impl PlayerView {
             )
     }
 
+    /// 视频态下列表用 Latte 字色（浅底玻璃），其它时候跟主题走。
+    fn sync_playlist_ink(&mut self, cx: &mut Context<Self>) {
+        let on = self.video_active;
+        if self.playlist_on_glass == on {
+            return;
+        }
+        self.playlist_on_glass = on;
+        self.playlist.update(cx, |state, cx| {
+            if state.delegate_mut().set_light_glass(on) {
+                cx.notify();
+            }
+        });
+    }
+
+    /// 按当前窗口和面板开关重烤液态玻璃。位置/帧没变时烘焙器自己会跳过。
+    fn sync_liquid_glass(&mut self, window: &mut Window) {
+        let size = window.bounds().size;
+        let win_w = size.width.as_f32();
+        let win_h = size.height.as_f32();
+        let playlist = self.playlist_open && !self.cinema;
+        let mut jobs = Vec::with_capacity(3);
+        if self.chrome_alpha > 0.01 {
+            if let Some((x, y, w, h)) = capsule_box(win_w, win_h, playlist) {
+                jobs.push(GlassJob::capsule(x, y, w, h));
+            }
+            if self.info_open {
+                if let Some((x, y, w, h)) = info_box(win_w, win_h) {
+                    jobs.push(GlassJob::info(x, y, w, h));
+                }
+            }
+        }
+        if playlist {
+            if let Some((x, y, w, h)) = playlist_box(win_w, win_h) {
+                jobs.push(GlassJob::playlist(x, y, w, h));
+            }
+        }
+        let hue = self.tint_applied.or_else(|| self.video.surface.tint());
+        self.video
+            .surface
+            .sync_glass(win_w, win_h, &jobs, hue, window);
+    }
+
     /// 悬浮胶囊：两行进度区 + 控制行，深色玻璃，**固定 760 宽**。
     ///
     /// 高度是算出来的：8 + 24（进度区：时间行 16 + 4 + 轨道 4）+ 8 + 44（走带）
     /// + 8 = 92，正好是设计稿的 92。所有尺寸都是常数，不随窗口拉伸——设计稿里它
     /// 是画面下方的一条窄带，两侧留出画面，不是铺满整宽的黑条。
     ///
-    /// 三层的**先后顺序**是这张图的关键（后画的在上面）：
-    /// ① L3 画面模糊（整块铺满）→ ② L1 深色玻璃（60~74% 半透明，模糊从它底下
-    /// 透出来）→ ③ L2 染色（画面色相，α .26/.08）。所以玻璃底色不能写成
-    /// `.bg()`：`bg` 在子节点**之前**画，会被模糊层整块盖住，胶囊就变成一块
-    /// 亮色的磨砂板，浅色时间码在上面根本看不清。
+    /// 有视频帧时底子是 L4 液态玻璃贴图（折射 + 压暗已经烤在里面）。贴图还没
+    /// 出来时退回 L1 渐变 + L2 染色，避免起播那一帧是一块透的。
     fn render_capsule(&self, cx: &mut Context<Self>) -> Div {
         // 外框负责定位/圆角，内层负责 padding —— 夹在中间的 canvas 量到的
         // 就是胶囊的真实外框（含 padding），算几何时不会差一圈。
         let slot = self.capsule_rect.clone();
+        let glass = if self.video_active {
+            self.video.surface.glass(0)
+        } else {
+            None
+        };
+        let liquid = glass.is_some();
         div()
             .w(px(CAPSULE_WIDTH))
             .max_w_full()
             .rounded(px(CAPSULE_RADIUS))
             // 圆角裁掉 1px 内描边和染色层探出去的那点角
             .overflow_hidden()
-            .border_1()
-            .border_color(overlay::edge())
             // 接触阴影 + 环境阴影：贴地那层负责"压住"，散开那层负责"浮起来"
             .shadow(vec![
                 BoxShadow {
@@ -3460,10 +3655,9 @@ impl PlayerView {
                     inset: false,
                 },
             ])
-            // ① L3 画面模糊：48×20 的底部缩略图拉到整块胶囊，GPU 的双线性插值
-            // 本身就是一次大半径模糊（见 `video_surface`）。没有画面时这一层不画，
-            // 后面那层玻璃底色照样给出一块完整的深色。
-            .children(self.video.surface.blur().map(|source| {
+            // 液态玻璃贴图是不透明的（圆角外 alpha 0），压暗和染色已经烤在里面。
+            // 没有贴图时才退回 L1 渐变 + L2 染色，否则渐变会盖住折射。
+            .children(glass.map(|source| {
                 gpui_kit::img(source)
                     .object_fit(gpui_kit::ObjectFit::Fill)
                     .absolute()
@@ -3472,43 +3666,75 @@ impl PlayerView {
                     .size_full()
                     .into_any_element()
             }))
-            // ② L1 定向光：竖向渐变（上偏蓝灰、下压深黑），不是一块平底色
+            .when(!liquid, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
+                        .size_full()
+                        .bg(crate::theme::v_gradient(
+                            overlay::capsule_top(),
+                            overlay::capsule_bottom(),
+                        )),
+                )
+            })
+            .when(!liquid, |el| {
+                el.when_some(self.tint_applied, |el, hue| {
+                    el.child(div().absolute().top(px(0.)).left(px(0.)).size_full().bg(
+                        crate::theme::v_gradient(overlay::tint(hue, 0.26), overlay::tint(hue, 0.08)),
+                    ))
+                })
+            })
+            // 1px 描边必须**画在贴图上面**。
+            //
+            // GPUI 的 border 和 `bg()` 一样在子节点**之前**绘制（`Div::paint` 里先
+            // 走 interactivity 的背景/边框，再逐个 paint 子元素），所以根节点上的
+            // `border_1()` 会被整幅玻璃贴图完整盖住——圆角处那条"断开的边"就是
+            // 它：玻璃的边只有贴图里烤的 INNER_SHADE，白色描边根本不存在。
+            // 这里换成一个同样带圆角的空节点当描边层，铺在贴图之上；顺带让 GPUI
+            // 的圆角裁剪把描边也抗锯齿掉。
             .child(
                 div()
                     .absolute()
                     .top(px(0.))
                     .left(px(0.))
                     .size_full()
-                    .bg(crate::theme::v_gradient(
-                        overlay::capsule_top(),
-                        overlay::capsule_bottom(),
-                    )),
+                    .rounded(px(CAPSULE_RADIUS))
+                    .border_1()
+                    .border_color(if liquid {
+                        overlay::liquid_edge()
+                    } else {
+                        overlay::edge()
+                    }),
             )
-            // ③ L2 画面染色（取不到画面时这一层干脆不画）
-            .when_some(self.tint_applied, |el, hue| {
-                el.child(div().absolute().top(px(0.)).left(px(0.)).size_full().bg(
-                    crate::theme::v_gradient(overlay::tint(hue, 0.26), overlay::tint(hue, 0.08)),
-                ))
+            // 1px 顶亮 / 底暗只在没有贴图时画。
+            //
+            // 液态玻璃的边必须**沿圆角连续**：这两条是绝对定位的矩形，圆角那一段
+            // 会被外层裁掉，于是顶边的亮线在进圆角处突然断掉、弧上只剩贴图的边圈，
+            // 看着像描边缺了一截。贴图在场时改由上面那层 `border_1()` 沿圆角整圈
+            // 描边（GPUI 的圆角边框自带抗锯齿），厚度感交给折射本身。
+            .when(!liquid, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .h(px(1.))
+                        .bg(overlay::highlight()),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .h(px(1.))
+                        .bg(overlay::shade()),
+                )
             })
-            // L1 的两道 1px 内描边：上沿吃光、下沿压暗，玻璃才有一层厚度
-            .child(
-                div()
-                    .absolute()
-                    .top(px(0.))
-                    .left(px(0.))
-                    .right(px(0.))
-                    .h(px(1.))
-                    .bg(overlay::highlight()),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(0.))
-                    .left(px(0.))
-                    .right(px(0.))
-                    .h(px(1.))
-                    .bg(overlay::shade()),
-            )
+
             .child(
                 canvas(
                     move |bounds, _window, _cx| {
@@ -4190,6 +4416,13 @@ impl PlayerView {
 
 impl Render for PlayerView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 液态玻璃要在组元素之前烤好：这一帧的贴图才能被胶囊 / 信息卡 / 歌单用上。
+        // 列表字色跟着视频态走，深色主题下奶白面板才读得清。
+        self.sync_playlist_ink(cx);
+        if self.video_active {
+            self.sync_liquid_glass(window);
+        }
+
         // 拖放：GPUI 把系统的文件拖放转成内部拖拽（载荷类型是 ExternalPaths），
         // 松开时在鼠标下的元素上派发 MouseUp；把监听挂在根节点，整个窗口都是投放区。
         let drop_view = cx.weak_entity();

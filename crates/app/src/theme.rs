@@ -258,15 +258,12 @@ fn config(name: &str, mode: ThemeMode, p: &Palette) -> ThemeConfig {
 /// 亮场景、也会把暗场景吃掉。IINA 在浅色系统下 OSC 同样走深色玻璃，这里照此处理；
 /// 唯一贯穿两套体系的是 Mauve。
 ///
-/// 设计稿玻璃底是 `#0B0C10` 60% + backdrop blur 32。Windows 上没有 backdrop blur，
-/// 60% 压在亮画面上文字会糊，所以这里加浓到 72%。
+/// 设计稿玻璃底是 `#0B0C10` 60% + backdrop blur 32。没有视频帧可折射时（刚起播、
+/// 音频模式）退回这块 72% 的平底，亮画面上 11px 字才站得住。
 ///
-/// 质感按 `design/spec.json → texture_layers` 的三层来：
-/// - **L1 定向光**（[`capsule_top`]/[`capsule_bottom`]/[`edge`]/[`highlight`]/
-///   [`shade`]/[`contact`]/[`ambient`]）：纯样式，已经落地；
-/// - **L2 画面染色**（[`tint_layer`]）：一次缩略图取色，已经落地；
-/// - **L3 真背景模糊**：`--wid` 叠加窗这条渲染路径拿不到区域级 backdrop blur，
-///   要等把 libmpv 的 render API 接进 GPUI 自己的合成树，暂时不做。
+/// 视频在播时，胶囊 / 视频信息 / 播放列表走 L4 液态玻璃（`liquid_glass`）：
+/// 对位采样的两档模糊 + 边缘折射，压暗和染色烤进贴图。这里的 L1 色值只作
+/// 那张贴图还没出来时的兜底，以及贴图上面那条 1px 顶亮/底暗。
 pub mod overlay {
     use gpui_kit::Hsla;
 
@@ -306,6 +303,25 @@ pub mod overlay {
     /// 胶囊描边：白 14%（比信息卡的 10% 亮一档——它压在画面上、要显出「一片玻璃」）
     pub fn edge() -> Hsla {
         gpui_kit::rgba(0xFFFFFF24).into()
+    }
+
+    /// 液态玻璃暗底描边：白 12%。形状靠折射，描边只留一丝。
+    ///
+    /// 液态玻璃只有这一圈边：原来另加的「1px 顶亮 / 底暗」是绝对定位的矩形，
+    /// 圆角那一段会被外层裁掉，顶边亮线在进圆角处突然断掉。整圈描边走 `border`
+    /// 才能沿圆角连续（GPUI 的圆角边框自带抗锯齿）。
+    pub fn liquid_edge() -> Hsla {
+        gpui_kit::rgba(0xFFFFFF1F).into()
+    }
+
+    /// 液态玻璃浅底（播放列表）描边：`rgba(188,192,204,.45)`。
+    pub fn liquid_light_edge() -> Hsla {
+        gpui_kit::rgba(0xBCC0CC73).into()
+    }
+
+    /// 奶白 `#EFF1F5`。浅底玻璃贴图还没烤出来时的兜底，和面纱是同一个色。
+    pub fn milk() -> Hsla {
+        gpui_kit::rgb(0xEFF1F5).into()
     }
 
     /// 上沿 1px 内高光：`rgba(255,255,255,.16)`
@@ -364,16 +380,12 @@ pub mod overlay {
         gpui_kit::rgb(0xD5D9E2).into()
     }
 
-    /// 浮层次要文字（剩余时间、标题带）
-    pub fn dim() -> Hsla {
-        gpui_kit::rgb(0x8B909C).into()
-    }
-
-    /// 信息卡里的字段名（设计稿 `#A6ADC8`）。
+    /// 浮层次要文字：剩余时间、标题带文件名、信息卡字段名、拖放/错误提示的说明行。
     ///
-    /// 比 `dim()` 亮一档：信息卡是**要读**的卡片，成对出现的 label 太暗就只剩
-    /// 右边一列值，扫读时对不上号。
-    pub fn label() -> Hsla {
+    /// 取 `spec.json → tokens.osc.text_secondary`（`#A6ADC8`，即 Mocha 的 Overlay1）。
+    /// 曾经写 `#8B909C`：在亮画面（黄/绿彩条）上剩余时间几乎读不出来，而设计稿里
+    /// 它和 OSD 的 label 是同一个颜色——两个值合并成一个。
+    pub fn dim() -> Hsla {
         gpui_kit::rgb(0xA6ADC8).into()
     }
 
@@ -402,6 +414,37 @@ pub mod overlay {
     /// 只会把玻璃染得更黑）。混入比例上 26%、中 8%。
     pub fn tint(hue: f32, alpha: f32) -> Hsla {
         gpui_kit::hsla(hue / 360.0, 0.46, 0.36, alpha)
+    }
+}
+
+/// 浅底玻璃上的字色。播放列表压在画面上时固定走 Latte，不跟深色主题走——
+/// 底是奶白，深色主题的浅字会直接融进去。
+pub mod latte {
+    use gpui_kit::Hsla;
+
+    pub fn text() -> Hsla {
+        gpui_kit::rgb(0x4C4F69).into()
+    }
+
+    pub fn mantle() -> Hsla {
+        gpui_kit::rgb(0xE6E9EF).into()
+    }
+
+    pub fn subtext() -> Hsla {
+        gpui_kit::rgb(0x6C6F85).into()
+    }
+
+    pub fn accent() -> Hsla {
+        gpui_kit::rgb(0x8839EF).into()
+    }
+
+    pub fn line() -> Hsla {
+        gpui_kit::rgb(0xCCD0DA).into()
+    }
+
+    /// Mauve 10%，当前曲目那一行的底。
+    pub fn row() -> Hsla {
+        gpui_kit::rgba(0x8839EF1A).into()
     }
 }
 
