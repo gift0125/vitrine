@@ -183,8 +183,24 @@
     "why_not_animation": "不用 with_animation：那个动画只在有帧驱动时推进，而这里的帧是 tick 拉起来的。",
   "preview": "design/preview/index.html?idle=1 冻结该状态；?bare=1 去掉页面留白和工具条，截图区域正好是窗口本身",
   "motion": {
-    "status": "HTML 原型已实现（2026-10-20）；Rust 未做。",
+    "status": "HTML 原型已实现（2026-10-20）；Rust 侧接入路径已定（见 rust_landing），实现未做。",
     "principle": "两条动作分开做，因为它们不是同一种东西：标题带是**信息**，走「向上收走」；控制栏是**材质**，走「散成尘」。方向一致（向外 + 向上），读者才觉得是一起退场。",
+    "rust_landing": {
+      "one_line": "不新开渲染通道：粒子是既有 GlassPlate 烘焙里的一个新 pass，不是一套独立的渲染层。",
+      "pipeline": "libmpv sw render → BGRA → GlassBaker::ingest() → sync(win_w, win_h, jobs, hue, dpi) → plates() → render_image() → GPUI img() → drop_image 退役（RETIRED_KEEP=8）。",
+      "what_render_api_gives": "render API 给的是**视频帧像素**，不是「画 UI 的能力」——胶囊、文字、按钮仍是 GPUI 的矢量节点，不在 mpv 帧里。所以玻璃必须 ingest（要模糊背后的画面）；粒子**不需要** ingest（像素由它自己生成）。真正被复用的是后半段 `BGRA → RenderImage → img()` 那条 CPU 贴图上屏通道，它和视频无关。",
+      "why_bake_into_plate": "加色混合（lighter）在 GPUI 的层叠里没有逐节点入口，在 BGRA 里就是一次饱和加法。这是「烘进贴图」的决定性理由，不是妥协。顺带省掉 340 个节点的布局与绘制。",
+      "why_no_dual_channel": "粒子与玻璃在时间上几乎不重叠：退场时胶囊本体 .18s 就淡出，粒子接管；回场时粒子在聚、玻璃直接用上一次的烘焙结果。所以不需要「玻璃 plate + 粒子 plate」两层叠加，同一张贴图分时复用即可。",
+      "needs_three_edits": [
+        "GlassJob 增加相位于项（或 phase: Option<f32>）：粒子的位置由胶囊几何 + 相位决定，几何已在 job 里",
+        "bake_key / JobKey 必须把相位量化进 key——现在 key 只含 generation | win_w/h | hue | dpi | 三个 (x,y,w,h)，相位变了会被判「没变」直接 return false，粒子一帧都不会重画",
+        "粒子在跑时绕过 BAKE_MIN_INTERVAL（20ms）：那个节流是防「整帧烘焙拖垮 UI」，而粒子期间玻璃 pass 走缓存、成本降到约 1/40，可以安全跳过"
+      ],
+      "reuse": "取点与法线复用折射层同一个圆角矩形 SDF（GlassJob 已有 x/y/w/h/radius，coverage_one 等函数都在），所以「一套粒子模拟」实际只是：一张预生成 sprite + 340 个位置积分（每个每帧 6 次浮点运算）。",
+      "cost": "胶囊 plate 28 万像素 @2x；一次玻璃 bake ≈ 50 万次双线性采样。粒子 pass 每帧约 1.2 万像素写入（340 × 约 36px sprite），并跳过玻璃重算。上传 1.1MB/帧，50fps × 640ms ≈ 32 帧。",
+      "open_risk": "每帧 plates() → to_vec() 会新分配 1.1MB 堆内存（retired 队列 8 个就 drop）。32 帧连续烘焙要确认没有明显分配抖动；必要时改成复用 buffer。",
+      "not_doing": "不做「预生成 N 帧贴图序列、代码端按时间轴重放」：几何（窗口缩放、面板开合、DPI 切换）一变就全废，而现算成本只有玻璃的 1/40。"
+    },
     "title_band": {
       "what": "标题 translateY(-12px) + opacity 0；窗口按钮 translateY(-7px)",
       "curve": "transform .36s cubic-bezier(.22,.78,.28,1)，opacity .22s ease",
