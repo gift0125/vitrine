@@ -54,4 +54,10 @@
 - **玻璃面的位置别用 `offsetLeft`**：只对居中成立；一律 `(el.rect - win.rect) / scale`。
 - **液态玻璃要进代码前先修采样**：L3 现在是「整块缩略图铺满胶囊」，**不对位**，做折射
   必须换成矩形区域对位采样；且折射要两份模糊（体部 ≈ 32 / 边圈 ≈ 7）。
+- **控制层退场是两条动作，不是一条**：标题带（信息）向上收 12px + 淡；胶囊（材质）散成
+  粒子——只在 12px 轮廓带按 SDF 加权取点、沿法线外推 + 浮力、`delay` 随贴边程度走。
+  粒子用预渲染 sprite + `drawImage`（硬边 arc 像噪点，逐帧建渐变会垮）。
+- **headless 的 `--virtual-time-budget` 不推进 CSS transition**（只推进 `setTimeout`），
+  `?bare=1` 又带 `transition:none!important`：动效只能靠端点态 + `transitionProperty`
+  读数验证，截不到中间帧。
 - 并行会话会顺手 `git add -A`：判断「这轮改了多少」看工作区 vs HEAD，别信 `git diff` 行数。

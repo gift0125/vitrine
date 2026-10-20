@@ -69,10 +69,40 @@ body{
 /* ---------- 控制层闲置淡出 ----------
    对齐 App 的 chrome_visible_target：只有「视频 + 在播 + 2.5s 没输入」才淡；
    暂停、面板打开、正在拖进度都不淡（那会儿用户在读东西）。
-   淡出后 pointer-events 一并关掉——否则会留下看不见但点得到的按钮。 */
-.traffic,.title,.capsule{transition:opacity .22s ease}
-.window.idle .traffic,.window.idle .title,.window.idle .capsule{opacity:0;pointer-events:none}
+   淡出后 pointer-events 一并关掉——否则会留下看不见但点得到的按钮。
+
+   两条动作分开做，因为它们不是同一种东西：
+   - 标题带是**信息**，走「向上收走」：位移 12px + 淡出，回来时落回原位；
+   - 控制栏是**材质**，走「散成尘」：CSS 只负责淡掉本体，形体交给粒子层。
+     两者用同一条缓动方向（向外 + 向上），读者才觉得是"一起退场"。 */
+
+/* 标题带：向上收走 */
+.traffic,.title{transition:opacity .22s ease, transform .36s cubic-bezier(.22,.78,.28,1)}
+/* 顶部压暗本来只为托住标题，标题走了它就没有存在理由——一起淡，画面更整 */
+.mask-top{transition:opacity .42s ease}
+.window.idle .traffic{opacity:0;transform:translateY(-7px);pointer-events:none}
+.window.idle .title{opacity:0;transform:translateY(-12px)}
+.window.idle .mask-top{opacity:0}
+
+/* 控制栏：本体淡得快（.18s），剩下那点"余像"由粒子接住；回来时让位给聚拢（延迟 .07s） */
+.capsule{transition:opacity .26s ease .07s, transform .36s cubic-bezier(.22,.78,.28,1)}
+.window.idle .capsule{
+  opacity:0;pointer-events:none;
+  transform:translateX(-50%) translateY(3px) scale(.985);
+  transition:opacity .18s ease, transform .28s cubic-bezier(.4,0,1,1);
+}
 .window.idle .mask-bottom{opacity:0}
+
+/* 粒子层：盖在胶囊之上，只画不接事件。canvas 是替换元素，尺寸必须显式给 */
+.dissolve{position:absolute;left:0;top:0;width:100%;height:100%;
+  z-index:8;pointer-events:none;display:block}
+
+/* 减少动态：去掉位移与粒子，只留淡出（宁可朴素，不要晕） */
+@media (prefers-reduced-motion: reduce){
+  .window.idle .traffic,.window.idle .title{transform:none}
+  .window.idle .capsule{transform:translateX(-50%)}
+  .dissolve{display:none}
+}
 
 /* ---------- 标题带 ---------- */
 .traffic{position:absolute;left:24px;top:24px;display:flex;gap:8px;z-index:6}
@@ -569,6 +599,9 @@ body.bare .traffic,body.bare .title,body.bare .capsule,body.bare .mask-bottom{tr
           </div>
         </div>
       </div>
+
+      <!-- 粒子消散层：控制栏闲置退场时「散成尘」，聚回时反过来（见脚本 DUST） -->
+      <canvas class="dissolve" aria-hidden="true"></canvas>
     </div>
   </div>
 
@@ -1109,19 +1142,178 @@ document.getElementById('btnPlay').addEventListener('click', () => {
    App 侧是 2500ms 计时 + 0.25/100ms 步进（见 CHROME_IDLE / CHROME_FADE_STEP），
    这里用 CSS 过渡近似，别照搬时长曲线。 */
 const IDLE_MS = 2500;
-let idleTimer = null;
+let idleTimer = null, isIdle = false;
 const osdEl = document.getElementById('osd');
 const plEl = document.getElementById('playlist');
 function panelsOpen(){ return osdEl.classList.contains('on') || plEl.classList.contains('on'); }
+
+function goIdle(){
+  if(isIdle) return;
+  isIdle = true;
+  motes('scatter');        // 先撒：此刻胶囊还在原位，量到的几何才是准的
+  win.classList.add('idle');
+}
 function wake(){
-  win.classList.remove('idle');
+  if(isIdle){
+    isIdle = false;
+    motes('gather');       // 先聚：让"尘"落回原位，本体随后淡入
+    win.classList.remove('idle');
+  }
   clearTimeout(idleTimer);
-  if(playing && !panelsOpen()) idleTimer = setTimeout(() => win.classList.add('idle'), IDLE_MS);
+  if(playing && !panelsOpen()) idleTimer = setTimeout(goIdle, IDLE_MS);
 }
 ['pointermove','pointerdown','pointerup','keydown','wheel'].forEach(ev =>
   window.addEventListener(ev, wake, {passive:true}));
 document.getElementById('btnPl').addEventListener('click', () => setTimeout(wake, 0));
 document.getElementById('btnInfo').addEventListener('click', () => setTimeout(wake, 0));
+
+/* ---------- 粒子消散（鸿蒙「沉浸光感」那条：材质不是淡出，是散成尘） ----------
+   四条取值理由，改参数前先看：
+
+   1. **只从轮廓带取点**（12px，按 exp(d/6) 加权）。整块一起碎会像沙漏；真实材质是
+      边先松、中心最后走——中心那块厚度最大，本来就最晚散。
+   2. **法线外推 + 浮力**。位移沿圆角矩形 SDF 的梯度（和折射同一个场，所以两者
+      在空间上是"同一块玻璃"），再叠一点向上的加速度。全程 easeOut：鸿蒙是气态，
+      不是爆炸，没有初速冲击。
+   3. **三种尺度混着撒**：细尘 62%（小、快、贴边）/ 绒絮 30%（大、慢、飘远）/
+      亮屑 8%（alpha 满）。单一尺寸像噪点，三种才有"体积"。
+   4. **加色混合**（`lighter`）。粒子是光尘；用 source-over 在亮画面上会变成脏点。
+      代价是雪地 / 白墙那种亮画面里几乎看不见——和"光"本身的性质一致，接受。
+
+   聚回（wake）用同一套粒子倒着走，只是时长更短（520ms）：聚是"响应"，不该让
+   用户等；而且它必须在胶囊淡入完成前就成形，否则会像被擦掉而不是"凝"起来。 */
+const DUST = {
+  scatterMs: 640,
+  gatherMs: 520,
+  count: 340,
+  band: 12,      // 轮廓带宽度（逻辑 px）
+  push: 24,      // 沿法线推开的距离上限
+  rise: 16,      // 浮力：额外向上的位移
+  alpha: 0.55
+};
+
+const motesEl = document.querySelector('.dissolve');
+const mctx = motesEl ? motesEl.getContext('2d') : null;
+let motesParts = [], motesMode = null, motesT0 = 0, motesDur = 0, motesRaf = 0;
+
+/* 粒子贴图：一次画好的软光点，逐帧 drawImage。
+   用硬边的 arc 填圆会读成"噪点"；光点有衰减才有体积，而逐帧建渐变会拖死 60fps。 */
+const moteSprite = (() => {
+  const c = document.createElement('canvas');
+  c.width = c.height = 32;
+  const g = c.getContext('2d');
+  const grd = g.createRadialGradient(16, 16, 0, 16, 16, 16);
+  grd.addColorStop(0, 'rgba(255,255,255,1)');
+  grd.addColorStop(0.32, 'rgba(255,255,255,.62)');
+  grd.addColorStop(0.66, 'rgba(255,255,255,.16)');
+  grd.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grd;
+  g.fillRect(0, 0, 32, 32);
+  return c;
+})();
+
+function reduceMotion(){ return matchMedia('(prefers-reduced-motion: reduce)').matches; }
+
+/* canvas 是替换元素：CSS 给了 100%，但位图尺寸得自己按 dpr 开 */
+function motesSize(){
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  const w = Math.round(1280 * dpr), h = Math.round(800 * dpr);
+  if(motesEl.width !== w || motesEl.height !== h){ motesEl.width = w; motesEl.height = h; }
+  mctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+/* 元素在**窗口坐标系**（1280×800 逻辑像素）里的矩形。
+   不要用 offsetLeft：`fit()` 给的是 transform 缩放，offset 那套量不到。 */
+function rectInWin(el){
+  const a = el.getBoundingClientRect(), b = win.getBoundingClientRect();
+  const s = b.width / 1280 || 1;
+  return { x: (a.left - b.left) / s, y: (a.top - b.top) / s, w: a.width / s, h: a.height / s };
+}
+
+function sdfRR(x, y, r, R){
+  const qx = Math.abs(x - (r.x + r.w / 2)) - (r.w / 2 - R);
+  const qy = Math.abs(y - (r.y + r.h / 2)) - (r.h / 2 - R);
+  return Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - R;
+}
+/* SDF 的梯度就是外法线：直边取轴向、圆角取径向，和折射层用的是同一个场 */
+function sdfNormal(x, y, r, R){
+  const e = 0.6;
+  const gx = sdfRR(x + e, y, r, R) - sdfRR(x - e, y, r, R);
+  const gy = sdfRR(x, y + e, r, R) - sdfRR(x, y - e, r, R);
+  const l = Math.hypot(gx, gy) || 1;
+  return [gx / l, gy / l];
+}
+
+function seedMotes(r, R, n){
+  const out = [];
+  let guard = 0;
+  while(out.length < n && guard++ < n * 120){
+    const x = r.x + Math.random() * r.w;
+    const y = r.y + Math.random() * r.h;
+    const d = sdfRR(x, y, r, R);
+    if(d > 0) continue;                                   // 矩形外
+    const near = Math.exp(d / (DUST.band * 0.42));         // 贴边 1 → 带内沿 ~0.06
+    if(Math.random() > near) continue;
+    const [nx, ny] = sdfNormal(x, y, r, R);
+    const k = Math.random();
+    const fine = k < 0.6, fluff = k < 0.9;
+    out.push({
+      x, y, nx, ny,
+      dist: DUST.push * (0.45 + Math.random() * 0.55) * (fine ? 0.68 : 1),
+      r: fine ? 0.5 + Math.random() * 0.45 : fluff ? 0.9 + Math.random() * 0.7 : 0.4 + Math.random() * 0.22,
+      a: DUST.alpha * (fluff ? 0.5 + Math.random() * 0.45 : 1),
+      // 贴边先松、内侧后走：材质是边先碎，中心那块最厚、最后走
+      delay: 0.2 * (1 - near) + Math.random() * 0.12,
+      span: 0.62 + Math.random() * 0.38,
+      ph: Math.random() * 6.2832,
+      wob: 0.5 + Math.random() * 1.6
+    });
+  }
+  return out;
+}
+
+function motes(mode, freeze){
+  if(!mctx || reduceMotion()) return;
+  motesSize();
+  motesParts = seedMotes(rectInWin(document.querySelector('.capsule')), 14, DUST.count);
+  motesMode = mode;
+  motesDur = mode === 'scatter' ? DUST.scatterMs : DUST.gatherMs;
+  motesT0 = performance.now() - (freeze == null ? 0 : freeze * motesDur);
+  if(freeze != null){ motesFrame(motesT0); return; }   // 截图/评审用：冻结在这一相位
+  if(!motesRaf) motesRaf = requestAnimationFrame(motesFrame);
+}
+
+function motesFrame(now){
+  const u = Math.min(1, (now - motesT0) / motesDur);
+  const scatter = motesMode === 'scatter';
+  mctx.clearRect(0, 0, 1280, 800);
+  mctx.globalCompositeOperation = 'lighter';
+  for(const p of motesParts){
+    const pu = Math.min(1, Math.max(0, (u - p.delay) / p.span));
+    if(pu <= 0 || pu >= 1) continue;
+    // 散：快脱开再减速（气被推开）；聚：走的距离从远端倒回 0，收尾变慢（被吸住）
+    const e = scatter ? 1 - Math.pow(1 - pu, 3) : Math.pow(1 - pu, 2);
+    // 切向摆：让"气"有漂浮感，而不是一条条直线射出去
+    const w = Math.sin(pu * 5 + p.ph) * p.wob * e;
+    const x = p.x + p.nx * p.dist * e - p.ny * w;
+    const y = p.y + p.ny * p.dist * e - DUST.rise * e * e + p.nx * w;
+    const a = scatter ? p.a * Math.pow(1 - pu, 1.5) : p.a * Math.sin(Math.PI * pu) * 0.9;
+    if(a <= 0.004) continue;
+    const rad = p.r * (scatter ? 1 - 0.3 * pu : 0.7 + 0.3 * pu);
+    const s = rad * 2.8;      // 贴图是软边，视觉核心约等于 s/2.8
+    mctx.globalAlpha = a;
+    mctx.drawImage(moteSprite, x - s, y - s, s * 2, s * 2);
+  }
+  mctx.globalAlpha = 1;
+  mctx.globalCompositeOperation = 'source-over';
+  if(u < 1){
+    motesRaf = requestAnimationFrame(motesFrame);
+  } else {
+    motesRaf = 0;
+    motesParts = [];
+    mctx.clearRect(0, 0, 1280, 800);
+  }
+}
 
 /* ---------- 播放列表数据：与设计稿 21:170 逐字一致 ---------- */
 const items = [
@@ -1161,8 +1353,13 @@ if(qs.get('panel')){
   if(want.includes('playlist') || want.includes('both')) playlist.classList.add('on');
   syncPanels();
 }
-/* ?idle=1 冻结在「闲置淡出」状态，方便截图/评审 */
-if(qs.get('idle') !== null) win.classList.add('idle');
+/* ?idle=1 冻结在「闲置淡出」状态，方便截图/评审；
+   &dust=<0..1> 再把粒子冻在指定相位（0.42 那一帧看着最像"正在散"） */
+if(qs.get('idle') !== null){
+  isIdle = true;
+  win.classList.add('idle');
+  if(qs.get('dust') !== null) motes('scatter', parseFloat(qs.get('dust')) || 0);
+}
 /* ?bare=1 去掉页面留白和工具条：截图区域 = 窗口本身 */
 if(qs.get('bare') !== null) document.body.classList.add('bare');
 
