@@ -1,60 +1,78 @@
-"""生成 docs/chrome-dissolve.png：控制栏「散成尘」的相位 + 标题带收走的端点。
+"""生成 docs/chrome-dissolve.png：控制层退场的粒子消散方向对照。
 
-五条横带，全 1:1（粒子只有 1~2px，一缩就没了）：
-  常态（整条）→ 0.06 / 0.22 / 0.40（只裁胶囊带）→ 闲置稳态（整条）
+两段：
+  上 = 同一相位（0.42）下三档方向并排：锋面 / 横流 / 四周散
+  下 = 锋面档从 0.08 → 0.88 的进程（每行左沿逐格后移 = 从左右推进）
 
-重拍命令：
+全 1:1（粒子只有 1~2px，一缩就没了），裁切按胶囊位置固定。
+
+重拍命令（全部带 seed=7，保证三档是同一批粒子）：
   chrome --headless=new --hide-scrollbars --force-device-scale-factor=2 \
     --window-size=1280,800 --virtual-time-budget=5000 \
-    --screenshot=target/lg/m_0.22.png \
-    "file:///.../preview/index.html?bare=1&idle=1&dust=0.22"
-  （常态去掉 &idle=1；闲置稳态去掉 &dust=）
+    --screenshot=target/lg/g_front.png \
+    "file:///.../preview/index.html?bare=1&idle=1&seed=7&dust=0.42&dustflow=front"
+  相位进程把 &dustflow 去掉、改 &dust=<0.08|0.24|0.40|0.56|0.72|0.88>，存成 h_<相位>.png
 """
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
-LG = Path('target/lg')
-OUT = Path('docs/chrome-dissolve.png')
+ROOT = Path(__file__).resolve().parent.parent
+LG = ROOT / 'target' / 'lg'
+OUT = ROOT / 'docs' / 'chrome-dissolve.png'
 
-FONT = ImageFont.truetype('C:/Windows/Fonts/msyh.ttc', 18)
-LABEL_H = 34
-BG = (10, 10, 13)
-BAR = (17, 18, 23)
+# 2x 裸窗口里胶囊那一带。胶囊实际逻辑 y=688..779（物理 1376..1558，实测 rectInWin），
+# 上下各留一点余量放"飘出去"的粒子——只裁到 1520 会把整个下沿切掉。
+BOX = (460, 1330, 2120, 1590)
+PANEL_W, PANEL_H = BOX[2] - BOX[0], BOX[3] - BOX[1]
+LABEL_W = 170
 
-# 1280×800 逻辑 → 2x 像素：字幕 1144..1194，胶囊 1376..1558（含投影到 ~1590）
-FULL = (460, 1210, 2100, 1610)   # 1640×400
-BAND = (460, 1300, 2100, 1620)   # 1640×320，粒子飘散够用
+BG = (13, 14, 18)
+FG = (236, 238, 244)
+DIM = (138, 142, 156)
+ACCENT = (198, 160, 246)
+RULE = (38, 40, 48)
 
+F_TITLE = ImageFont.truetype('C:/Windows/Fonts/msyh.ttc', 26)
+F_LABEL = ImageFont.truetype('C:/Windows/Fonts/msyh.ttc', 21)
+F_SMALL = ImageFont.truetype('C:/Windows/Fonts/msyh.ttc', 17)
 
-def label(im, text, color):
-    row = Image.new('RGB', (im.width, im.height + LABEL_H), BAR)
-    row.paste(im, (0, LABEL_H))
-    ImageDraw.Draw(row).text((14, 8), text, font=FONT, fill=color)
-    return row
+TIERS = [
+    ('g_front.png', '锋面', 'front', '默认 · 贴轮廓'),
+    ('g_side.png', '横流', 'side', '整块被抽走'),
+    ('g_out.png', '四周散', 'out', '上一版 · 沿法线'),
+]
+PHASES = ['0.08', '0.24', '0.40', '0.56', '0.72', '0.88']
 
+GAP = 8
+HEAD = 88
+SUB = 44
+ROW = PANEL_H
 
-def crop(name, box):
-    return Image.open(LG / name).convert('RGB').crop(box)
+H = HEAD + len(TIERS) * (ROW + GAP) + SUB + len(PHASES) * (ROW + GAP) + 16
+canvas = Image.new('RGB', (LABEL_W + PANEL_W, H), BG)
+d = ImageDraw.Draw(canvas)
 
+d.text((20, 20), '控制层退场 · 粒子消散方向', font=F_TITLE, fill=FG)
+d.text((20, 56), '同一批粒子（seed=7）· scatter 640ms', font=F_SMALL, fill=DIM)
 
-rows = [label(crop('m_rest.png', FULL),
-              '常态 · 标题带 + 控制栏（L4 液态玻璃）', (150, 214, 255))]
+y = HEAD
+for name, cn, key, note in TIERS:
+    canvas.paste(Image.open(LG / name).convert('RGB').crop(BOX), (LABEL_W, y))
+    d.text((20, y + 8), cn, font=F_LABEL, fill=ACCENT if key == 'front' else FG)
+    d.text((20, y + 36), key, font=F_SMALL, fill=DIM)
+    d.text((20, y + 60), note, font=F_SMALL, fill=DIM)
+    y += ROW + GAP
 
-for name, cap in [
-    ('m_0.05.png', '0.05 · 轮廓先松：12px 带内先起尘，中心那块最厚、最后走'),
-    ('m_0.22.png', '0.22 · 沿 SDF 法线外推：上下两条边分别向上 / 向下拉开'),
-    ('m_0.40.png', '0.40 · 叠浮力：整体向上飘，切向摆让它像"气"而不是射线'),
-]:
-    rows.append(label(crop(name, BAND), cap, (232, 196, 120)))
+d.line([(0, y + 10), (canvas.width, y + 10)], fill=RULE, width=2)
+y += SUB
 
-rows.append(label(crop('m_idle.png', FULL),
-                  '闲置稳态 · 标题带向上收走 12px + 淡出，顶部压暗一并淡掉', (150, 214, 255)))
+d.text((20, y - 32), '锋面 · 相位进程', font=F_SMALL, fill=DIM)
+for p in PHASES:
+    canvas.paste(Image.open(LG / ('h_%s.png' % p)).convert('RGB').crop(BOX), (LABEL_W, y))
+    d.text((20, y + 8), p, font=F_LABEL, fill=FG)
+    y += ROW + GAP
 
-out = Image.new('RGB', (1640, sum(r.height for r in rows) + 12 * (len(rows) - 1)), BG)
-y = 0
-for r in rows:
-    out.paste(r, (0, y))
-    y += r.height + 12
-out.save(OUT)
-print(OUT, out.size)
+OUT.parent.mkdir(parents=True, exist_ok=True)
+canvas.save(OUT)
+print('wrote %s  %dx%d' % (OUT, canvas.width, canvas.height))

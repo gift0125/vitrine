@@ -97,6 +97,11 @@ body{
 .dissolve{position:absolute;left:0;top:0;width:100%;height:100%;
   z-index:8;pointer-events:none;display:block}
 
+/* ?dusthold=1：退场时把胶囊留在半透明，评审/截图专用。
+   否则 idle 一上来胶囊就淡到 0，粒子浮在背景上，看不出是从哪块形体散的。 */
+.window.dusthold .capsule{opacity:.5 !important;pointer-events:none !important}
+.window.dusthold .title,.window.dusthold .traffic{opacity:.5 !important}
+
 /* 减少动态：去掉位移与粒子，只留淡出（宁可朴素，不要晕） */
 @media (prefers-reduced-motion: reduce){
   .window.idle .traffic,.window.idle .title{transform:none}
@@ -619,6 +624,11 @@ body.bare .traffic,body.bare .title,body.bare .capsule,body.bare .mask-bottom{tr
       <button data-liquid="off">液态玻璃：关</button>
       <button data-liquid="edge" class="on">+边缘折射 · 默认</button>
       <button data-liquid="full">+高光/色散</button>
+    </div>
+    <div class="seg" id="segFlow">
+      <button data-flow="front" class="on">消散 → 锋面</button>
+      <button data-flow="side">→ 横流</button>
+      <button data-flow="out">四周散</button>
     </div>
     <span class="tintout">播放后 2.5s 不动鼠标 → 控制层淡出（按播放键试）</span>
     <span class="tintout" id="tintOut"></span>
@@ -1185,16 +1195,39 @@ document.getElementById('btnInfo').addEventListener('click', () => setTimeout(wa
 const DUST = {
   scatterMs: 640,
   gatherMs: 520,
-  count: 340,
-  band: 12,      // 轮廓带宽度（逻辑 px）
-  push: 24,      // 沿法线推开的距离上限
-  rise: 16,      // 浮力：额外向上的位移
-  alpha: 0.55
+  count: 400,
+  band: 13,      // 轮廓带宽度（逻辑 px）
+  push: 48,      // 锋面位移上限：24 太贴边，读不出"被吹走"
+  rise: 5,       // 浮力：侧向流里只留一点点上扬，16 那套是"四周散"的
+  alpha: 0.72,   // 0.55 在暗画面上 3~5px 的点几乎看不见，退场就散了架
+  /* 三档方向，?dustflow= 切：
+     front = 锋面：贴轮廓，逐列从左往右依次散开（默认）
+     side  = 横流：整块材质被从左至右抽走（覆盖整个面，位移 70~340px）
+     out   = 四周散：沿法线外推（上一版，留着对照） */
+  flow: 'front'
 };
+const SIDE = () => DUST.flow === 'side' || DUST.flow === 'front';
+/* ?dustflow=side|front|out 切方向，默认 side（横流） */
+if(['side','front','out'].includes(qs.get('dustflow'))) DUST.flow = qs.get('dustflow');
+
+/* ?seed=<n>：把粒子种子固定住。诊断用——静态截图里看不出运动方向，
+   只有"同一批粒子在两个相位的位置差"才说明问题。固定种子后才能这么比。 */
+function makeRng(seed){
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+if(qs.get('seed') !== null) DUST.seed = parseInt(qs.get('seed'), 10) || 1;
 
 const motesEl = document.querySelector('.dissolve');
 const mctx = motesEl ? motesEl.getContext('2d') : null;
 let motesParts = [], motesMode = null, motesT0 = 0, motesDur = 0, motesRaf = 0;
+let motesFrozen = false;   // ?dust= 冻结相位时置起：motesFrame 画一帧就停，不排 rAF
 
 /* 粒子贴图：一次画好的软光点，逐帧 drawImage。
    用硬边的 arc 填圆会读成"噪点"；光点有衰减才有体积，而逐帧建渐变会拖死 60fps。 */
@@ -1246,27 +1279,55 @@ function sdfNormal(x, y, r, R){
 
 function seedMotes(r, R, n){
   const out = [];
+  // 固定种子时每批粒子完全一致，才能跨相位比同一颗粒子走到哪了
+  const RND = DUST.seed ? makeRng(DUST.seed) : Math.random;
+  const flow = DUST.flow;
+  const stream = flow === 'side';    // 横流：整块材质被抽走
+  const front  = flow === 'front';   // 锋面：逐列从左往右依次散
   let guard = 0;
-  while(out.length < n && guard++ < n * 120){
-    const x = r.x + Math.random() * r.w;
-    const y = r.y + Math.random() * r.h;
+  while(out.length < n && guard++ < n * 260){
+    const x = r.x + RND() * r.w;
+    const y = r.y + RND() * r.h;
+    const xn = (x - r.x) / r.w;                           // 0 = 左沿，1 = 右沿
     const d = sdfRR(x, y, r, R);
     if(d > 0) continue;                                   // 矩形外
+    /* 带宽固定，不随 x 变。曾经让迎风面（左端）带更宽、几乎整列都参与——
+       但那样同时放大了左侧的采样密度（左端通过率 45%、右端 9%），结果左边一堆
+       先散、右边稀稀拉拉，读成"一团浓雾向右淡去"，不是一道墙扫过。
+       方向只该由延迟决定，每列的粒子数必须一样。 */
     const near = Math.exp(d / (DUST.band * 0.42));         // 贴边 1 → 带内沿 ~0.06
-    if(Math.random() > near) continue;
+    /* 取点范围：横流是整块材质都在走，所以覆盖整个面（只是靠边略密）；
+       锋面 / 四周散只取轮廓带。 */
+    const pick = stream ? 0.62 + 0.38 * Math.exp(d / 26) : near;
+    if(RND() > pick) continue;
     const [nx, ny] = sdfNormal(x, y, r, R);
-    const k = Math.random();
+    const k = RND();
     const fine = k < 0.6, fluff = k < 0.9;
+
+    let delay, dist, span;
+    if(stream){
+      // 弱锋面：左边略先起，主体是整体向右。位移 70~340px，横跨半个胶囊才有"流"。
+      delay = 0.16 * xn + RND() * 0.14;
+      dist = (70 + RND() * 240) * (1.18 - 0.36 * xn);
+      span = Math.max(0.3, Math.min(0.6 + RND() * 0.34, 1 - delay));
+    } else if(front){
+      /* 跨度必须够大（0.55）才读得出锋面：0.34 时整片几乎同时起，像一起飘散。 */
+      delay = 0.55 * xn + 0.07 * (1 - near) + RND() * 0.10;
+      dist = DUST.push * (0.45 + RND() * 0.55) * (fine ? 0.68 : 1) * (1.25 - 0.55 * xn);
+      span = Math.max(0.24, Math.min(0.34 + RND() * 0.26, 1 - delay));
+    } else {
+      delay = 0.2 * (1 - near) + RND() * 0.12;
+      dist = DUST.push * (0.45 + RND() * 0.55) * (fine ? 0.68 : 1);
+      span = Math.max(0.24, Math.min(0.62 + RND() * 0.38, 1 - delay));
+    }
+    /* span 收在 1-delay 以内：否则 u→1 那一帧还有残余 alpha，会硬切。
+       副作用正好是想要的——起得晚的走得更短促。 */
     out.push({
-      x, y, nx, ny,
-      dist: DUST.push * (0.45 + Math.random() * 0.55) * (fine ? 0.68 : 1),
-      r: fine ? 0.5 + Math.random() * 0.45 : fluff ? 0.9 + Math.random() * 0.7 : 0.4 + Math.random() * 0.22,
-      a: DUST.alpha * (fluff ? 0.5 + Math.random() * 0.45 : 1),
-      // 贴边先松、内侧后走：材质是边先碎，中心那块最厚、最后走
-      delay: 0.2 * (1 - near) + Math.random() * 0.12,
-      span: 0.62 + Math.random() * 0.38,
-      ph: Math.random() * 6.2832,
-      wob: 0.5 + Math.random() * 1.6
+      x, y, nx, ny, xn, dist, delay, span,
+      r: fine ? 0.5 + RND() * 0.45 : fluff ? 0.9 + RND() * 0.7 : 0.4 + RND() * 0.22,
+      a: DUST.alpha * (fluff ? 0.5 + RND() * 0.45 : 1),
+      ph: RND() * 6.2832,
+      wob: 0.5 + RND() * 1.6
     });
   }
   return out;
@@ -1278,34 +1339,68 @@ function motes(mode, freeze){
   motesParts = seedMotes(rectInWin(document.querySelector('.capsule')), 14, DUST.count);
   motesMode = mode;
   motesDur = mode === 'scatter' ? DUST.scatterMs : DUST.gatherMs;
-  motesT0 = performance.now() - (freeze == null ? 0 : freeze * motesDur);
-  if(freeze != null){ motesFrame(motesT0); return; }   // 截图/评审用：冻结在这一相位
+  motesT0 = performance.now();
+  if(freeze != null){
+    /* 截图/评审用：把 u 直接钉在 freeze。
+       不能只把 motesT0 往前挪——那样必须再传"现在"进去才算得出 u，而传 motesT0
+       会得到 u=0；更糟的是 rAF 不会停，截图时实际相位是 freeze + 若干 ms，
+       于是 ?dust=0.74 这种靠后的相位会被冲过终点、整块清空。 */
+    motesFrozen = true;
+    motesFrame(motesT0 + freeze * motesDur);
+    motesFrozen = false;
+    return;
+  }
   if(!motesRaf) motesRaf = requestAnimationFrame(motesFrame);
 }
 
 function motesFrame(now){
   const u = Math.min(1, (now - motesT0) / motesDur);
   const scatter = motesMode === 'scatter';
+  const stream = DUST.flow === 'side', front = DUST.flow === 'front';
   mctx.clearRect(0, 0, 1280, 800);
   mctx.globalCompositeOperation = 'lighter';
   for(const p of motesParts){
     const pu = Math.min(1, Math.max(0, (u - p.delay) / p.span));
     if(pu <= 0 || pu >= 1) continue;
-    // 散：快脱开再减速（气被推开）；聚：走的距离从远端倒回 0，收尾变慢（被吸住）
-    const e = scatter ? 1 - Math.pow(1 - pu, 3) : Math.pow(1 - pu, 2);
-    // 切向摆：让"气"有漂浮感，而不是一条条直线射出去
+    /* 位移曲线。散：被推开 → 快脱开再减速；横流：被抽走 → 反而要加速，
+       否则位移一大就像"飘过去又停住"。聚：走的距离从远端倒回 0，收尾变慢。 */
+    const e = scatter
+      ? (stream ? Math.pow(pu, 1.35) : 1 - Math.pow(1 - pu, 3))
+      : Math.pow(1 - pu, 2);
+    // 摆：让"气"有漂浮感，而不是一条条直线射出去
     const w = Math.sin(pu * 5 + p.ph) * p.wob * e;
-    const x = p.x + p.nx * p.dist * e - p.ny * w;
-    const y = p.y + p.ny * p.dist * e - DUST.rise * e * e + p.nx * w;
-    const a = scatter ? p.a * Math.pow(1 - pu, 1.5) : p.a * Math.sin(Math.PI * pu) * 0.9;
+    let dx, dy;
+    if(stream){
+      /* 横流向 +X，位移 70~340px。法线只留纵向分量做上下抖——
+         横向再按 nx 推开的话左沿会向左飞，方向感立刻散掉。 */
+      dx = p.dist * e;
+      dy = p.ny * 5 * e + w * 1.3;
+    } else if(front){
+      /* 锋面：贴轮廓、位移小，靠延迟推进。法线只留 ny 负责上下张开。 */
+      dx = p.dist * e * (0.88 + 0.12 * p.nx) + w * 0.3;
+      dy = p.ny * p.dist * 0.42 * e - DUST.rise * e * e + w * 1.8;
+    } else {
+      // 四周散：沿法线外推 + 浮力
+      dx = p.nx * p.dist * e - p.ny * w;
+      dy = p.ny * p.dist * e - DUST.rise * e * e + p.nx * w;
+    }
+    const x = p.x + dx;
+    const y = p.y + dy;
+    /* 亮度：横流/锋面都用 1-pu²，把亮度撑到后段——(1-pu)^1.5 衰减太快，
+       粒子刚起步就暗了，640ms 里真正看得见的只有前 200ms。 */
+    const a = scatter
+      ? (stream ? p.a * (1 - pu * pu * pu) : p.a * (1 - pu * pu))
+      : p.a * Math.sin(Math.PI * pu) * 0.9;
     if(a <= 0.004) continue;
-    const rad = p.r * (scatter ? 1 - 0.3 * pu : 0.7 + 0.3 * pu);
+    // 横流的粒子要保持体量走到远处，缩得太快会读成"远处星点"
+    const rad = p.r * (scatter ? (stream ? 1 - 0.15 * pu : 1 - 0.3 * pu) : 0.7 + 0.3 * pu);
     const s = rad * 2.8;      // 贴图是软边，视觉核心约等于 s/2.8
     mctx.globalAlpha = a;
     mctx.drawImage(moteSprite, x - s, y - s, s * 2, s * 2);
   }
   mctx.globalAlpha = 1;
   mctx.globalCompositeOperation = 'source-over';
+  if(motesFrozen) return;   // 冻结：停在当前帧，不推进、不清场
   if(u < 1){
     motesRaf = requestAnimationFrame(motesFrame);
   } else {
@@ -1314,6 +1409,26 @@ function motesFrame(now){
     mctx.clearRect(0, 0, 1280, 800);
   }
 }
+
+/* ---------- 消散方向：锋面 / 横流 / 四周散 ----------
+   注意：必须放在 DUST 定义之后。之前放在 initLiquid 旁边（更靠前），
+   `const DUST` 还在 TDZ 里，整个脚本一进来就 ReferenceError。 */
+(function initFlow(){
+  const seg = document.getElementById('segFlow');
+  if(!seg) return;
+  const pick = f => {
+    DUST.flow = f;
+    seg.querySelectorAll('button').forEach(x => x.classList.toggle('on', x.dataset.flow === f));
+    // 正在退场就重播一次，好当场比较；否则等下次 2.5s 淡出才生效
+    if(win.classList.contains('idle')) motes('scatter');
+  };
+  seg.addEventListener('click', e => {
+    const b = e.target.closest('button'); if(!b) return;
+    pick(b.dataset.flow);
+  });
+  const fromUrl = qs.get('dustflow');
+  if(fromUrl && ['side','front','out'].includes(fromUrl)) pick(fromUrl);
+})();
 
 /* ---------- 播放列表数据：与设计稿 21:170 逐字一致 ---------- */
 const items = [
@@ -1360,6 +1475,8 @@ if(qs.get('idle') !== null){
   win.classList.add('idle');
   if(qs.get('dust') !== null) motes('scatter', parseFloat(qs.get('dust')) || 0);
 }
+/* ?dusthold=1：胶囊停在半透明，让粒子有个参照物（评审图用） */
+if(qs.get('dusthold') !== null) win.classList.add('dusthold');
 /* ?bare=1 去掉页面留白和工具条：截图区域 = 窗口本身 */
 if(qs.get('bare') !== null) document.body.classList.add('bare');
 
