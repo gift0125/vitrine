@@ -37,7 +37,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
-use crate::liquid_glass::GlassJob;
+use crate::liquid_glass::{DUST_GATHER, DUST_PAD, DUST_SCATTER, DustPhase, GlassJob};
 use crate::persistence::{self, RepeatMode, Settings};
 use crate::playlist::PlaylistDelegate;
 use crate::theme::overlay;
@@ -186,11 +186,31 @@ const VIGNETTE_HEIGHT: f32 = 240.0;
 /// 视频播放器（IINA / QuickTime / VLC）的通用手感是 2~3 秒；取中间值。暂停、
 /// 拖动进度、开着面板时**不**淡出——那会儿用户正在读控件。
 const CHROME_IDLE: Duration = Duration::from_millis(2500);
-/// 淡出/淡入每 100ms tick 走一步：0.25 → 400ms 淡完，四步用肉眼已经看不出台阶。
+/// 淡出/淡入的时长（秒）。设计稿 `design/preview/index.html` 的 `.window.idle` 那几条。
 ///
-/// 不用 GPUI 的 `with_animation`：那个动画只在有帧驱动时推进，而这个界面的帧
-/// 是 tick 拉起来的（画面本身就是 mpv 在画，主窗口大部分时间是空的）。
-const CHROME_FADE_STEP: f32 = 0.25;
+/// 两条动作时长不同，因为**东西不一样**：标题带是信息，走「向上收走」（淡 0.22s、
+/// 位移 0.36s）；胶囊是材质，本体淡得快（0.18s，延迟 0.07s），形体交给光尘（0.64s）。
+/// 起来的时候反过来：胶囊先凝（0.26s）、粒子晚一点落回（0.52s）。
+const TITLE_FADE: f32 = 0.22;
+const TITLE_SLIDE: f32 = 0.36;
+/// 标题带向上收的距离（设计稿 `translateY(-12px)`）。
+const TITLE_LIFT: f32 = 12.0;
+/// 窗口按钮的上移量。比标题少 5px：它们贴着窗口右边，跟着走 12px 会像整条
+/// 标题栏在往上跑；7px 只读出「一起让开」的意思（设计稿 `translateY(-7px)`）。
+const CAPTION_LIFT: f32 = 7.0;
+/// 顶部压暗的淡出时长。它只为托住标题，所以比标题的 0.22s 更慢一点。
+const SCRIM_FADE: f32 = 0.42;
+/// 胶囊淡出：(延迟, 时长)。70ms 延迟是给光尘的——先看见尘往外漏，本体才淡。
+const CAPSULE_OUT: (f32, f32) = (0.07, 0.18);
+/// 胶囊淡入：(延迟, 时长)。回来时也留 70ms，把出场让给粒子聚拢。
+const CAPSULE_IN: (f32, f32) = (0.07, 0.26);
+/// 胶囊淡出时往下沉的距离（设计稿 `translateY(3px)`）。
+///
+/// 设计稿还有 `scale(.985)`，GPUI 这一版没有 transform，1.5% 的缩放本来也看不出，
+/// 沉 3px 已经足够读出「往下让位」。
+const CAPSULE_SINK: f32 = 3.0;
+/// 过渡帧循环的间隔。16ms ≈ 60fps：光尘是连续运动，100ms 的 tick 撑不起来。
+const CHROME_ANIM_STEP: Duration = Duration::from_millis(16);
 /// 淡到这个值以下就当「已经隐藏」：chrome 整块让出、探针里 `rects` 为空。
 const CHROME_HIDDEN_EPS: f32 = 0.01;
 /// 画面色相换一次的门限（度）。
@@ -433,6 +453,82 @@ pub(crate) fn chrome_visible_target(
     idle < CHROME_IDLE
 }
 
+/// 一段控制层过渡。
+///
+/// 存的是「从哪来、到哪去、什么时候开始的」，而不是每帧推一个步长：中途反向
+/// （用户动了鼠标、淡出到一半又淡回来）时从**当前值**起步才不会跳变。
+#[derive(Clone, Copy)]
+struct ChromeRun {
+    /// 胶囊起始 alpha
+    from: f32,
+    /// 标题带起始 alpha。和胶囊分开存：两者时长曲线不同，反转时各算各的。
+    title_from: f32,
+    /// 顶部压暗的起始 alpha（0.42s，比标题还慢）。
+    scrim_from: f32,
+    /// 目标（1 = 显示，0 = 隐藏）
+    to: f32,
+    started: Instant,
+}
+
+impl ChromeRun {
+    /// 胶囊这一帧的 alpha。
+    ///
+    /// 两头都带 70ms 延迟（设计稿 `opacity .18s ease .07s`）：散的时候光尘先撒出去、
+    /// 本体晚一瞬才开始淡，看着才像「漏出去」而不是「被擦掉」；回来时把出场让给
+    /// 粒子聚拢。
+    fn capsule(&self, t: f32) -> f32 {
+        let (delay, dur) = if self.to >= 1.0 {
+            CAPSULE_IN
+        } else {
+            CAPSULE_OUT
+        };
+        let p = ((t - delay) / dur).clamp(0.0, 1.0);
+        self.from + (self.to - self.from) * ease_out(p)
+    }
+
+    /// 标题带这一帧的 `(alpha, 上移量)`。
+    fn title(&self, t: f32) -> (f32, f32) {
+        let fade = (t / TITLE_FADE).clamp(0.0, 1.0);
+        let slide = (t / TITLE_SLIDE).clamp(0.0, 1.0);
+        let alpha = self.title_from + (self.to - self.title_from) * ease_out(fade);
+        // 位移走自己那条更慢的曲线（设计稿 `transform .36s`）。起点从当前 alpha
+        // 反推：单向过渡里两者一一对应，反推只会让缓动形状差一点，看不出来；
+        // 写死 0 / -12 反倒会在中途反向时直接跳一下。
+        let lift_from = TITLE_LIFT * (1.0 - self.title_from);
+        let dy = if self.to >= 1.0 {
+            -lift_from * (1.0 - ease_out(slide))
+        } else {
+            -TITLE_LIFT * ease_out(slide)
+        };
+        (alpha, dy)
+    }
+
+    /// 顶部压暗这一帧的 alpha。
+    fn scrim(&self, t: f32) -> f32 {
+        let p = (t / SCRIM_FADE).clamp(0.0, 1.0);
+        self.scrim_from + (self.to - self.scrim_from) * ease_out(p)
+    }
+}
+
+/// 一趟退场光尘：往哪走、什么时候起、这一趟的编号。
+///
+/// 相位本身不存——它是「现在几点减起点」，每帧现算。存相位会逼着帧循环去改
+/// 状态，而渲染这边随时可能读（窗口尺寸变了、DPI 变了都会重烤）。
+#[derive(Clone, Copy)]
+struct DustRun {
+    scatter: bool,
+    started: Instant,
+    run: u32,
+}
+
+/// 二次 ease-out。设计稿两条曲线（`ease` 与 `cubic-bezier(.22,.78,.28,1)`）在这个
+/// 距离上都近于「开头猛、尾巴长」，二次够用，不值得为 0.2 秒写一条贝塞尔。
+#[inline]
+fn ease_out(p: f32) -> f32 {
+    let i = 1.0 - p;
+    1.0 - i * i
+}
+
 /// 两个色相之间的最短距离（度，0~180）。///
 /// 色相是环：350° 和 10° 只差 20°，不是 340°。胶囊染色的迟滞判据要用它，
 /// 直接相减会让「红→品红」那一小段永远算成大幅变化，玻璃每帧都在闪。
@@ -571,9 +667,26 @@ pub struct PlayerView {
     /// 控制层（标题带 + 胶囊 + 底部遮罩）当前的透明度：1 全显、0 全隐。
     ///
     /// 视频播放中一段时间没有输入就淡到 0，鼠标一动淡回来（见 [`CHROME_IDLE`]）。
-    /// 只在 tick 里按 `CHROME_FADE_STEP` 推一步，所以淡出是 4 帧的阶梯，不是
-    /// 真正的插值——换来的是**不需要额外帧驱动**，界面的帧本来就由 tick 拉起来。
+    /// 过渡由一段 16ms 的帧循环推进（[`ChromeRun`]），各元素按自己的时长曲线走：
+    /// 标题带向上收 12px + 淡出，胶囊淡得快、形体交给液态玻璃贴图里的光尘
+    /// （见 `liquid_glass` 的 [`DustPhase`]）。
+    ///
+    /// 这个字段是**胶囊**的 alpha，也就是整块控制层「还在不在」的判据
+    /// （`CHROME_HIDDEN_EPS`）；标题带另有 `title_alpha` / `title_dy` / `scrim_alpha`。
     chrome_alpha: f32,
+    /// 标题带这一帧的不透明度与上移量（淡出是「向上收走」，和胶囊的「散成尘」分开）。
+    title_alpha: f32,
+    title_dy: f32,
+    /// 顶部压暗的 alpha。它比标题慢（0.42s）：只为托住标题，标题走了才没有存在理由。
+    scrim_alpha: f32,
+    /// 正在跑的那段过渡；`None` = 静止。
+    chrome_run: Option<ChromeRun>,
+    /// 帧循环是否还活着（避免每次 tick 都起一条新任务）。
+    chrome_anim_live: bool,
+    /// 这一趟退场（或回场）的光尘；`None` = 没在散。
+    dust_run: Option<DustRun>,
+    /// 退场编号：每起一趟 +1，让烘焙器重新撒点（两次退场不该是同一团气）。
+    dust_seq: u32,
     /// 最近一次输入（鼠标移动/按键）的时刻，自动淡出的判据。
     activity: Instant,
     /// 鼠标移动的时间戳（`Cell`：`on_mouse_move` 每帧都来，不能每次都 notify）。
@@ -778,6 +891,13 @@ impl PlayerView {
             playlist_open: false,
             playlist_on_glass: false,
             chrome_alpha: 1.0,
+            title_alpha: 1.0,
+            title_dy: 0.0,
+            scrim_alpha: 1.0,
+            chrome_run: None,
+            chrome_anim_live: false,
+            dust_run: None,
+            dust_seq: 0,
             activity: Instant::now(),
             activity_moved: Rc::new(Cell::new(None)),
             tint_applied: None,
@@ -976,7 +1096,7 @@ impl PlayerView {
         }
 
         // 控制层淡出/淡入：必须在 `sync_video_chrome` 之前——探针要看到新的 `chrome_alpha`。
-        self.tick_chrome_fade(cx);
+        self.tick_chrome_fade(window, cx);
 
         // 帧泵：引擎起播时只存下了接收端（`start_video` 手上没有 window），
         // 在这里把「有新帧」接成界面上的画面。
@@ -2487,7 +2607,12 @@ impl PlayerView {
     }
 
     /// 顶部标题带：当前曲名 + 自绘窗口按钮（系统标题栏已在 main 里关掉）。
-    fn render_title_band(&self, cx: &Context<Self>) -> Div {
+    ///
+    /// `alpha` / `dy` 是淡出相位（见 [`ChromeRun::title`]）：标题文字走满 12px，
+    /// 窗口按钮只走 7px（[`CAPTION_LIFT`]）——它们贴着窗口右边，跟着走 12px 会像
+    /// 整条标题栏在往上跑。顺带说明：视频模式下这条带的底色不在这里画，它比标题
+    /// 慢 0.2 秒，由 `render` 单独铺一层（见 `scrim_alpha`）。
+    fn render_title_band(&self, alpha: f32, dy: f32, cx: &Context<Self>) -> Div {
         // 自己缓存的最大化状态（切换不经过 GPUI，见 `toggle_maximize`）；
         // 最大化时 Windows 会把「最大化」换成「还原」图标。
         let maximized = self.maximized;
@@ -2505,10 +2630,7 @@ impl PlayerView {
             .flex_shrink_0()
             .items_center()
             .pl(px(16.))
-            // 视频模式下这一条压在画面上，必须自带一层玻璃，否则曲名和窗口按钮直接
-            // 落在亮画面上（16:9 片源常见顶部黑边，看着「还好」，换成顶到边的画面
-            // 就读不出来了）。72% 深玻璃 + 画面透出来，和胶囊同一套口径。
-            .when(self.video_active, |el| el.bg(overlay::glass()))
+            .opacity(alpha)
             // 只有左侧这段是拖拽区：整条都设成 Drag 的话，右侧窗口按钮会一起
             // 被当成非客户区，点击事件就到不了 GPUI。
             .child(
@@ -2526,19 +2648,26 @@ impl PlayerView {
                     }))
                     .child(
                         div()
+                            .relative()
+                            .top(px(dy))
                             .text_size(px(11.))
                             .text_color(self.chrome_dim(cx))
                             .child(title),
                     ),
             )
             .when_some(self.status_pill_live(), |el, (message, _, is_error)| {
-                el.child(self.render_status_pill(message, *is_error))
+                el.child(div().relative().top(px(dy)).child(
+                    self.render_status_pill(message, *is_error),
+                ))
             })
             .child(
                 h_flex()
                     .flex_shrink_0()
                     .h_full()
                     .items_center()
+                    // 窗口按钮只走 7px（设计稿 `translateY(-7px)`）
+                    .relative()
+                    .top(px(dy * (CAPTION_LIFT / TITLE_LIFT)))
                     .when(self.cinema, |el| {
                         // 影院模式下仍然留一个退出按钮，否则用户没法回到普通窗口
                         let fg = self.chrome_fg(cx);
@@ -3310,8 +3439,11 @@ impl PlayerView {
         )
     }
 
-    /// 每 tick 推一步透明度（见 [`CHROME_FADE_STEP`]）。
-    fn tick_chrome_fade(&mut self, cx: &mut Context<Self>) {
+    /// 每 tick 比对一次目标态，变了就起一段过渡（[`ChromeRun`]）。
+    ///
+    /// 这里只负责「起」；推进在 16ms 的帧循环里（[`Self::step_chrome_anim`]），
+    /// 因为光尘是连续运动，100ms 的 tick 撑不起来。
+    fn tick_chrome_fade(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 鼠标移动由根节点的 `on_mouse_move` 记（画面也在根节点下面，事件照常冒泡），
         // 这里只把时间戳搬进普通字段。
         if let Some(stamp) = self.activity_moved.take() {
@@ -3328,8 +3460,9 @@ impl PlayerView {
             if due {
                 *slot = Some(Instant::now());
                 eprintln!(
-                    "[chrome] alpha={:.2} target={target:.2} video={} playing={} idle={:.1}s pill={} seeking={} drop={} panel={} info={}",
+                    "[chrome] alpha={:.2} title={:.2} target={target:.2} video={} playing={} idle={:.1}s pill={} seeking={} drop={} panel={} info={}",
                     self.chrome_alpha,
+                    self.title_alpha,
                     self.video_active,
                     self.playback_state().is_playing(),
                     self.activity.elapsed().as_secs_f32(),
@@ -3341,15 +3474,145 @@ impl PlayerView {
                 );
             }
         }
-        if (self.chrome_alpha - target).abs() < 0.001 {
+        // 已经静止在目标上（绝大多数 tick 走这里），什么也不做。
+        let settled = self
+            .chrome_run
+            .map(|run| run.to)
+            .unwrap_or(self.chrome_alpha);
+        if (settled - target).abs() < 0.001 {
             return;
         }
-        self.chrome_alpha = if target > self.chrome_alpha {
-            (self.chrome_alpha + CHROME_FADE_STEP).min(1.0)
-        } else {
-            (self.chrome_alpha - CHROME_FADE_STEP).max(0.0)
-        };
+        // 目标变了：从**当前值**出发起一段新过渡。中途反向（用户动了鼠标）、
+        // 淡出到一半又淡回来，都不该跳变，所以起始 alpha 取的是这一刻的实测值。
+        self.chrome_run = Some(ChromeRun {
+            from: self.chrome_alpha,
+            title_from: self.title_alpha,
+            scrim_from: self.scrim_alpha,
+            to: target,
+            started: Instant::now(),
+        });
+        self.start_dust(target < 0.5);
+        self.ensure_chrome_anim(window, cx);
         cx.notify();
+    }
+
+    /// 起一趟光尘。只有视频模式有这东西——音频模式的窗口本来就铺满底色，控制层
+    /// 不会浮在画面上，「材质散开」也就没有对象。
+    fn start_dust(&mut self, scatter: bool) {
+        if !self.video_active {
+            self.dust_run = None;
+            return;
+        }
+        self.dust_seq = self.dust_seq.wrapping_add(1);
+        self.dust_run = Some(DustRun {
+            scatter,
+            started: Instant::now(),
+            run: self.dust_seq,
+        });
+    }
+
+    /// 这一刻的光尘相位。走完了就是 `None`（贴图回到纯玻璃）。
+    fn dust_phase(&self) -> Option<DustPhase> {
+        let run = self.dust_run?;
+        let total = if run.scatter {
+            DUST_SCATTER
+        } else {
+            DUST_GATHER
+        }
+        .as_secs_f32();
+        let u = run.started.elapsed().as_secs_f32() / total;
+        if u >= 1.0 {
+            return None;
+        }
+        Some(DustPhase {
+            u,
+            scatter: run.scatter,
+            fade: self.chrome_alpha,
+            run: run.run,
+        })
+    }
+
+    /// 光尘这一帧的贴图与它在窗口里的矩形。没在散时为 `None`。
+    ///
+    /// 它比胶囊大一圈（[`DUST_PAD`]），所以不能塞进胶囊那个 div：那里
+    /// `overflow_hidden` 会把飞出去的尘切掉，套着的 `opacity` 又会让它跟着胶囊
+    /// 一起消失——而粒子恰恰要在胶囊淡完之后继续。胶囊本体的淡出已经烘进这张
+    /// 贴图的 alpha 里了（`DustPhase::fade`）。
+    fn dust_plate(&self, window: &Window) -> Option<((f32, f32, f32, f32), ImageSource)> {
+        self.dust_phase()?;
+        let size = window.bounds().size;
+        let (x, y, w, h) = capsule_box(
+            f32::from(size.width),
+            f32::from(size.height),
+            self.playlist_open && !self.cinema,
+        )?;
+        let image = self.video.surface.glass(0)?;
+        Some((
+            (
+                x - DUST_PAD,
+                y - DUST_PAD,
+                w + DUST_PAD * 2.0,
+                h + DUST_PAD * 2.0,
+            ),
+            image,
+        ))
+    }
+
+    /// 把帧循环拉起来（已经在跑就不重复起）。
+    fn ensure_chrome_anim(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chrome_anim_live {
+            return;
+        }
+        self.chrome_anim_live = true;
+        // 不用 `with_animation`：那个要每帧都有 draw 才推进，而这个窗口的帧本来就
+        // 是 tick 和 mpv 拉着走的，空闲时完全静止。
+        cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor().timer(CHROME_ANIM_STEP).await;
+            let more = this
+                .update_in(cx, |view, window, cx| view.step_chrome_anim(window, cx))
+                .unwrap_or(false);
+            if !more {
+                break;
+            }
+        })
+        .detach();
+    }
+
+    /// 推一帧过渡，返回「还要不要继续」。
+    fn step_chrome_anim(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(run) = self.chrome_run else {
+            self.chrome_anim_live = false;
+            return false;
+        };
+        let now = Instant::now();
+        let t = now.saturating_duration_since(run.started).as_secs_f32();
+        // 整段的长度由最慢的那条腿决定：淡出走光尘的 640ms，淡入等聚回落定。
+        let dust_total = if run.to >= 1.0 {
+            DUST_GATHER
+        } else {
+            DUST_SCATTER
+        };
+        let total = dust_total.as_secs_f32();
+        let done = t >= total;
+        let tt = if done { total } else { t };
+
+        self.chrome_alpha = run.capsule(tt);
+        let (title, dy) = run.title(tt);
+        self.title_alpha = title;
+        self.title_dy = dy;
+        self.scrim_alpha = run.scrim(tt);
+
+        if done {
+            self.chrome_alpha = run.to;
+            self.title_alpha = run.to;
+            self.title_dy = 0.0;
+            self.scrim_alpha = run.to;
+            self.chrome_run = None;
+            self.chrome_anim_live = false;
+            self.dust_run = None;
+        }
+        cx.notify();
+        !done
     }
 
     fn render_bottom_chrome(&self, cx: &mut Context<Self>) -> Div {
@@ -3592,10 +3855,17 @@ impl PlayerView {
         let win_w = size.width.as_f32();
         let win_h = size.height.as_f32();
         let playlist = self.playlist_open && !self.cinema;
+        // 光尘接管之后胶囊本体已经是透明的（alpha=0），但贴图还得继续烤——粒子和
+        // 胶囊本体现在装在同一张图里，见 `liquid_glass` 的模块说明。
+        let dust = self.dust_phase();
         let mut jobs = Vec::with_capacity(3);
-        if self.chrome_alpha > 0.01 {
+        if self.chrome_alpha > 0.01 || dust.is_some() {
             if let Some((x, y, w, h)) = capsule_box(win_w, win_h, playlist) {
-                jobs.push(GlassJob::capsule(x, y, w, h));
+                let mut job = GlassJob::capsule(x, y, w, h);
+                if let Some(phase) = dust {
+                    job = job.with_dust(phase);
+                }
+                jobs.push(job);
             }
             if self.info_open {
                 if let Some((x, y, w, h)) = info_box(win_w, win_h) {
@@ -3626,16 +3896,23 @@ impl PlayerView {
         // 外框负责定位/圆角，内层负责 padding —— 夹在中间的 canvas 量到的
         // 就是胶囊的真实外框（含 padding），算几何时不会差一圈。
         let slot = self.capsule_rect.clone();
-        let glass = if self.video_active {
+        // 光尘在跑时贴图比胶囊大一圈（粒子要飞出去），而且胶囊本体的淡出已经烘进
+        // 贴图 alpha 了，所以那几帧不在这里画，改由根节点单独摆一层（见 `dust_plate`）。
+        let dusting = self.dust_phase().is_some();
+        let glass = if self.video_active && !dusting {
             self.video.surface.glass(0)
         } else {
             None
         };
-        let liquid = glass.is_some();
+        let liquid = glass.is_some() || dusting;
         div()
             .w(px(CAPSULE_WIDTH))
             .max_w_full()
             .rounded(px(CAPSULE_RADIUS))
+            // 淡出时往下沉 3px（设计稿 `translateY(3px)`）：让它像"让位"而不是
+            // "被擦掉"。挂在定位上，不改布局——胶囊是浮层，下面没有兄弟会跟着跳。
+            .relative()
+            .top(px(CAPSULE_SINK * (1.0 - self.chrome_alpha)))
             // 圆角裁掉 1px 内描边和染色层探出去的那点角
             .overflow_hidden()
             // 接触阴影 + 环境阴影：贴地那层负责"压住"，散开那层负责"浮起来"
@@ -4460,6 +4737,13 @@ impl Render for PlayerView {
         // 淡到 0 只影响绘制，元素还在树上——这是有意的：面板/信息卡本来就不该在
         // 淡出时被卸载（它们的展开态要留住），而透明元素的命中测试同样会被跳过。
         let chrome_alpha = self.chrome_alpha;
+        // 标题带是「信息」：淡出时向上收 12px（见 `ChromeRun::title`）。
+        let title_alpha = self.title_alpha;
+        let title_dy = self.title_dy;
+        // 顶部压暗比标题慢（0.42s）：它只为托住标题。
+        let scrim_alpha = self.scrim_alpha;
+        // 光尘贴图：比胶囊大一圈、含胶囊本体的淡出，所以按窗口坐标单独摆一层。
+        let dust_plate = self.dust_plate(window);
         let move_stamp = self.activity_moved.clone();
 
         div()
@@ -4498,10 +4782,29 @@ impl Render for PlayerView {
                             .child(self.render_vignette(cx)),
                     )
             })
+            // 顶部压暗：单独一层，因为它比标题带慢（0.42s）。标题带自己的底色
+            // 在视频模式下已经去掉了，见 `render_title_band`。
+            .when(self.video_active, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(0.))
+                        .left(px(0.))
+                        .right(px(0.))
+                        .h(px(TITLE_BAND))
+                        .bg(overlay::glass())
+                        .opacity(scrim_alpha),
+                )
+            })
             .child(
                 v_flex()
                     .size_full()
-                    .child(self.render_title_band(cx).opacity(chrome_alpha))
+                    .child(
+                        // 标题带是「信息」，走「向上收走」：淡出的同时上移，回来时
+                        // 落回原位。位移挂在里面的文字/按钮上而不是整条上——窗口
+                        // 按钮只走 7px（设计稿），整条一起移就分不出来了。
+                        self.render_title_band(title_alpha, title_dy, cx),
+                    )
                     .child(
                         h_flex()
                             .flex_1()
@@ -4514,6 +4817,23 @@ impl Render for PlayerView {
                     // 底部预留悬浮胶囊的位置（视频模式下这块是画布）
                     .child(div().h(px(BOTTOM_BAND)).flex_shrink_0()),
             )
+            // 光尘那一层（含正在淡出的胶囊本体），压在胶囊内容的下面：
+            // 文字和按钮还得在材质之上。
+            .when_some(dust_plate, |el, (bbox, source)| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px(bbox.0))
+                        .top(px(bbox.1))
+                        .w(px(bbox.2))
+                        .h(px(bbox.3))
+                        .child(
+                            gpui_kit::img(source)
+                                .object_fit(gpui_kit::ObjectFit::Fill)
+                                .size_full(),
+                        ),
+                )
+            })
             .child(self.render_bottom_chrome(cx).opacity(chrome_alpha))
             .when(self.playlist_open && !self.cinema, |el| {
                 el.child(self.render_playlist_panel(cx))

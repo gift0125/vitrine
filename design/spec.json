@@ -167,7 +167,7 @@
   },
   "chrome_auto_hide": {
     "idle_ms": 2500,
-    "fade": "代码：CHROME_FADE_STEP 0.25 / 100ms tick；HTML 预览用 .22s 过渡近似，不要照搬曲线",
+    "fade": "代码：16ms 帧循环 + 各元素自己的时长（胶囊 .18s / +70ms 延迟、标题淡 .22s / 位移 .36s、顶部压暗 .42s）；HTML 预览用 CSS 过渡近似，不要照搬曲线",
     "applies_to": [
       "title_band",
       "capsule",
@@ -183,7 +183,7 @@
     "why_not_animation": "不用 with_animation：那个动画只在有帧驱动时推进，而这里的帧是 tick 拉起来的。",
   "preview": "design/preview/index.html?idle=1 冻结该状态；?bare=1 去掉页面留白和工具条，截图区域正好是窗口本身",
   "motion": {
-    "status": "HTML 原型已实现（2026-10-20）；Rust 侧接入路径已定（见 rust_landing），实现未做。",
+    "status": "两边都已实现（2026-10-20）：HTML 原型 + Rust（按 rust_landing 烘进 GlassPlate，见 docs/gpui-kit-plan.md 第十七轮）。",
     "principle": "两条动作分开做，因为它们不是同一种东西：标题带是**信息**，走「向上收走」；控制栏是**材质**，走「散成尘」。方向一致（向外 + 向上），读者才觉得是一起退场。",
     "rust_landing": {
       "one_line": "不新开渲染通道：粒子是既有 GlassPlate 烘焙里的一个新 pass，不是一套独立的渲染层。",

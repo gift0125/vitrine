@@ -115,7 +115,9 @@ iOS 26 Liquid Glass 那一路：玻璃的边不是「更狠的模糊」，是**�
 - `prefers-reduced-motion` 下不画粒子、不做位移，只留淡出。
 - 对照图 `../docs/chrome-fade.png`（稳态）、`../docs/chrome-dissolve.png`（消散相位）；交互看 `preview/index.html?idle=1`（冻结该状态，`&dust=0..1` 再冻粒子相位）。
 
-> 粒子这一层目前**只在 HTML 里**。逐帧 `drawImage` 340 次在 GPUI 里没有对等物（要么自己写一套粒子模拟，要么预渲染一张贴图序列重放），进代码前先确认预算。
+> 粒子在 Rust 里**烘进液态玻璃那张贴图**（见 `spec.json → chrome_auto_hide.motion.rust_landing`）：
+> 加光在 GPUI 的层叠里没有逐节点入口，在 BGRA 里就是逐像素加法；两者时间上不重叠，
+> 一张贴图分时复用。340 个绘制节点那条路走不通，预生成帧序列也别做（几何一变全废）。
 
 ## HTML 原型
 
@@ -137,7 +139,7 @@ iOS 26 Liquid Glass 那一路：玻璃的边不是「更狠的模糊」，是**�
 
 - **数值**以 `spec.json` 为准（含 `texture_layers` 四层的精确参数）；HTML 里能读到同名参数，但不要从 CSS 里抄。
 - **视觉**用 HTML 当对照：实现完截个图，和 `?layers=...` 的对应档位比。
-- HTML 里这些**没有对应实现**，别照搬：`backdrop-filter`（GPUI 无）、CSS 过渡曲线（闲置淡出在代码里是 `0.25/100ms` tick 步进，不是 `.22s` ease）、字体度量、以及拖拽吸附。
+- HTML 里这些**没有对应实现**，别照搬：`backdrop-filter`（GPUI 无）、`transform`/`scale`（gpui-pre 0.3.9 没有，胶囊淡出只沉 3px、没有 `.985` 缩放）、加色混合（贴图只能 source-over，粒子用「往白推」近似）、字体度量、以及拖拽吸附。
 
 ## 更新流程
 

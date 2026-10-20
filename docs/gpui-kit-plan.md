@@ -1537,6 +1537,54 @@ tick 在算的（和 `drop_activity` 同一个套路）。
 
 ---
 
+### ✨ 第十七轮：控制层退场——散成光尘 + 标题向上收走（2026-10-20）
+
+用户：**按新的 spec 实现**。`design/spec.json → chrome_auto_hide.motion.rust_landing`
+把接入路径定死了：粒子不是一套独立渲染层，而是既有 `GlassPlate` 烘焙里的一个新 pass。
+
+#### 为什么是「烘进贴图」而不是一层贴图节点
+
+- **加色混合没有逐节点入口**：GPUI 的层叠是 source-over，想让一层「光」叠在画面上，
+  在 BGRA 缓冲里就是逐像素加法——这是决定性理由，不是妥协。
+- **两件事在时间上不重叠**：退场时胶囊本体 .18s 淡完，粒子接管到 .64s；回场时粒子在聚、
+  玻璃直接用缓存。所以不需要「玻璃 plate + 粒子 plate」两层，一张分时复用。
+- 顺带省掉 340 个节点的布局与绘制。
+
+#### 改了什么
+
+1. `GlassJob.dust: Option<DustPhase { u, scatter, fade, run }>`——相位。几何已在 job 里。
+2. **相位量化进 `bake_key`**（`u` ×65534、`fade` ×255 + `scatter` + `run`）：不写这条，
+   几何/帧/色相都没变，`sync` 判「没变」直接返回，粒子一帧都不会重画。
+3. 粒子期间绕过 `BAKE_MIN_INTERVAL`（20ms）。
+4. 带光尘的 plate 四周留 `DUST_PAD = 48`（外推 24 + 浮力 16 + 光点半径），`render_plate`
+   多一个 `pad`：胶囊本体从 `(pad, pad)` 写起，留边保持透明。
+5. **玻璃 pass 缓存**（`DUST_BASE_REFRESH = 120ms`）：退场时胶囊 .18s 就淡完、回场 .26s，
+   玻璃里装的是模糊倒影，定格一百来毫秒看不出来，成本降到 1/20（实测 4.68ms → 0.23ms）。
+6. `DustPhase::fade` 把胶囊本体的淡出烘进贴图 alpha：贴图挂在根节点上，不能跟着控制层的
+   opacity 走，否则粒子会跟胶囊一起消失。
+7. 加光用预乘空间的屏幕混合：`na = a0 + (1-a0)·k`、`c = (c·a0 + 255k)/na`。透明处得到
+   「白 + 覆盖率」，不透明处得到「原色往白推」——单张 source-over 贴图里最接近 `lighter`
+   的做法。
+
+界面侧同一个 `ChromeRun` 里三条腿各走各的时长：胶囊 .18s（+70ms 延迟，回场 .26s）、
+标题淡 .22s / 位移 .36s（`-12px`，窗口按钮只 `-7px`）、顶部压暗 .42s（单独一层，套在
+标题的 opacity 里就分不开了）。胶囊淡出时沉 3px；设计稿的 `scale(.985)` 做不了——
+gpui-pre 0.3.9 没有 `transform`。
+
+#### 验证
+
+- `cargo test --workspace`：**29 + 59 全绿**（新增 8 条：轮廓带取点、相位进 key、留边尺寸、
+  粒子确实烘在同一张图、fade 烘进 alpha、sprite 剖面、缓存后更便宜、相位预览图）。
+- `scripts/verify_floating_chrome.py`：**18 项 ALL OK**。
+- 截图：`target/fade/out-06.png`（散到一半）、`target/dust-plate-*.png`（四个相位的贴图）。
+
+#### 留给下一轮
+
+- 真加色混合（要 GPUI 给图片节点开混合模式，或者在 D3D 层单独画一层）；
+- `prefers-reduced-motion`（Windows 上读 `SPI_GETCLIENTAREAANIMATION`）时只淡不散。
+
+---
+
 ## 4. 里程碑与时间线
 
 | 里程碑 | 内容 | 累计工期 |
