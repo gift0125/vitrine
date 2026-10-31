@@ -1,4 +1,4 @@
-# Simple Media Player (Chroma) — 长期备忘
+# Simple Media Player (Vitrine) — 长期备忘
 
 > 只留**索引 + 最容易重犯的结论**。过程在当天日志，细节在专题文件——动手前先按表打开对应文件。
 
@@ -13,8 +13,11 @@
 
 ## 概览
 
-- 产品名 **Chroma**（仓库/二进制仍是 `simple-media-player`）。设计稿在 Ardot（file 737444551354649，
-  Catppuccin Latte + Mauve `#8839EF`；macOS = Page 1，Windows = 「Chroma · Windows」）。
+- 产品名 **Vitrine**（2026-10-22 由 Chroma 改名）（仓库/二进制仍是 `simple-media-player`）。设计稿在 Ardot（file 737444551354649，
+  Catppuccin Latte + Mauve `#8839EF`；macOS = Page 1，Windows = 「Vitrine · Windows」）。
+- 资产已随改名同批更新：`assets/vitrine.{ico,png}`、`design/icons/vitrine-*.png`、
+  `docs/screenshots/vitrine-*.png`（`scripts/make-icon.py` / `build.rs` / 验收脚本按窗口标题找窗，
+  标题现在是 **Vitrine**）。
 - 栈：GPUI Kit 0.7.3 + gpui-component、rodio、**进程内 libmpv**（`libmpv-2.dll`），视频走
   **SW render API → BGRA → `RenderImage` → `img()`**；`--wid` 叠加窗那套（区域打洞 / z 序 / 逐像素
   透明）已在第十五轮全删。
@@ -23,10 +26,13 @@
 - 五步流程：plan review → modify → implement → **verify completion** → next stage。
   验证**只认真实文件 / 产物 / git status**，不信自报告。
 - 设计物全在 `design/`：`spec.json` 是**唯一数值来源**，`frames/*.png` 是 2× 窗口图。
-  **开发会话读不到 Ardot 链接**，要改画布得去设计会话。
+  **画布会话也能在本机开发会话里读**（ardot MCP 的 `batch_read` / `export_nodes` 可用，2026-10-22 验过：
+  直接读节点数、`export_nodes format=svg` 拿图标路径），比量图准得多，优先用它。
 - **视频播放态只有 HTML 原型一份**：画布上 6 个视频帧已删（与 HTML 重复，改一次质感要同步 6 份）。
   `frames/` 只剩 HTML 表达不了的 10 张（音乐模式、设置、首屏三态 ×2 平台）；结构快照在
   `design/archive/video-frames-2026-10-18.jsonl`。
+- **首屏三态两边都有**（2026-10-22 起）：画布 6 帧 + `preview/index.html?view=first&fr=…&os=…`。
+  改首屏要同时改两处（这跟视频态的口径相反，别记混）。
 
 ## 最容易重犯的几条（细节见专题文件）
 

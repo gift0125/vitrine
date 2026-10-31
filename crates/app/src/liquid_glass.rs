@@ -14,8 +14,18 @@
 //!
 //! 但**贴图本身按屏幕 1:1 出**（逻辑像素 × 缩放比，单块面 22 万像素封顶）。
 //! 圆角是曲率，比直边更吃分辨率：半分辨率再放大时，14px 的折射带在弧上只剩
-//! 几个采样点，圆角就成了阶梯加一圈灰黑毛边。边缘 alpha 的过渡带固定 1 个
-//! **物理**像素，所以无论分辨率高低，圆角的柔软度都一样。
+//! 几个采样点，圆角就成了阶梯。
+//!
+//! 圆角**不在贴图里裁**：普通贴图整块不透明，圆角交给 `img().rounded()`，由 GPU
+//! 按设备像素做 SDF 抗锯齿，和贴图分辨率无关。GPUI 的贴图是非预乘 alpha，在贴图
+//! 里裁的话圆角外是透明黑，只要贴图被缩放或落在半像素上，双线性一采就是一圈灰黑边
+//! （奶白的歌单上最显眼）。只有带光尘的那张（四周留边、摆在根节点上）还得自己在
+//! alpha 里裁，它在轮廓外多写一圈颜色，免得把黑拖进来。
+//!
+//! ## 不在 UI 线程上烤
+//!
+//! 三块面一起烤要十毫秒上下，`GlassBaker` 由 `video_surface` 整个借给后台线程，
+//! 烤完连同贴图一起还回来；节流（[`BAKE_MIN_INTERVAL`]）也在那边做，这里只管算。
 //!
 //! ## 退场的光尘也在这张贴图里
 //!
@@ -69,10 +79,13 @@ const LIGHT_PLATE_RATIO: f32 = 0.72;
 const COVERAGE_MARGIN: f32 = 36.0;
 /// 播放中玻璃底图的重烤间隔。
 ///
-/// 贴图是屏幕 1:1 的，胶囊一块就 15.7 万像素、三块面一起 47 万（约 14ms CPU），
-/// 每帧重烤会把预算吃满。玻璃里装的是模糊过的倒影，慢一两帧看不出来，所以
+/// 贴图是屏幕 1:1 的，胶囊一块就 15.7 万像素、三块面一起 47 万（约 10ms CPU），
+/// 每帧重烤会把一个核吃满。玻璃里装的是模糊过的倒影，慢一两帧看不出来，所以
 /// 只在**有画面在跑**时才节流；开合面板、改窗口这种布局变化照旧立刻重烤。
-const BAKE_MIN_INTERVAL: Duration = Duration::from_millis(20);
+///
+/// 节流由调用方按 [`BakeKey::same_layout`] 判断：烘焙器在后台线程上，它自己
+/// 跳过的那一帧没人会补。
+pub const BAKE_MIN_INTERVAL: Duration = Duration::from_millis(20);
 /// 模糊用的源图长边上限。再大的帧先做面积平均，边圈 σ=7 用不上那些高频。
 const SOURCE_MAX_LONG: f32 = 1920.0;
 
@@ -82,6 +95,9 @@ pub const DUST_GATHER: Duration = Duration::from_millis(520);
 /// 粒子最远能跑出胶囊多远：外推 24 + 浮力 16 + 光点自身半径。贴图四周要留这么多，
 /// 摆这张贴图的人也得知道（它比胶囊大一圈）。
 pub const DUST_PAD: f32 = 48.0;
+/// 在 alpha 里裁圆角时，轮廓外多上色的那一圈（贴图像素）。双线性只够得着 1 个
+/// texel，多留 1 个给「贴图比摆放尺寸差 1 像素」的拉伸。
+const EDGE_RING: usize = 2;
 /// 带光尘时的贴图像素预算。玻璃 pass 走缓存，逐帧只有粒子在写，可以放宽。
 const DUST_PLATE_BUDGET: f32 = 420_000.0;
 /// 光尘期间玻璃底图的最长保鲜期。
@@ -239,8 +255,9 @@ struct JobKey {
     dust: Option<DustKey>,
 }
 
+/// 一次烘焙的全部输入（量化过）。相等就不用重烤。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BakeKey {
+pub struct BakeKey {
     gen: u64,
     win_w: u32,
     win_h: u32,
@@ -248,6 +265,32 @@ struct BakeKey {
     /// 缩放比（×64 定点）。换了显示器就得按新倍率重烤。
     dpi_q: u16,
     jobs: [Option<JobKey>; 3],
+}
+
+impl BakeKey {
+    /// 除了帧号以外全都一样：只是「又来了一帧」，可以节流。
+    pub fn same_layout(&self, other: &Self) -> bool {
+        self.win_w == other.win_w
+            && self.win_h == other.win_h
+            && self.hue == other.hue
+            && self.dpi_q == other.dpi_q
+            && self.jobs == other.jobs
+    }
+
+    /// 光尘在跑：逐帧都在动，不能节流。
+    pub fn has_dust(&self) -> bool {
+        self.jobs.iter().flatten().any(|job| job.dust.is_some())
+    }
+
+    /// 这一块面在不在（尺寸太小的面不算）。
+    pub fn has_job(&self, id: u8) -> bool {
+        self.jobs.get(id as usize).is_some_and(|job| job.is_some())
+    }
+
+    /// 一块面都没有：不用烤，现有贴图直接撤掉。
+    pub fn is_empty(&self) -> bool {
+        self.jobs.iter().all(|job| job.is_none())
+    }
 }
 
 struct Plate {
@@ -343,7 +386,6 @@ pub struct GlassBaker {
     space: Space,
     plates: Vec<Plate>,
     key: Option<BakeKey>,
-    last_bake: Option<Instant>,
     /// 上次 `sync` 里真正重算像素花的时间，给诊断用。
     last_ms: f32,
     /// 光尘期间缓存的「玻璃 pass」结果（带留边的整块贴图）。见 [`DUST_BASE_REFRESH`]。
@@ -413,6 +455,24 @@ impl GlassBaker {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// 按调用方的帧号收帧：帧号直接当 [`BakeKey`] 里的 `gen`，这样调用方不用
+    /// 摸烘焙器（它可能正在后台线程上）就能算出同一把 key。
+    pub fn ingest_frame(&mut self, tag: u64, width: usize, height: usize, bgra: &[u8]) {
+        self.ingest(width, height, bgra);
+        self.generation = tag;
+    }
+
+    /// 这一帧（按 [`Self::ingest_frame`] 的帧号）已经收过了。
+    pub fn has_frame(&self, tag: u64) -> bool {
+        self.has_source() && self.generation == tag
+    }
+
+    /// 忘掉上一次的 key：下一次 `sync` 无论如何都重出全部贴图。调用方撤掉过
+    /// 贴图时要这么做，否则「面回来了、帧和布局都没变」会被判成没变。
+    pub fn invalidate(&mut self) {
+        self.key = None;
+    }
+
     pub fn clear(&mut self) {
         self.source.clear();
         self.source_w = 0;
@@ -445,25 +505,6 @@ impl GlassBaker {
         let key = bake_key(self.generation, win_w, win_h, hue, dpi, jobs);
         if self.key == Some(key) {
             return false;
-        }
-        // 只有「又来了一帧、布局没变」才节流。开合面板必须这一帧就跟上。
-        // 光尘在跑时**不节流**：那 20ms 是防「整帧烘焙拖垮 UI」，而这段期间玻璃
-        // 走缓存（见 `DUST_BASE_REFRESH`），逐帧的只有粒子 pass。
-        if let Some(prev) = self.key {
-            let layout_same = prev.win_w == key.win_w
-                && prev.win_h == key.win_h
-                && prev.hue == key.hue
-                && prev.dpi_q == key.dpi_q
-                && prev.jobs == key.jobs;
-            let dusting = job_keys_have_dust(&key);
-            if layout_same
-                && !dusting
-                && self
-                    .last_bake
-                    .is_some_and(|at| at.elapsed() < BAKE_MIN_INTERVAL)
-            {
-                return false;
-            }
         }
         let started = Instant::now();
         let tint = hue.map(tint_rgb).unwrap_or([0.0, 0.0, 0.0]);
@@ -560,14 +601,13 @@ impl GlassBaker {
             plate.dirty = true;
             next.push(plate);
         }
-        if !job_keys_have_dust(&key) {
+        if !key.has_dust() {
             // 光尘散了就把缓存还回去：下一次退场可能是别的位置、别的 DPI。
             self.dust_base = None;
             self.dust_field = None;
         }
         self.plates = next;
         self.key = Some(key);
-        self.last_bake = Some(started);
         self.last_ms = started.elapsed().as_secs_f32() * 1000.0;
         true
     }
@@ -659,7 +699,7 @@ impl GlassBaker {
     }
 }
 
-fn bake_key(
+pub fn bake_key(
     gen: u64,
     win_w: f32,
     win_h: f32,
@@ -703,10 +743,6 @@ fn bake_key(
         dpi_q,
         jobs: slots,
     }
-}
-
-fn job_keys_have_dust(key: &BakeKey) -> bool {
-    key.jobs.iter().flatten().any(|job| job.dust.is_some())
 }
 
 /// 玻璃 pass 缓存的指纹。**不含帧号**——画面在动也要忍住。
@@ -1062,13 +1098,20 @@ fn render_plate(
     let radius = job.radius;
     let band = job.band.max(0.001);
     let maxd = job.maxd;
-    // 圆角覆盖率：过渡带正好 1 个**物理**像素（= `1/dpi` 逻辑像素）。
-    //
-    // 贴图和屏幕 1:1 时就是 1 个贴图像素，是矢量级的干净边缘；分辨率被预算
-    // 压下来时过渡带在贴图里更宽，双线性拉上去仍是同样的柔软度。之前用的是
-    // 二值裁切（`d > 0` 清黑），半分辨率放大后就变成 2~3 物理像素的灰黑毛边
-    // ——圆角"烧焦"就是这么来的。
-    let aa = if dpi.is_finite() && dpi > 0.01 { dpi } else { 1.0 };
+    // 带留边的贴图摆在根节点上，没人替它裁圆角，只能在 alpha 里裁。不带留边的
+    // 整块不透明，圆角交给 `img().rounded()`（GPU 按设备像素裁）。
+    let mask = pad > 0.0;
+    // 裁切的过渡带取「1 个物理像素」和「1 个贴图像素」里宽的那个：贴图被预算
+    // 压到低于屏幕分辨率时，不到一个 texel 的过渡带等于二值裁切，放大后是阶梯。
+    let dpi = if dpi.is_finite() && dpi > 0.01 { dpi } else { 1.0 };
+    let aa = dpi.min(scale);
+    // 裁切时往轮廓外多写一圈颜色（alpha 仍是 0）：贴图是非预乘的，那一圈留黑的话，
+    // 双线性会把黑拖进边缘。
+    let ring = if mask { EDGE_RING } else { 0 };
+    let x_lo = ox0.saturating_sub(ring);
+    let x_hi = (ox0 + pill_w + ring).min(pw);
+    let y_lo = oy0.saturating_sub(ring);
+    let y_hi = (oy0 + pill_h + ring).min(ph);
 
     // ---- 行/列预计算 ----
     //
@@ -1084,25 +1127,28 @@ fn render_plate(
     let half_w = (hw - radius).max(0.0);
     let half_h = (hh - radius).max(0.0);
 
-    let mut col_qx = vec![0.0f32; pill_w];
-    let mut col_bx = vec![0.0f32; pill_w];
-    let mut col_sgx = vec![1.0f32; pill_w];
-    let mut col_sx = vec![0.0f32; pill_w];
-    let mut col_rx = vec![0.0f32; pill_w];
-    for ox in 0..pill_w {
-        let wx = job.x + (ox as f32 + 0.5) * dx;
+    // 列数组按 `x_lo` 起算；窗口坐标按胶囊本体的 (ox0, oy0) 起算，外圈是负的。
+    let cols = x_hi - x_lo;
+    let mut col_qx = vec![0.0f32; cols];
+    let mut col_bx = vec![0.0f32; cols];
+    let mut col_sgx = vec![1.0f32; cols];
+    let mut col_sx = vec![0.0f32; cols];
+    let mut col_rx = vec![0.0f32; cols];
+    for i in 0..cols {
+        let wx = job.x + ((x_lo + i) as f32 - ox0 as f32 + 0.5) * dx;
         let rel = wx - cx;
         let qx = rel.abs() - half_w;
-        col_qx[ox] = qx;
-        col_bx[ox] = qx.max(0.0);
-        col_sgx[ox] = if rel > 0.0 { 1.0 } else { -1.0 };
-        col_sx[ox] = (wx - space.x) * k_soft_x;
-        col_rx[ox] = (wx - space.x) * k_rim_x;
+        col_qx[i] = qx;
+        col_bx[i] = qx.max(0.0);
+        col_sgx[i] = if rel > 0.0 { 1.0 } else { -1.0 };
+        col_sx[i] = (wx - space.x) * k_soft_x;
+        col_rx[i] = (wx - space.x) * k_rim_x;
     }
 
-    for oy in 0..pill_h {
-        let wy = job.y + (oy as f32 + 0.5) * dy;
-        let ty = (oy as f32 + 0.5) / pill_h as f32;
+    for oy in y_lo..y_hi {
+        let ly = oy as f32 - oy0 as f32 + 0.5;
+        let wy = job.y + ly * dy;
+        let ty = (ly / pill_h as f32).clamp(0.0, 1.0);
         let rel_y = wy - cy;
         let qy = rel_y.abs() - half_h;
         let by = qy.max(0.0);
@@ -1117,20 +1163,19 @@ fn render_plate(
         let add_g = SCRIM_RGB[1] * flat_a * (1.0 - ga) + gg * ga;
         let add_b = SCRIM_RGB[2] * flat_a * (1.0 - ga) + gb * ga;
 
-        for ox in 0..pill_w {
+        for ox in 0..cols {
             let qx = col_qx[ox];
             let bx = col_bx[ox];
             let len = (bx * bx + by * by).sqrt();
             let d_raw = len + qx.max(qy).min(0.0) - radius;
-            // 留边把整块贴图撑大了一圈，胶囊本体从 (ox0, oy0) 开始写。
-            let o = ((oy + oy0) * pw + (ox + ox0)) * 4;
-            let cover = (0.5 - d_raw * aa).clamp(0.0, 1.0);
-            if cover <= 0.002 {
-                out[o..o + 4].copy_from_slice(&[0, 0, 0, 0]);
-                continue;
-            }
-            // 颜色照旧按 `d = 0`（贴边）算：圆角外那半个像素仍然取边缘色，
-            // 免得插值时把黑色拖进来。alpha 才是裁切。
+            let o = (oy * pw + x_lo + ox) * 4;
+            let cover = if mask {
+                (0.5 - d_raw * aa).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            // 圆角外也照 `d = 0`（贴边）上色：alpha 才是裁切，颜色得是边缘色，
+            // 否则插值会把黑拖进来。
             let t = ((-d_raw).max(0.0) / band).clamp(0.0, 1.0);
             let u = 1.0 - t;
             let u2 = u * u;
@@ -1605,11 +1650,15 @@ mod tests {
             l(left) > l(center) + 20,
             "左缘应比中心亮：edge={left:?} center={center:?}"
         );
-        // 圆角裁在贴图里（带 1 物理像素的覆盖率），外层 `overflow_hidden`
-        // 只是双保险：贴图四角必须已经透明，否则弧上的边缘带会被整块露出。
-        assert_eq!(out[3], 0, "圆角外要透明，圆角才是圆的");
+        // 不带留边的贴图整块不透明，圆角交给 `img().rounded()`。圆角外那一角
+        // 要是边缘色（采的是白边圈），留黑的话 GPU 双线性会拖出一圈灰黑边。
+        assert_eq!(out[3], 255, "不带留边的贴图不在 alpha 里裁");
+        let corner = rgb_at(&out, 80, 0, 0);
+        assert!(
+            l(corner) > l(center) + 20,
+            "圆角外应是边缘色而不是黑：corner={corner:?} center={center:?}"
+        );
         assert_eq!(out[(20 * 80 + 40) * 4 + 3], 255, "中心不透明");
-        assert_eq!(out[(20 * 80 + 5) * 4 + 3], 255, "贴着左缘内侧不透明");
     }
 
     #[test]
@@ -1758,10 +1807,20 @@ mod tests {
         let first = baker.last_ms();
         assert!(first > 0.0);
         assert!(!baker.sync(320.0, 360.0, &jobs, Some(200.0), 1.0));
+        // 节流归调用方：烘焙器收到新帧就重烤。
         baker.ingest(320, 180, &frame);
-        // 「只有新帧」的重烤有 20ms 节流，布局变化不节流，所以这里要等一下。
-        std::thread::sleep(BAKE_MIN_INTERVAL + Duration::from_millis(5));
         assert!(baker.sync(320.0, 360.0, &jobs, Some(200.0), 1.0));
+        // 按帧号收：同一个帧号 key 不变，换了帧号就要重烤
+        baker.ingest_frame(41, 320, 180, &frame);
+        assert!(baker.has_frame(41));
+        assert!(baker.sync(320.0, 360.0, &jobs, Some(200.0), 1.0));
+        assert!(!baker.sync(320.0, 360.0, &jobs, Some(200.0), 1.0));
+        let key = bake_key(41, 320.0, 360.0, Some(200.0), 1.0, &jobs);
+        let next = bake_key(42, 320.0, 360.0, Some(200.0), 1.0, &jobs);
+        assert_ne!(key, next);
+        assert!(key.same_layout(&next), "只换帧号是同一个布局");
+        assert!(!key.has_dust() && key.has_job(0) && !key.has_job(2));
+        assert!(bake_key(41, 320.0, 360.0, Some(200.0), 1.0, &[]).is_empty());
     }
 
     #[test]
@@ -1983,6 +2042,33 @@ mod tests {
             &bytes[i..i + 3]
         );
         let _ = ph;
+    }
+
+    #[test]
+    fn dust_plate_clips_in_alpha_but_colors_the_ring_outside() {
+        // 带留边的贴图自己在 alpha 里裁圆角。裁掉的地方 alpha 是 0，但紧贴轮廓的
+        // 那一圈得是边缘色——非预乘贴图上留黑，双线性一采就是灰黑边。
+        let mut baker = dust_baker();
+        // u=0：粒子还没起步，留边里只有玻璃那一圈
+        let job = GlassJob::capsule(100.0, 200.0, 360.0, 80.0).with_dust(phase(0.0));
+        assert!(baker.sync(640.0, 400.0, &[job], Some(200.0), 1.0));
+        let (_, pw, _, bytes, _) = baker.plates().next().expect("plate");
+        let pad = DUST_PAD as usize;
+        let px = |x: usize, y: usize| &bytes[(y * pw + x) * 4..(y * pw + x) * 4 + 4];
+        let lum = |p: &[u8]| p[0] as u32 + p[1] as u32 + p[2] as u32;
+        let mid = pad + 40;
+        // 左缘外 1 个像素：透明，但有颜色
+        let outside = px(pad - 1, mid);
+        assert_eq!(outside[3], 0, "轮廓外要透明");
+        assert!(lum(outside) > 30, "轮廓外那一圈应是边缘色，实际 {outside:?}");
+        // 圆角外（胶囊本体的左上角）同理
+        let corner = px(pad, pad);
+        assert_eq!(corner[3], 0, "圆角外要透明");
+        assert!(lum(corner) > 30, "圆角外应是边缘色，实际 {corner:?}");
+        // 再往外就不必上色了（只留 EDGE_RING 那一圈）
+        assert_eq!(px(pad - EDGE_RING - 4, mid), &[0, 0, 0, 0]);
+        // 本体照旧不透明
+        assert_eq!(px(pad + 20, mid)[3], 255);
     }
 
     #[test]

@@ -3,13 +3,17 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Chroma · 主播放窗（HTML 原型）</title>
+<title>Vitrine · 原型（播放态 + 首屏）</title>
 <link rel="icon" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAMAAABEpIrGAAACQFBMVEVHcExgEbtxItdmEbtiFb9gF7thFL1hFLxjFb5gFLxxHNJzHtRyH9dvH9RvHtNvHtJjFr9xH9ZuHdFfErtmF8FkF8JmIsxsHNJsHM1nFsJpGslrHMxfErpyIdhmGcVtHM9oGcZoGMZqGsx3It1yIdheE7dfErhfE7leErhzIdlzIdhzIdj///+WUPeVTverb/2scf2ZVPiYUveoa/yqbf2TTPauc/5gE7pxINanafyaVvilZ/ucWPmkZfudWvmjY/ufXfmvdv6SSvZfE7lyINehYfqgX/pwH9VhFLuxeP+RSPViFb5iFL1jFb9hFLxuHtFwH9RkFsBvH9NvHtJtHdBlF8JpGsloGchkFsFtHc9rHM1rG8xmGMVmF8NoGcdqG8tqGspsHM5nGMZ3LdZ+NN19M93+/f91KdOVUPVpHMeoavuGPuL7+f/MqvxmGcF2J9hzJNSBOOCIQuStcvyQTOmQSPOSTerj0P57MNuYVPaTUOvgy/3k0f5oGMSlZvqNSOeudP2WUvCORvOGO+liFr13LNV+M9pxIdZsHM1sHc6PSeuKROWFPeKkZ/aTTu2CN+SVUPB6L9twJM1yIdhfErigYPOUUeyFPOKpbvuhYPmtdvnXvP3s3/7Utvy3hf3iz/7izv3izf2udvuiY/qrcfqhYvq9j/v07f7Blvziz/317f+pbPyyev2yf/maVfihYvjjz/7Lp/3l0v7Blf7bw/zPr/vDmvv69v/p2/3Yvf7fyv3fyf359P/hy/7hzf3hzP2GVDYtAAAALHRSTlMALS0PPC3u7szMLTyL7u7Mi8yLiy2bDy1cXO6bm5ubm+7MzA9cXJvM7pvM7mlm6Q0AAAIqSURBVHgBbdP1VxtLHAXwCcHd3V2Gx0MqWOoad1egWIt7i7s71N3dXf61fmd3k2w2/fw2997knJzMILec3KLiku3tkuKi3BzkzSftJEuaD7cPPcwR6vnxqDNgfn9vd3V1d29/npyiWF8SEiaTyTpHJs4xJkY6IQgLcfbB4QqFoqf3GEtvD0ThwcwgQqlUDhzkGIAwgu6jpVJp3/9e+iCOJn2CSqVqLwPfPpR5aIciAQYZen1XWxV4j3+9rGJp69LrMxCKX7DbxyuJKxh/efei0m3cbl+IR4kGw+JYNQEDjG/ernYZWzQYElGK0ThXSxkkA3zhxtVapzmjMQVlW63L9ZS31ADj50/pc339stWajZJttrUjlDvMAOPB+3SyZrMlI41GM3mKctc1wBcvPSDJJJRIq9VunKbcYw8ekWQDSpRpsSwdpfx29c8e0smSxZKJshyOFQHlD1M/eUyfBYIVhyMLpZtMs3WUy/TPvHWtzmnWZEpHSWbz6HANQQ2+Xq9xGR41m5MQX61Wd5cT3zH++fl1uVs3VHyE4nS61pYK8AN/fFPB0tKq08XBvxkrl8sbSsGnV6UeGqCIJRciUiwWN/7npRHiSPpKBQqFwqYDHE0QBjJ30s9fJBI19x9n6W+GyN/Pea19AyQSScfQ1HnG1FAHBAG+7ofBCzoLZrY216en1ze3ZsgpiOfxtmIOccRwHycv9QRLKu8f75ufl19QuLNTWJCfx3enfwH0BuhnMzcHmAAAAABJRU5ErkJggg==">
 <style>
 /* ============================================================
-   Chroma 主播放窗 —— 由 Ardot 设计稿转出的 HTML 原型
+   Vitrine 原型 —— 由 Ardot 设计稿转出的 HTML
    数值来源：design/spec.json（不要手猜，改这里之前先对一下）
-   设计尺寸 1280×800，整体用 transform: scale() 适配视口
+   两个视图：
+     · 主播放窗 1280×800（视频态 / 歌单 / OSD / 闲置淡出 / 液态玻璃）
+     · 首屏 560×440（最近打开 / 空 / 拖入中 × mac|Win）
+   主窗用 transform: scale() 适配视口，首屏同理（各自按设计尺寸算）。
+   首屏是**画布上还有的那 6 帧**的等价实现：frames/*-firstrun-*.png
    ============================================================ */
 
 :root{
@@ -438,6 +442,120 @@ body.bare .stage{display:block;min-height:0;padding:0;gap:0}
 body.bare .toolbar{display:none}
 /* 截图是"瞬间快照"，过渡没走完会截到半透明中间态 —— 去掉过渡才稳定 */
 body.bare .traffic,body.bare .title,body.bare .capsule,body.bare .mask-bottom{transition:none!important}
+
+/* ============================================================
+   首屏（560×440）—— 三态 × 双平台
+   ------------------------------------------------------------
+   节点：mac 21:1（最近打开）/ 21:58（空）/ 21:483（拖入中）
+         Win 21:587 / 21:644 / 21:710
+   骨架两段固定：品牌区 24,54（512×68）· 主操作区 24,148（512×32）。
+   下面按状态换，坐标全是画布值，不是量图：
+     recent —— 继续上次 y196 · 「最近打开」y246 · 列表 y268（4×28）· 拖放提示 y396
+     empty  —— 无框引导 24,186 / 512×220，内容垂直居中（48 + 3×10 + 21+17+17）
+     drop   —— 投放区 24,204 / 512×212，紫 6% 底 + 1.5px 半透明紫边
+   为什么单独一个窗口、而不是主窗上的浮层：首屏和播放态没有共享几何，
+   塞进同一个 #win 会让 fit() 的缩放比和玻璃层的采样坐标全对不上。
+   ============================================================ */
+.window.first{
+  position:absolute;left:0;top:0;transform-origin:top left;display:none;
+  width:560px;height:440px;border-radius:12px;background:#EFF1F5;color:#4C4F69;
+  box-shadow:0 20px 44px rgba(76,79,105,.20);
+}
+body.view-first .window.first{display:block}
+body.view-first #win{display:none}
+
+.fr{position:absolute;inset:0}
+
+/* 标题带：mac 左侧红绿灯 20,20（12px，间距 8）；Win 右上 462,6 的 92×32 双格 */
+.fr-traffic{position:absolute;left:20px;top:20px;display:flex;gap:8px}
+.fr-traffic i{width:12px;height:12px;border-radius:6px;display:block}
+.fr-traffic i:nth-child(1){background:#FF5F57}
+.fr-traffic i:nth-child(2){background:#FEBC2E}
+.fr-traffic i:nth-child(3){background:#28C840}
+/* 浅底上控件图标必须用 #4C4F69 —— 播放态那套 #E6E9EF 在白底上等于没画 */
+.fr-winctl{position:absolute;left:462px;top:6px;display:none}
+.fr-wc{width:46px;height:32px;border:0;background:none;padding:0;display:grid;place-items:center;
+  color:#4C4F69;cursor:pointer}
+.fr-wc:hover{background:rgba(76,79,105,.08)}
+.fr-wc svg{width:46px;height:32px;display:block}
+.fr[data-os="win"] .fr-traffic{display:none}
+.fr[data-os="win"] .fr-winctl{display:flex}
+
+/* 品牌区：68 图标 + gap14 + 名称列（20/28 Bold + gap4 + 12/17），整块垂直居中 */
+.fr-brand{position:absolute;left:24px;top:54px;width:512px;height:68px;display:flex;align-items:center;gap:14px}
+.fr-logo{width:68px;height:68px;flex:none;display:block}
+.fr-name{display:flex;flex-direction:column;gap:4px;min-width:0}
+.fr-name b{font-size:20px;font-weight:700;line-height:28px;color:#4C4F69}
+.fr-name span{font-size:12px;line-height:17px;color:#8C8FA1}
+
+/* 主操作区：116 主按钮 + gap10 + 104 次按钮，内容居中（外框定宽，不靠 padding 凑） */
+.fr-actions{position:absolute;left:24px;top:148px;display:flex;gap:10px}
+.fr-btn{height:32px;border-radius:8px;border:0;padding:0;display:flex;align-items:center;
+  justify-content:center;gap:6px;font-family:inherit;font-size:13px;font-weight:500;line-height:1;cursor:pointer}
+.fr-btn svg{width:14px;height:14px;display:block;flex:none}
+.fr-open{width:116px;background:#8839EF;color:#fff;box-shadow:0 3px 12px rgba(136,57,239,.30)}
+.fr-open:hover{background:#7C2FE0}
+.fr-stream{width:104px;background:#E6E9EF;color:#4C4F69;border:1px solid #BCC0CC}
+.fr-stream:hover{background:#DFE3EA}
+
+/* 「继续上次」：32 高、r8、padding 0 10、gap8；文件名吃满剩余宽度 */
+.fr-continue{position:absolute;left:24px;top:196px;width:512px;height:32px;border-radius:8px;
+  background:#E6E9EF;display:flex;align-items:center;gap:8px;padding:0 10px;cursor:pointer}
+.fr-continue:hover{background:#DFE3EA}
+.fr-continue .ic{width:14px;height:14px;flex:none;color:#8839EF}
+.fr-continue .ic svg{width:14px;height:14px;display:block}
+.fr-continue .lb{font-size:11px;font-weight:500;line-height:16px;color:#8839EF;flex:none}
+.fr-continue .fn{flex:1;min-width:0;font-size:12px;line-height:17px;color:#4C4F69;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fr-continue .tm{flex:none;font-family:"JetBrains Mono",Consolas,monospace;font-size:11px;line-height:16px;color:#8C8FA1}
+
+/* 最近列表：标题 11/16，行 28 高、r6、padding 0 4、gap8；当前项紫 8% 底 + 紫色图标 */
+.fr-sec{position:absolute;left:24px;top:246px;font-size:11px;font-weight:500;line-height:16px;color:#8C8FA1}
+.fr-list{position:absolute;left:24px;top:268px;width:512px;display:flex;flex-direction:column}
+.fr-row{height:28px;border-radius:6px;display:flex;align-items:center;gap:8px;padding:0 4px;cursor:pointer}
+.fr-row:hover{background:rgba(76,79,105,.05)}
+.fr-row.on{background:rgba(136,57,239,.08)}
+.fr-row .ic{width:14px;height:14px;flex:none;color:#8C8FA1}
+.fr-row.on .ic{color:#8839EF}
+.fr-row .ic svg{width:14px;height:14px;display:block}
+.fr-row .fn{flex:1;min-width:0;font-size:12px;line-height:17px;color:#4C4F69;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.fr-row .tm{flex:none;font-family:"JetBrains Mono",Consolas,monospace;font-size:11px;line-height:16px;color:#8C8FA1}
+.fr-hint{position:absolute;left:24px;top:396px;font-size:11px;line-height:16px;color:#6C6F85}
+
+/* 空状态 / 投放区共用的引导块：图标 48 + gap10 + 15/21 + gap10 + 12/17 ×2 = 133。
+   行高 21/17 是从帧上反推的（文字 ink 的间距 30.5 / 27 只有这组对得上）；
+   内容在块里居中，画布上整体比居中低 1px，用 padding-top:2px 补回那半像素。 */
+.fr-guide{position:absolute;left:24px;width:512px;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:10px;text-align:center;padding-top:2px}
+.fr-guide .gi{width:48px;height:48px;border-radius:24px;display:grid;place-items:center;flex:none}
+.fr-guide .gi svg{width:48px;height:48px;display:block}
+.fr-guide h3{font-size:15px;font-weight:500;line-height:21px}
+.fr-guide p{font-size:12px;line-height:17px}
+
+.fr-empty{top:186px;height:220px}
+.fr-empty .gi{background:#E6E9EF;color:#8839EF}
+.fr-empty h3{color:#4C4F69}
+.fr-empty p{color:#8C8FA1}
+
+.fr-drop{top:204px;height:212px;border-radius:12px;
+  background:rgba(136,57,239,.06);border:1.5px solid rgba(136,57,239,.50)}
+.fr-drop .gi{background:#8839EF;color:#fff}
+.fr-drop h3{color:#8839EF}
+.fr-drop p{color:#6C6F85}
+.fr-drop p.dim{color:#8C8FA1}
+
+/* 三态切换：data-state 决定露出哪块；骨架（标题带 / 品牌区 / 按钮）永远在 */
+.fr-recent,.fr-empty,.fr-drop{display:none}
+.fr[data-state="recent"] .fr-recent{display:block}
+.fr[data-state="empty"] .fr-empty{display:flex}
+.fr[data-state="drop"] .fr-drop{display:flex}
+
+/* 工具条按视图显隐：首屏没有质感档位 / 面板 / 消散这些概念，摆在那儿只会误导 */
+body:not(.view-first) #segFr,body:not(.view-first) #segOs{display:none}
+body.view-first #segMode,body.view-first #segLiquid,body.view-first #segFlow,
+body.view-first #segPanel,body.view-first #tintOut,body.view-first #liquidOut,
+body.view-first #idleHint,body.view-first #leadTexture{display:none}
 </style>
 </head>
 <body>
@@ -608,11 +726,117 @@ body.bare .traffic,body.bare .title,body.bare .capsule,body.bare .mask-bottom{tr
       <!-- 粒子消散层：控制栏闲置退场时「散成尘」，聚回时反过来（见脚本 DUST） -->
       <canvas class="dissolve" aria-hidden="true"></canvas>
     </div>
+
+    <!-- ============ 首屏 560×440（独立窗口，与播放态并列） ============
+         三态共用骨架：标题带 + 品牌区 + 主操作区；
+         recent 多「继续上次 / 最近打开 / 列表 / 拖放提示」，empty 与 drop 换成居中引导块。
+         文案与数值逐条取自画布，不要改成"看起来差不多"的版本。 -->
+    <div class="window first" id="winFirst">
+      <div class="fr" data-state="recent" data-os="mac">
+        <!-- 标题带：mac 红绿灯 / Win 右上控件，由 data-os 切 -->
+        <div class="fr-traffic"><i></i><i></i><i></i></div>
+        <div class="fr-winctl">
+          <button class="fr-wc" aria-label="最小化"><svg viewBox="0 0 46 32"><rect fill="#4B4F69" transform="matrix(1 0 0 1 19 16.5)" y="-0.55" width="8" height="1.1"/></svg></button>
+          <button class="fr-wc" aria-label="关闭"><svg viewBox="0 0 46 32"><path fill="#4B4F69" transform="matrix(1 0 0 1 19 12)" d="M4.7778 4L8.3889 0.3889Q8.5566 0.2306 8.55 0Q8.5566 -0.2306 8.3889 -0.3889Q8.2306 -0.5566 8 -0.55Q7.7694 -0.5566 7.6111 -0.3889L4 3.2222L0.3889 -0.3889Q0.2306 -0.5566 0 -0.55Q-0.2306 -0.5566 -0.3889 -0.3889Q-0.5566 -0.2306 -0.55 0Q-0.5566 0.2306 -0.3889 0.3889L3.2222 4L-0.3889 7.6111Q-0.5566 7.7694 -0.55 8Q-0.5566 8.2306 -0.3889 8.3889Q-0.2306 8.5566 0 8.55Q0.2306 8.5566 0.3889 8.3889L4 4.7778L7.6111 8.3889Q7.7694 8.5566 8 8.55Q8.2306 8.5566 8.3889 8.3889Q8.5566 8.2306 8.55 8Q8.5566 7.7694 8.3889 7.6111L4.7778 4Z"/></svg></button>
+        </div>
+
+        <!-- 品牌区 -->
+        <div class="fr-brand">
+          <img class="fr-logo" alt="Vitrine" src="data:image/png;base64,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">
+          <div class="fr-name"><b>Vitrine</b><span>版本 1.0.0</span></div>
+        </div>
+
+        <!-- 主操作区 -->
+        <div class="fr-actions">
+          <button class="fr-btn fr-open">
+            <svg viewBox="0 0 14 14"><g transform="translate(.65 2.45)"><path fill="#fff" transform="matrix(1 0 0 1 0.55 0.55)" d="M1.1 -0.55L4 -0.55Q4.1205 -0.5506 4.2298 -0.4997Q4.3396 -0.4499 4.4176 -0.3579L5.453 0.85L10.5 0.85Q11.1778 0.85 11.6639 1.3361Q12.15 1.8222 12.15 2.5L12.15 7.4Q12.15 8.0778 11.6639 8.5639Q11.1778 9.05 10.5 9.05L1.1 9.05Q0.4222 9.05 -0.0639 8.5639Q-0.55 8.0778 -0.55 7.4L-0.55 1.1Q-0.55 0.4222 -0.0639 -0.0639Q0.4222 -0.55 1.1 -0.55ZM1.1 0.55Q0.8778 0.55 0.7139 0.7139Q0.55 0.8778 0.55 1.1L0.55 7.4Q0.55 7.6222 0.7139 7.7861Q0.8778 7.95 1.1 7.95L10.5 7.95Q10.7222 7.95 10.8861 7.7861Q11.05 7.6222 11.05 7.4L11.05 2.5Q11.05 2.2778 10.8861 2.1139Q10.7222 1.95 10.5 1.95L5.2 1.95Q5.0795 1.9506 4.9702 1.8997Q4.8604 1.8499 4.7824 1.7579L3.747 0.55L1.1 0.55Z"/></g></svg>
+            打开文件
+          </button>
+          <button class="fr-btn fr-stream">
+            <svg viewBox="0 0 14 14"><path fill="currentColor" transform="matrix(1 0 0 1 5.9 5.9)" d="M1.8111 -0.3889L-0.3889 1.8111Q-0.5566 1.9694 -0.55 2.2Q-0.5566 2.4306 -0.3889 2.5889Q-0.2306 2.7566 0 2.75Q0.2306 2.7566 0.3889 2.5889L2.5889 0.3889Q2.7566 0.2306 2.75 0Q2.7566 -0.2306 2.5889 -0.3889Q2.4306 -0.5566 2.2 -0.55Q1.9694 -0.5566 1.8111 -0.3889Z"/><path fill="currentColor" transform="matrix(1 0 0 1 7.2 2.45)" d="M0.6111 0.3611L-0.3889 1.3611Q-0.5566 1.5194 -0.55 1.75Q-0.5566 1.9806 -0.3889 2.1389Q-0.2306 2.3066 0 2.3Q0.2306 2.3066 0.3889 2.1389L1.3889 1.1389Q1.9778 0.55 2.8 0.55Q3.6222 0.55 4.2111 1.1389Q4.8 1.7278 4.8 2.55Q4.8 3.3722 4.2111 3.9611L3.2111 4.9611Q3.0434 5.1194 3.05 5.35Q3.0434 5.5806 3.2111 5.7389Q3.3694 5.9066 3.6 5.9Q3.8306 5.9066 3.9889 5.7389L4.9889 4.7389Q5.9 3.8278 5.9 2.55Q5.9 1.2722 4.9889 0.3611Q4.0778 -0.55 2.8 -0.55Q1.5222 -0.55 0.6111 0.3611Z"/><path fill="currentColor" transform="matrix(1 0 0 1 1.45 6.2)" d="M4.7389 4.9889L5.7389 3.9889Q5.9066 3.8306 5.9 3.6Q5.9066 3.3694 5.7389 3.2111Q5.5806 3.0434 5.35 3.05Q5.1194 3.0434 4.9611 3.2111L3.9611 4.2111Q3.3722 4.8 2.55 4.8Q1.7278 4.8 1.1389 4.2111Q0.55 3.6222 0.55 2.8Q0.55 1.9778 1.1389 1.3889L2.1389 0.3889Q2.3066 0.2306 2.3 0Q2.3066 -0.2306 2.1389 -0.3889Q1.9806 -0.5566 1.75 -0.55Q1.5194 -0.5566 1.3611 -0.3889L0.3611 0.6111Q-0.55 1.5222 -0.55 2.8Q-0.55 4.0778 0.3611 4.9889Q1.2722 5.9 2.55 5.9Q3.8278 5.9 4.7389 4.9889Z"/></svg>
+            打开串流
+          </button>
+        </div>
+
+        <!-- 状态一：最近打开 -->
+        <div class="fr-recent">
+          <div class="fr-continue">
+            <span class="ic">
+              <svg viewBox="0 0 14 14"><path fill="currentColor" transform="matrix(1 0 0 1 2.2 2.18823)" d="M2.2456 8.1145Q0.6051 6.8616 0.6 4.7971Q0.6066 4.5456 0.4232 4.3733Q0.25 4.1908 -0.0015 4.1986Q-0.253 4.192 -0.4253 4.3754Q-0.6079 4.5486 -0.6 4.8001Q-0.5935 7.4562 1.5173 9.0682Q3.6281 10.6803 6.192 9.9871Q8.7559 9.294 9.7671 6.8379Q10.7783 4.3819 9.4459 2.0843Q8.1134 -0.2134 5.4796 -0.5552Q2.8458 -0.897 0.971 0.9844Q0.7883 1.1575 0.796 1.409Q0.7892 1.6605 0.9725 1.8329Q1.1456 2.0156 1.3971 2.0079Q1.6486 2.0147 1.8211 1.8314Q3.2781 0.3691 5.3251 0.6348Q7.3722 0.9005 8.4078 2.6863Q9.4434 4.4721 8.6575 6.3811Q7.8715 8.29 5.8788 8.8287Q3.8862 9.3674 2.2456 8.1145Z"/><path fill="currentColor" transform="matrix(1 0 0 1 2.1 1.6)" d="M0.6 2.2L0.6 0Q0.6072 -0.2515 0.4243 -0.4243Q0.2515 -0.6072 0 -0.6Q-0.2515 -0.6072 -0.4243 -0.4243Q-0.6072 -0.2515 -0.6 0L-0.6 2.8Q-0.6072 3.0515 -0.4243 3.2243Q-0.2515 3.4072 0 3.4L2.8 3.4Q3.0515 3.4072 3.2243 3.2243Q3.4072 3.0515 3.4 2.8Q3.4072 2.5485 3.2243 2.3757Q3.0515 2.1928 2.8 2.2L0.6 2.2Z"/><path fill="currentColor" transform="matrix(1 0 0 1 6.6 4.9)" d="M0.55 2.1764L0.55 0Q0.5566 -0.2306 0.3889 -0.3889Q0.2306 -0.5566 0 -0.55Q-0.2306 -0.5566 -0.3889 -0.3889Q-0.5566 -0.2306 -0.55 0L-0.55 2.8236L1.5329 3.9808Q1.7312 4.0986 1.9511 4.0288Q2.1746 3.9719 2.2808 3.7671Q2.3986 3.5688 2.3288 3.3489Q2.2719 3.1254 2.0671 3.0192L0.55 2.1764Z"/></svg>
+            </span>
+            <span class="lb">继续上次</span>
+            <span class="fn">星际漫游者 Interstellar Voyager · S01E04.mkv</span>
+            <span class="tm">42:17</span>
+          </div>
+
+          <div class="fr-sec">最近打开</div>
+
+          <div class="fr-list">
+            <div class="fr-row on">
+              <span class="ic"><svg viewBox="0 0 14 14"><path fill="currentColor" transform="matrix(1 0 0 1 1.2 3.2)" d="M1.6 -0.55L10 -0.55Q10.8906 -0.55 11.5203 0.0797Q12.15 0.7094 12.15 1.6L12.15 6Q12.15 8.15 10 8.15L1.6 8.15Q0.7094 8.15 0.0797 7.5203Q-0.55 6.8906 -0.55 6L-0.55 1.6Q-0.55 0.7094 0.0797 0.0797Q0.7094 -0.55 1.6 -0.55ZM1.6 0.55Q1.1651 0.55 0.8575 0.8575Q0.55 1.1651 0.55 1.6L0.55 6Q0.55 7.05 1.6 7.05L10 7.05Q11.05 7.05 11.05 6L11.05 1.6Q11.05 0.55 10 0.55L1.6 0.55Z"/><path fill="currentColor" transform="matrix(1 0 0 1 5.6 5.6)" d="M0 0L3.4 1.4L0 2.8L0 0Z"/></svg></span>
+              <span class="fn">引力弹弓 Gravity Assist.mp4</span>
+              <span class="tm">0:48:36</span>
+            </div>
+            <div class="fr-row">
+              <span class="ic"><svg viewBox="0 0 14 14"><path fill="currentColor" transform="matrix(1 0 0 1 1.2 3.2)" d="M1.6 -0.55L10 -0.55Q10.8906 -0.55 11.5203 0.0797Q12.15 0.7094 12.15 1.6L12.15 6Q12.15 8.15 10 8.15L1.6 8.15Q0.7094 8.15 0.0797 7.5203Q-0.55 6.8906 -0.55 6L-0.55 1.6Q-0.55 0.7094 0.0797 0.0797Q0.7094 -0.55 1.6 -0.55ZM1.6 0.55Q1.1651 0.55 0.8575 0.8575Q0.55 1.1651 0.55 1.6L0.55 6Q0.55 7.05 1.6 7.05L10 7.05Q11.05 7.05 11.05 6L11.05 1.6Q11.05 0.55 10 0.55L1.6 0.55Z"/><path fill="currentColor" transform="matrix(1 0 0 1 5.6 5.6)" d="M0 0L3.4 1.4L0 2.8L0 0Z"/></svg></span>
+              <span class="fn">极光延时 Aurora Timelapse 4K.mp4</span>
+              <span class="tm">0:04:12</span>
+            </div>
+            <div class="fr-row">
+              <span class="ic"><svg viewBox="0 0 14 14"><path fill="currentColor" transform="matrix(1 0 0 1 1.2 3.2)" d="M1.6 -0.55L10 -0.55Q10.8906 -0.55 11.5203 0.0797Q12.15 0.7094 12.15 1.6L12.15 6Q12.15 8.15 10 8.15L1.6 8.15Q0.7094 8.15 0.0797 7.5203Q-0.55 6.8906 -0.55 6L-0.55 1.6Q-0.55 0.7094 0.0797 0.0797Q0.7094 -0.55 1.6 -0.55ZM1.6 0.55Q1.1651 0.55 0.8575 0.8575Q0.55 1.1651 0.55 1.6L0.55 6Q0.55 7.05 1.6 7.05L10 7.05Q11.05 7.05 11.05 6L11.05 1.6Q11.05 0.55 10 0.55L1.6 0.55Z"/><path fill="currentColor" transform="matrix(1 0 0 1 5.6 5.6)" d="M0 0L3.4 1.4L0 2.8L0 0Z"/></svg></span>
+              <span class="fn">夜航 Nighthawks 1080p.mp4</span>
+              <span class="tm">1:37:05</span>
+            </div>
+            <div class="fr-row">
+              <span class="ic"><svg viewBox="0 0 14 14"><path fill="currentColor" transform="matrix(1 0 0 1 1.2 3.2)" d="M1.6 -0.55L10 -0.55Q10.8906 -0.55 11.5203 0.0797Q12.15 0.7094 12.15 1.6L12.15 6Q12.15 8.15 10 8.15L1.6 8.15Q0.7094 8.15 0.0797 7.5203Q-0.55 6.8906 -0.55 6L-0.55 1.6Q-0.55 0.7094 0.0797 0.0797Q0.7094 -0.55 1.6 -0.55ZM1.6 0.55Q1.1651 0.55 0.8575 0.8575Q0.55 1.1651 0.55 1.6L0.55 6Q0.55 7.05 1.6 7.05L10 7.05Q11.05 7.05 11.05 6L11.05 1.6Q11.05 0.55 10 0.55L1.6 0.55Z"/><path fill="currentColor" transform="matrix(1 0 0 1 5.6 5.6)" d="M0 0L3.4 1.4L0 2.8L0 0Z"/></svg></span>
+              <span class="fn">Silent Deep · 静默深空.wav</span>
+              <span class="tm">0:49:44</span>
+            </div>
+          </div>
+
+          <div class="fr-hint">也可以直接把文件或文件夹拖进这个窗口</div>
+        </div>
+
+        <!-- 状态二：空（第一次打开、没有任何历史） -->
+        <div class="fr-guide fr-empty">
+          <div class="gi">
+            <svg viewBox="0 0 48 48"><circle fill="#E6E9EE" cx="24" cy="24" r="24"/><path fill="#8839EF" transform="matrix(1 0 0 1 24 17)" d="M0.75 8.5L0.75 0Q0.759 -0.3144 0.5303 -0.5303Q0.3144 -0.759 0 -0.75Q-0.3144 -0.759 -0.5303 -0.5303Q-0.759 -0.3144 -0.75 0L-0.75 8.5Q-0.759 8.8144 -0.5303 9.0303Q-0.3144 9.259 0 9.25Q0.3144 9.259 0.5303 9.0303Q0.759 8.8144 0.75 8.5Z"/><path fill="#8839EF" transform="matrix(1 0 0 1 20.6 22.4)" d="M3.4 2.3393L0.5303 -0.5303Q0.3144 -0.759 0 -0.75Q-0.3144 -0.759 -0.5303 -0.5303Q-0.759 -0.3144 -0.75 0Q-0.759 0.3144 -0.5303 0.5303L2.8697 3.9303Q3.0856 4.159 3.4 4.15Q3.7144 4.159 3.9303 3.9303L7.3303 0.5303Q7.559 0.3144 7.55 0Q7.559 -0.3144 7.3303 -0.5303Q7.1144 -0.759 6.8 -0.75Q6.4856 -0.759 6.2697 -0.5303L3.4 2.3393Z"/><path fill="#8839EF" transform="matrix(1 0 0 1 17.5 27.5)" d="M0.75 1.7L0.75 0Q0.759 -0.3144 0.5303 -0.5303Q0.3144 -0.759 0 -0.75Q-0.3144 -0.759 -0.5303 -0.5303Q-0.759 -0.3144 -0.75 0L-0.75 1.7Q-0.75 2.5357 -0.1428 3.1428Q0.4643 3.75 1.3 3.75L11.7 3.75Q12.5357 3.75 13.1428 3.1428Q13.75 2.5357 13.75 1.7L13.75 0Q13.759 -0.3144 13.5303 -0.5303Q13.3144 -0.759 13 -0.75Q12.6856 -0.759 12.4697 -0.5303Q12.241 -0.3144 12.25 0L12.25 1.7Q12.25 1.9143 12.0822 2.0822Q11.9143 2.25 11.7 2.25L1.3 2.25Q1.0857 2.25 0.9178 2.0822Q0.75 1.9143 0.75 1.7Z"/></svg>
+          </div>
+          <h3>把视频拖进来就能开始</h3>
+          <p>支持 MP4 · MKV · MOV · MP3 · FLAC</p>
+          <p>或点击上方「打开文件」选择</p>
+        </div>
+
+        <!-- 状态三：拖入中（松手即播） -->
+        <div class="fr-guide fr-drop">
+          <div class="gi">
+            <svg viewBox="0 0 48 48"><circle fill="#8739EE" cx="24" cy="24" r="24"/><path fill="#FFF" transform="matrix(1 0 0 1 24 17)" d="M0.8 8.5L0.8 0Q0.8097 -0.3354 0.5657 -0.5657Q0.3354 -0.8097 0 -0.8Q-0.3354 -0.8097 -0.5657 -0.5657Q-0.8097 -0.3354 -0.8 0L-0.8 8.5Q-0.8097 8.8354 -0.5657 9.0657Q-0.3354 9.3097 0 9.3Q0.3354 9.3097 0.5657 9.0657Q0.8097 8.8354 0.8 8.5Z"/><path fill="#FFF" transform="matrix(1 0 0 1 20.6 22.4)" d="M3.4 2.2686L0.5657 -0.5657Q0.3354 -0.8097 0 -0.8Q-0.3354 -0.8097 -0.5657 -0.5657Q-0.8097 -0.3354 -0.8 0Q-0.8097 0.3354 -0.5657 0.5657L2.8343 3.9657Q3.0646 4.2097 3.4 4.2Q3.7354 4.2097 3.9657 3.9657L7.3657 0.5657Q7.6097 0.3354 7.6 0Q7.6097 -0.3354 7.3657 -0.5657Q7.1354 -0.8097 6.8 -0.8Q6.4646 -0.8097 6.2343 -0.5657L3.4 2.2686Z"/><path fill="#FFF" transform="matrix(1 0 0 1 17.5 27.5)" d="M0.8 1.7L0.8 0Q0.8097 -0.3354 0.5657 -0.5657Q0.3354 -0.8097 0 -0.8Q-0.3354 -0.8097 -0.5657 -0.5657Q-0.8097 -0.3354 -0.8 0L-0.8 1.7Q-0.8 2.5564 -0.1782 3.1782Q0.4436 3.8 1.3 3.8L11.7 3.8Q12.5564 3.8 13.1782 3.1782Q13.8 2.5564 13.8 1.7L13.8 0Q13.8097 -0.3354 13.5657 -0.5657Q13.3354 -0.8097 13 -0.8Q12.6646 -0.8097 12.4343 -0.5657Q12.1903 -0.3354 12.2 0L12.2 1.7Q12.2 1.8936 12.0468 2.0468Q11.8936 2.2 11.7 2.2L1.3 2.2Q1.1064 2.2 0.9532 2.0468Q0.8 1.8936 0.8 1.7Z"/></svg>
+          </div>
+          <h3>松手即可播放</h3>
+          <p>星际漫游者 Interstellar Voyager · S01E04.mkv</p>
+          <p class="dim">将加入播放列表并立即开始播放</p>
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- 原型工具条（不属于设计稿） -->
   <div class="toolbar">
-    <span class="lead">质感档位（逐层叠加）</span>
+    <span class="lead">视图</span>
+    <div class="seg" id="segView">
+      <button data-view="main" class="on">主窗 · 播放态</button>
+      <button data-view="first">首屏 · 560×440</button>
+    </div>
+    <div class="seg" id="segFr">
+      <button data-fr="recent" class="on">最近打开</button>
+      <button data-fr="empty">空状态</button>
+      <button data-fr="drop">拖入中</button>
+    </div>
+    <div class="seg" id="segOs">
+      <button data-os="mac" class="on">macOS</button>
+      <button data-os="win">Windows</button>
+    </div>
+    <span class="lead" id="leadTexture">质感档位（逐层叠加）</span>
     <div class="seg" id="segMode">
       <button data-layers="">L0 设计稿原样</button>
       <button data-layers="enh">L1 +方向光</button>
@@ -630,7 +854,7 @@ body.bare .traffic,body.bare .title,body.bare .capsule,body.bare .mask-bottom{tr
       <button data-flow="side">→ 横流</button>
       <button data-flow="out">四周散</button>
     </div>
-    <span class="tintout">播放后 2.5s 不动鼠标 → 控制层淡出（按播放键试）</span>
+    <span class="tintout" id="idleHint">播放后 2.5s 不动鼠标 → 控制层淡出（按播放键试）</span>
     <span class="tintout" id="tintOut"></span>
     <span class="tintout" id="liquidOut"></span>
     <div class="seg" id="segPanel">
@@ -669,27 +893,36 @@ if(qs.get('card') !== null){
   document.documentElement.style.setProperty('--still', `url("${c.toDataURL()}")`);
 }
 
-/* ---------- 视口自适应：1280×800 等比缩放到可用宽度 ---------- */
+/* ---------- 视口自适应：当前视图按自己的设计尺寸等比缩放到可用宽度 ----------
+   两个视图不一样大（主窗 1280×800 / 首屏 560×440），缩放比必须跟着视图走：
+   沿用固定 1280 的话，?bare=1 截首屏会截出 1280×800 的一片底色。 */
 const holder = document.querySelector('.win-holder');
 const win = document.getElementById('win');
+const winFirst = document.getElementById('winFirst');
+const frRoot = winFirst.querySelector('.fr');
+const VIEWS = { main:{ w:1280, h:800 }, first:{ w:560, h:440 } };
+let view = qs.get('view') === 'first' ? 'first' : 'main';
+
 function fit(){
-  // ?bare=1 是截图模式：不缩放，截出来正好是 1280×800（×dpr）的窗口本身
+  const v = VIEWS[view];
+  const el = view === 'first' ? winFirst : win;
+  // ?bare=1 是截图模式：不缩放，截出来正好是设计尺寸 × dpr 的窗口本身
   if(qs.get('bare') !== null){
-    win.style.transform = 'none';
-    holder.style.width = '1280px';
-    holder.style.height = '800px';
+    el.style.transform = 'none';
+    holder.style.width = v.w + 'px';
+    holder.style.height = v.h + 'px';
   } else {
-    const availW = Math.min(window.innerWidth - 64, 1280);
+    const availW = Math.min(window.innerWidth - 64, v.w);
     const availH = window.innerHeight - 170;
-    const s = Math.min(1, availW / 1280, availH / 800);
-    win.style.transform = `scale(${s})`;
-    holder.style.width = 1280 * s + 'px';
-    holder.style.height = 800 * s + 'px';
+    const s = Math.min(1, availW / v.w, availH / v.h);
+    el.style.transform = `scale(${s})`;
+    holder.style.width = v.w * s + 'px';
+    holder.style.height = v.h * s + 'px';
   }
-  win.style.position = 'absolute';
-  win.style.left = '0';
-  win.style.top = '0';
-  win.style.transformOrigin = 'top left';
+  el.style.position = 'absolute';
+  el.style.left = '0';
+  el.style.top = '0';
+  el.style.transformOrigin = 'top left';
 }
 window.addEventListener('resize', fit); fit();
 
@@ -1479,6 +1712,47 @@ if(qs.get('idle') !== null){
 if(qs.get('dusthold') !== null) win.classList.add('dusthold');
 /* ?bare=1 去掉页面留白和工具条：截图区域 = 窗口本身 */
 if(qs.get('bare') !== null) document.body.classList.add('bare');
+
+/* ---------- 视图切换：主窗 / 首屏 ----------
+   默认仍停在主窗 —— 老链接（?idle=1 / ?layers=… / ?panel=…）行为一个字都不变。
+   参数：?view=first & fr=recent|empty|drop & os=mac|win
+   截图：?view=first&fr=empty&bare=1 → 截出来正好 560×440，
+        和 design/frames/*-firstrun-*.png 是同一套几何，可以直接比。 */
+(function initView(){
+  const segV = document.getElementById('segView');
+  const segF = document.getElementById('segFr');
+  const segO = document.getElementById('segOs');
+  if(!segV || !segF || !segO) return;
+
+  function apply(v, fr, os, syncUrl){
+    view = v;
+    document.body.classList.toggle('view-first', v === 'first');
+    if(fr) frRoot.dataset.state = fr;
+    if(os) frRoot.dataset.os = os;
+    segV.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.view === v));
+    segF.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.fr === frRoot.dataset.state));
+    segO.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.os === frRoot.dataset.os));
+    fit();
+    /* 主窗隐藏期间 clientWidth 是 0，玻璃层的缓存签名已经脏了——回来必须重画 */
+    if(glassMode) renderGlass();
+    if(syncUrl){
+      try{
+        const u = new URLSearchParams(location.search);
+        u.set('view', v); u.set('fr', frRoot.dataset.state); u.set('os', frRoot.dataset.os);
+        history.replaceState(null, '', '?' + u.toString());
+      }catch(e){ /* file:// 下部分浏览器禁止改 URL：参数只是便利，不影响渲染 */ }
+    }
+  }
+
+  frRoot.dataset.state = ['recent','empty','drop'].includes(qs.get('fr')) ? qs.get('fr') : 'recent';
+  frRoot.dataset.os = qs.get('os') === 'win' ? 'win' : 'mac';
+
+  segV.addEventListener('click', e => { const b = e.target.closest('button'); if(b) apply(b.dataset.view, null, null, true); });
+  segF.addEventListener('click', e => { const b = e.target.closest('button'); if(b) apply(view, b.dataset.fr, null, true); });
+  segO.addEventListener('click', e => { const b = e.target.closest('button'); if(b) apply(view, null, b.dataset.os, true); });
+
+  apply(view, null, null, false);
+})();
 
 </script>
 </body>

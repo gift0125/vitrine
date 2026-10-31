@@ -60,7 +60,7 @@ $shots = Join-Path $root "docs/screenshots"
 if (Test-Path $shots) {
     $shotStage = Join-Path $stage "docs/screenshots"
     New-Item -ItemType Directory -Path $shotStage -Force | Out-Null
-    Copy-Item (Join-Path $shots "chroma-*.png") $shotStage
+    Copy-Item (Join-Path $shots "vitrine-*.png") $shotStage
 }
 
 # 可选：把 libmpv-2.dll 一起打进去（视频功能需要；进程内加载，DLL 必须和 exe 同目录）

@@ -19,9 +19,11 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+use player_core::fit_gpu_render_size;
 use player_core::{
-    find_libmpv, fit_render_size, is_video_file, load_track_meta, scan_dir_for_tracks,
-    AudioEngine, PlaybackState, SpawnOptions, TrackMeta, VideoEngine, VideoStatus,
+    find_libmpv, fit_render_size, is_stream_url, is_video_file, load_track_meta, scan_dir_for_tracks,
+    AudioEngine, PlaybackState, SpawnOptions, TrackMeta, VideoEngine, VideoStatus, LIBMPV_NAME,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
@@ -38,11 +40,11 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 
 use crate::liquid_glass::{DUST_GATHER, DUST_PAD, DUST_SCATTER, DustPhase, GlassJob};
-use crate::persistence::{self, RepeatMode, Settings};
+use crate::persistence::{self, Recent, RepeatMode, Settings};
 use crate::playlist::PlaylistDelegate;
 use crate::theme::overlay;
 use crate::ui_state::{ChromeLayout, Rect as UiRect, UiState};
-use crate::video_surface::VideoSurface;
+use crate::video_surface::{GlassPlan, VideoSurface};
 use crate::window_actions::{self, Hwnd};
 
 /// 控制胶囊在窗口里的位置。歌单展开时居中于剩余画面（1280 宽时 x = 88）。
@@ -82,18 +84,54 @@ fn playlist_box(win_w: f32, win_h: f32) -> Option<(f32, f32, f32, f32)> {
     Some((x, y, PLAYLIST_WIDTH, h))
 }
 
+/// 深色玻璃面的 1px 顶亮 / 底暗（没有液态玻璃贴图时用）。
+///
+/// 不能画成贴边的 1px 矩形：父节点的 `overflow_hidden` 只按矩形裁，矩形线会在圆角
+/// 处直直戳出去。改成两层同圆角的节点、各只描一条边，GPUI 会让它沿圆弧收细。
+fn rim_lines(radius: f32) -> [Div; 2] {
+    let layer = || {
+        div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full()
+            .rounded(px(radius))
+    };
+    [
+        layer().border_t_1().border_color(overlay::highlight()),
+        layer().border_b_1().border_color(overlay::shade()),
+    ]
+}
+
 /// 进度条量程未知时的兜底（元数据解析失败）。
 const SEEK_FALLBACK_MAX: f32 = 600.0;
 /// 轮询间隔（计划约定 100ms）。
 const TICK_INTERVAL: Duration = Duration::from_millis(100);
+/// 「打开文件」对话框的过滤器（首屏和歌单的「添加」共用）。
+pub(crate) const MEDIA_EXTENSIONS: &[&str] = &[
+    "mp3", "flac", "wav", "ogg", "oga", "m4a", "aac", "aiff", "mp4", "m4v", "mkv", "webm", "mov",
+    "avi", "flv", "wmv", "ts",
+];
+/// 播放进度落盘的间隔。崩了最多丢这么久，正常退出 / 切歌时另外会记一次。
+const PROGRESS_SAVE_INTERVAL: Duration = Duration::from_secs(5);
 /// 顶部标题带高度（系统标题栏已关闭，这一段是自绘拖拽区 + 窗口按钮）。
 ///
-/// 设计稿分平台：mac 自绘 34，**Windows 主窗 40**（和设置窗标题带一致，也是
-/// Win10/11 原生标题栏高度）；窗口按钮 46×40 正好是一块标准热区。
+/// 设计稿分平台：**mac 34**（左上是系统红绿灯，见 [`TRAFFIC_LIGHT_ORIGIN`]），
+/// **Windows 主窗 40**（和设置窗标题带一致，也是 Win10/11 原生标题栏高度）；
+/// 窗口按钮 46×40 正好是一块标准热区。
 ///
 /// `theme::install` 也读它来给 toast 让位（通知层要从标题带下面开始），
 /// 所以是 `pub(crate)`。
+#[cfg(target_os = "macos")]
+pub(crate) const TITLE_BAND: f32 = 34.0;
+#[cfg(not(target_os = "macos"))]
 pub(crate) const TITLE_BAND: f32 = 40.0;
+/// mac 用系统红绿灯（透明标题栏下它们照常在），不自绘最小化 / 最大化 / 关闭。
+const NATIVE_TRAFFIC_LIGHTS: bool = cfg!(target_os = "macos");
+/// 红绿灯（关闭钮）左上角在窗口里的位置，交给 `TitlebarOptions`；按钮高 16，竖直居中。
+pub(crate) const TRAFFIC_LIGHT_ORIGIN: (f32, f32) = (12.0, (TITLE_BAND - 16.0) / 2.0);
+/// 标题文字给红绿灯让位：三颗按钮到 12 + 14×3 + 6×2 = 66，再留 12。
+const TRAFFIC_LIGHT_INSET: f32 = 78.0;
 /// 底部悬浮胶囊的内缩。
 const CAPSULE_INSET: f32 = 24.0;
 /// 胶囊**固定宽度**（设计稿 760）。
@@ -374,7 +412,15 @@ struct VideoRuntime {
     /// 放在这里是因为**接信号要 window**（`cx.spawn_in`），而 `start_video` 手上
     /// 没有 window：引擎起播时只把接收端存下来，下一次 tick 再把泵拉起来。
     frames: Option<async_channel::Receiver<()>>,
+    /// GPU 通路上次给玻璃回读源图的时刻（回读按玻璃的重烤间隔节流）
+    #[cfg(target_os = "macos")]
+    glass_read_at: Option<Instant>,
 }
+
+/// GPU 通路给玻璃回读的源图长边。玻璃的模糊源本来就封在 1920，边圈缓冲每块面
+/// 不过 420——再大的图只是多搬几兆字节。
+#[cfg(target_os = "macos")]
+const GLASS_SOURCE_LONG: usize = 1280;
 
 /// 方向键的四个方向。
 ///
@@ -706,6 +752,8 @@ pub struct PlayerView {
     /// 画面在主窗口里，GPUI 的 `start_window_move()` 在 Windows 后端又没有实现
     /// （实测只有 apple / test 后端有），只能自己搬。
     drag_anchor: Rc<Cell<Option<(i32, i32, i32, i32)>>>,
+    /// mac 拖窗口的「上膛」标记，见 [`PlayerView::native_window_move`]。
+    move_armed: Rc<Cell<Option<Point<Pixels>>>>,
     /// 验收探针的输出路径（`SMP_UI_STATE`），没设就完全不产生开销。
     ui_probe: Option<PathBuf>,
     /// 上一次写出去的探针 JSON（内容没变就不重写盘）。
@@ -718,6 +766,14 @@ pub struct PlayerView {
     pending_infos: Vec<SharedString>,
     /// 启动即播放的曲目（命令行 `--play` / 位置参数）；在第一次 tick 消费
     pending_autoplay: Option<usize>,
+    /// 首屏交过来的文件 / 文件夹（「打开文件」或拖进首屏），第一次 tick 按拖放导入
+    pending_import: Vec<PathBuf>,
+    /// 下一次起播从哪开始（首屏的「继续上次」/ 最近打开）；起播时取走
+    resume_at: Option<f64>,
+    /// 最近打开 + 各自的进度（`recent.json`），首屏读它
+    recent: Recent,
+    /// 上次把进度写进 `recent` 的时刻
+    progress_saved_at: Instant,
     /// 最近一次「有外部文件在窗口上方」的时间戳（用于画「松开即可播放」提示）。
     ///
     /// 用 `Cell` 而不是普通字段：判定「拖的是外部文件」只能靠 `drag_over::<ExternalPaths>`
@@ -798,7 +854,7 @@ impl PlayerView {
             this.sync_video_chrome(window);
         }));
         // 退出应用时结束 mpv 子进程（避免孤儿进程）
-        subscriptions.push(cx.on_app_quit(|this, _cx| {
+        subscriptions.push(cx.on_app_quit(|this, cx| {
             let detail = match this.current {
                 Some(i) => format!(
                     "app_quit requested (video_active={}, current={i})",
@@ -810,6 +866,8 @@ impl PlayerView {
                 ),
             };
             persistence::log_session(&detail);
+            // 进度要在停 mpv 之前取：停了位置就归零了
+            this.save_progress(cx);
             this.shutdown_video();
             async {}
         }));
@@ -902,12 +960,17 @@ impl PlayerView {
             activity_moved: Rc::new(Cell::new(None)),
             tint_applied: None,
             drag_anchor: Rc::new(Cell::new(None)),
+            move_armed: Rc::new(Cell::new(None)),
             ui_probe: std::env::var_os("SMP_UI_STATE").map(PathBuf::from),
             ui_published: None,
             last_error: startup_errors.first().cloned(),
             pending_errors: startup_errors,
             pending_infos: Vec::new(),
             pending_autoplay: autoplay,
+            pending_import: Vec::new(),
+            resume_at: None,
+            recent: persistence::load_recent(),
+            progress_saved_at: Instant::now(),
             drop_activity: Rc::new(Cell::new(None)),
             drop_hint_shown: false,
             status_pill: None,
@@ -1008,6 +1071,14 @@ impl PlayerView {
         this
     }
 
+    /// 首屏交过来的启动意图：`resume_at` 给 `autoplay` 那一条续播，
+    /// `import` 按拖放导入并播第一条。
+    pub fn with_launch(mut self, resume_at: Option<f64>, import: Vec<PathBuf>) -> Self {
+        self.resume_at = resume_at;
+        self.pending_import = import;
+        self
+    }
+
     // ------------------------------------------------------------------
     // 引擎状态同步
     // ------------------------------------------------------------------
@@ -1074,6 +1145,18 @@ impl PlayerView {
         // 命令行「打开方式」：等第一帧渲染完再起播，构造期间不发通知
         if let Some(index) = self.pending_autoplay.take() {
             self.play_track(index, cx);
+        }
+        if !self.pending_import.is_empty() {
+            let paths = std::mem::take(&mut self.pending_import);
+            self.import_dropped(paths, cx);
+        }
+
+        // 进度隔一会儿记一次（首屏的「继续上次」靠它）；暂停时位置不动，不用记
+        if self.progress_saved_at.elapsed() >= PROGRESS_SAVE_INTERVAL {
+            self.progress_saved_at = Instant::now();
+            if self.playback_state() == PlaybackState::Playing {
+                self.save_progress(cx);
+            }
         }
 
         // 拖放提示：`drag_over` 的样式回调拿不到 cx，只能留时间戳。
@@ -1583,10 +1666,44 @@ impl PlayerView {
         }
     }
 
+    /// 当前曲目放到哪了：`(位置, 总长)`。没在放（idle / 停了）返回 `None`。
+    fn playback_progress(&self) -> Option<(f64, Option<f64>)> {
+        if self.video_active {
+            let status = self.video.engine.as_ref()?.status();
+            if status.idle {
+                return None;
+            }
+            Some((status.position, (status.duration > 0.0).then_some(status.duration)))
+        } else {
+            let engine = self.engine.as_ref()?;
+            if engine.state() == PlaybackState::Stopped {
+                return None;
+            }
+            Some((engine.position_secs(), None))
+        }
+    }
+
+    /// 把当前曲目的进度记进「最近打开」，变了才落盘。
+    fn save_progress(&mut self, cx: &Context<Self>) {
+        let Some(track) = self.current_track(cx) else {
+            return;
+        };
+        let Some((position, duration)) = self.playback_progress() else {
+            return;
+        };
+        let duration = duration.or(track.duration_secs);
+        if self.recent.record_position(&track.path, position, duration) {
+            persistence::save_recent(&self.recent);
+        }
+    }
+
     fn play_track(&mut self, index: usize, cx: &mut Context<Self>) {
         let track = self.playlist.read(cx).delegate().track(index).cloned();
         let Some(track) = track else { return };
-        let want_video = is_video_file(Path::new(&track.path));
+        // 换片前先把正在放的那条停在哪记下来
+        self.save_progress(cx);
+        let start = self.resume_at.take().unwrap_or(0.0);
+        let want_video = wants_mpv(&track.path);
 
         // 开播这一刻算一次输入：新片子的前 2.5 秒控制层必须是亮着的，
         // 否则刚打开视频就是一块"什么都没有"的画面（用户还没碰过任何输入）。
@@ -1599,10 +1716,20 @@ impl PlayerView {
                 engine.stop();
             }
             self.current = Some(index);
-            self.start_video(&track, cx);
+            self.start_video(&track, start, cx);
         } else {
             self.leave_video();
-            self.start_audio(index, &track, cx);
+            self.start_audio(index, &track, start, cx);
+        }
+
+        if self.current == Some(index) {
+            self.recent
+                .touch(&track.path, &recent_title(&track.path), track.duration_secs);
+            if start > 0.0 {
+                self.recent.record_position(&track.path, start, None);
+            }
+            persistence::save_recent(&self.recent);
+            self.progress_saved_at = Instant::now();
         }
 
         self.playlist.update(cx, |state, cx| {
@@ -1613,9 +1740,9 @@ impl PlayerView {
         cx.notify();
     }
 
-    fn start_audio(&mut self, index: usize, track: &TrackMeta, cx: &mut Context<Self>) {
+    fn start_audio(&mut self, index: usize, track: &TrackMeta, start: f64, cx: &mut Context<Self>) {
         if let Some(engine) = &mut self.engine {
-            match engine.play(&track.path) {
+            match engine.play_at(&track.path, start) {
                 Ok(()) => {
                     self.current = Some(index);
                     let max = track.duration_secs.unwrap_or(SEEK_FALLBACK_MAX as f64) as f32;
@@ -1634,7 +1761,7 @@ impl PlayerView {
     }
 
     /// 进入视频模式：确保 mpv 引擎与软件渲染就绪，然后加载文件。
-    fn start_video(&mut self, track: &TrackMeta, cx: &mut Context<Self>) {
+    fn start_video(&mut self, track: &TrackMeta, start: f64, cx: &mut Context<Self>) {
         self.video_error = None;
         self.video_active = true;
         // 换片了：等新片子的尺寸出来再调窗口（旧尺寸不能沿用）
@@ -1647,14 +1774,16 @@ impl PlayerView {
             None => true,
         };
         if need_spawn {
-            // 进程内 libmpv：只找 DLL，不再起子进程
+            // 进程内 libmpv：只找动态库，不再起子进程
             let Some(libmpv) = find_libmpv(None) else {
                 self.video_active = false;
-                self.video_error =
-                    Some("未找到 libmpv-2.dll（可用环境变量 SMP_LIBMPV_PATH 指定路径）".into());
-                self.report_error(
-                    "视频不可用：未找到 libmpv-2.dll（设置 SMP_LIBMPV_PATH 可指定路径）",
+                self.video_error = Some(
+                    format!("未找到 {LIBMPV_NAME}（可用环境变量 SMP_LIBMPV_PATH 指定路径）")
+                        .into(),
                 );
+                self.report_error(format!(
+                    "视频不可用：未找到 {LIBMPV_NAME}（设置 SMP_LIBMPV_PATH 可指定路径）"
+                ));
                 return;
             };
             // `wid: None` = 不要 `--wid` 叠加窗，改走软件渲染（见 `video::spawn`）
@@ -1697,7 +1826,7 @@ impl PlayerView {
             self.video.frames = Some(rx);
 
             engine.set_volume(self.settings.volume);
-            engine.load(&track.path);
+            engine.load_at(&track.path, start);
         }
         let max = track.duration_secs.unwrap_or(SEEK_FALLBACK_MAX as f64) as f32;
         self.rebuild_seek(max, cx);
@@ -1762,18 +1891,34 @@ impl PlayerView {
             (status.width > 0 && status.height > 0).then_some((status.width, status.height))
         });
         let bounds = window.bounds().size;
-        let (width, height) = fit_render_size(
-            bounds.width.as_f32(),
-            bounds.height.as_f32(),
-            native,
-            window.scale_factor(),
-        );
 
         // 拆开借用：`render_frame` 拿 `&mut engine` 的同时 `surface` 要可变
         let VideoRuntime { engine, surface, .. } = &mut self.video;
         let Some(engine) = engine.as_mut() else {
             return;
         };
+        #[cfg(target_os = "macos")]
+        if engine.renders_on_gpu() {
+            let (width, height) = fit_gpu_render_size(
+                bounds.width.as_f32(),
+                bounds.height.as_f32(),
+                native,
+                window.scale_factor(),
+            );
+            let Some(buffer) = engine.render_surface(width, height) else {
+                return;
+            };
+            trace_frame(bounds.width.as_f32(), bounds.height.as_f32(), native, (width, height), window.scale_factor());
+            surface.accept_pixels(buffer, window);
+            cx.notify();
+            return;
+        }
+        let (width, height) = fit_render_size(
+            bounds.width.as_f32(),
+            bounds.height.as_f32(),
+            native,
+            window.scale_factor(),
+        );
         let Some(frame) = engine.render_frame(width, height) else {
             return;
         };
@@ -1899,6 +2044,12 @@ impl PlayerView {
     /// 和 `skip()` 分开是因为语义不同：手动按「下一首」时**单曲循环也要换歌**
     /// （否则按了没反应），只有自动连播才把「单曲」当回事。
     fn advance_after_end(&mut self, cx: &mut Context<Self>) {
+        // 放完了：首屏不该再提示「继续上次」
+        if let Some(track) = self.current_track(cx) {
+            if self.recent.record_position(&track.path, 0.0, None) {
+                persistence::save_recent(&self.recent);
+            }
+        }
         let count = self.playlist.read(cx).delegate().track_count();
         if count == 0 {
             return;
@@ -1972,10 +2123,7 @@ impl PlayerView {
                 .and_then(|index| self.playlist.read(cx).delegate().track(index).cloned());
             // 视频播完时 tick 会 `stop()` + 退出视频模式，这一刻用音频引擎重起一个 mp4
             // 只会解码失败、弹一条假错误。视频的「播完再往回跳」不在这一版里做。
-            if track
-                .as_ref()
-                .is_some_and(|track| is_video_file(Path::new(&track.path)))
-            {
+            if track.as_ref().is_some_and(|track| wants_mpv(&track.path)) {
                 return;
             }
             if let (Some(track), Some(engine)) = (track, &mut self.engine) {
@@ -2333,13 +2481,7 @@ impl PlayerView {
         cx.spawn(async move |this, cx| {
             let files = rfd::AsyncFileDialog::new()
                 .set_title("添加媒体文件")
-                .add_filter(
-                    "媒体文件",
-                    &[
-                        "mp3", "flac", "wav", "ogg", "oga", "m4a", "aac", "aiff", "mp4", "m4v",
-                        "mkv", "webm", "mov", "avi", "flv", "wmv", "ts",
-                    ],
-                )
+                .add_filter("媒体文件", MEDIA_EXTENSIONS)
                 .pick_files()
                 .await;
             let Some(files) = files else { return };
@@ -2607,6 +2749,7 @@ impl PlayerView {
     }
 
     /// 顶部标题带：当前曲名 + 自绘窗口按钮（系统标题栏已在 main 里关掉）。
+    /// mac 不画窗口按钮，左边让给系统红绿灯。
     ///
     /// `alpha` / `dy` 是淡出相位（见 [`ChromeRun::title`]）：标题文字走满 12px，
     /// 窗口按钮只走 7px（[`CAPTION_LIFT`]）——它们贴着窗口右边，跟着走 12px 会像
@@ -2621,7 +2764,7 @@ impl PlayerView {
                 Some(artist) if !artist.is_empty() => format!("{} · {}", track.title, artist),
                 _ => track.title.clone(),
             },
-            None => "Chroma".to_string(),
+            None => "Vitrine".to_string(),
         };
 
         h_flex()
@@ -2629,7 +2772,12 @@ impl PlayerView {
             .h(px(TITLE_BAND))
             .flex_shrink_0()
             .items_center()
-            .pl(px(16.))
+            .pl(px(if NATIVE_TRAFFIC_LIGHTS {
+                TRAFFIC_LIGHT_INSET
+            } else {
+                16.
+            }))
+            .when(NATIVE_TRAFFIC_LIGHTS, |el| el.pr(px(8.)))
             .opacity(alpha)
             // 只有左侧这段是拖拽区：整条都设成 Drag 的话，右侧窗口按钮会一起
             // 被当成非客户区，点击事件就到不了 GPUI。
@@ -2641,10 +2789,17 @@ impl PlayerView {
                     .h_full()
                     .flex()
                     .items_center()
+                    // Windows 靠命中测试拖；mac 后端不做命中测试，得自己发起
                     .window_control_area(WindowControlArea::Drag)
-                    // 双击标题栏最大化/还原——同样不能走 `window.zoom_window()`
+                    .when(NATIVE_TRAFFIC_LIGHTS, |el| self.native_window_move(el))
                     .on_double_click(cx.listener(|this, _e, window, cx| {
-                        this.toggle_maximize(window, cx);
+                        if NATIVE_TRAFFIC_LIGHTS {
+                            // 按系统设置走（缩放 / 最小化 / 什么都不做）
+                            window.titlebar_double_click();
+                        } else {
+                            // 不能走 `window.zoom_window()`，见 `toggle_maximize`
+                            this.toggle_maximize(window, cx);
+                        }
                     }))
                     .child(
                         div()
@@ -2653,7 +2808,8 @@ impl PlayerView {
                             .text_size(px(11.))
                             .text_color(self.chrome_dim(cx))
                             .child(title),
-                    ),
+                    )
+                    .test_support(),
             )
             .when_some(self.status_pill_live(), |el, (message, _, is_error)| {
                 el.child(div().relative().top(px(dy)).child(
@@ -2688,37 +2844,39 @@ impl PlayerView {
                     // Windows 的标题栏按钮是「46 宽 × 标题栏高」的矩形块，
                     // 悬停铺满整块底色；之前用的 xsmall 图标按钮只有 20×20，
                     // 在自绘标题栏里明显偏小（也不符合 Win 的点击热区）。
-                    .child(caption_button(
-                        "win-min",
-                        ICON_MINIMIZE,
-                        "最小化",
-                        false,
-                        self.video_active,
-                        |_, window, _| window.minimize_window(),
-                        cx,
-                    ))
-                    .child(caption_button(
-                        "win-max",
-                        if maximized {
-                            ICON_RESTORE
-                        } else {
-                            ICON_MAXIMIZE
-                        },
-                        if maximized { "还原" } else { "最大化" },
-                        false,
-                        self.video_active,
-                        cx.listener(|this, _e, window, cx| this.toggle_maximize(window, cx)),
-                        cx,
-                    ))
-                    .child(caption_button(
-                        "win-close",
-                        ICON_CLOSE,
-                        "关闭",
-                        true,
-                        self.video_active,
-                        |_, window, _| window.remove_window(),
-                        cx,
-                    )),
+                    .when(!NATIVE_TRAFFIC_LIGHTS, |el| {
+                        el.child(caption_button(
+                            "win-min",
+                            ICON_MINIMIZE,
+                            "最小化",
+                            false,
+                            self.video_active,
+                            |_, window, _| window.minimize_window(),
+                            cx,
+                        ))
+                        .child(caption_button(
+                            "win-max",
+                            if maximized {
+                                ICON_RESTORE
+                            } else {
+                                ICON_MAXIMIZE
+                            },
+                            if maximized { "还原" } else { "最大化" },
+                            false,
+                            self.video_active,
+                            cx.listener(|this, _e, window, cx| this.toggle_maximize(window, cx)),
+                            cx,
+                        ))
+                        .child(caption_button(
+                            "win-close",
+                            ICON_CLOSE,
+                            "关闭",
+                            true,
+                            self.video_active,
+                            |_, window, _| window.remove_window(),
+                            cx,
+                        ))
+                    }),
             )
     }
 
@@ -2876,13 +3034,29 @@ impl PlayerView {
                             .child(err.clone()),
                     )
                     .child(div().text_size(px(11.)).text_color(overlay::dim()).child(
-                        "提示：把 libmpv-2.dll 放到程序目录，或用 SMP_LIBMPV_PATH 指定路径",
+                        format!(
+                            "提示：把 {LIBMPV_NAME} 放到程序目录，或用 SMP_LIBMPV_PATH 指定路径{}",
+                            if cfg!(target_os = "macos") {
+                                "（或 brew install mpv）"
+                            } else {
+                                ""
+                            }
+                        ),
                     )),
             );
         }
 
         // 画面。还没有帧（刚起播、或渲染失败）时只留黑底——不要画占位图，
         // 那会在"第一帧到之前"闪一块和设计稿无关的东西。
+        #[cfg(target_os = "macos")]
+        let base = match self.video.surface.pixels() {
+            Some(buffer) => base.child(
+                gpui_kit::surface(buffer)
+                    .object_fit(gpui_kit::ObjectFit::Contain)
+                    .size_full(),
+            ),
+            None => base,
+        };
         let base = match self.video.surface.image() {
             Some(source) => base.child(
                 gpui_kit::img(source)
@@ -2949,6 +3123,11 @@ impl PlayerView {
                 this.drag_anchor.set(None);
                 this.toggle_cinema(window, cx);
             }))
+            .when(NATIVE_TRAFFIC_LIGHTS, |el| self.native_window_move(el))
+    }
+
+    fn native_window_move<E: InteractiveElement>(&self, element: E) -> E {
+        native_window_move(&self.move_armed, element)
     }
 
     /// 按下画面：记锚点并拉起拖动循环。
@@ -3023,6 +3202,7 @@ impl PlayerView {
                     .top(px(0.))
                     .left(px(0.))
                     .size_full()
+                    .rounded(px(CAPSULE_RADIUS))
                     .into_any_element()
             }))
             // 描边压在贴图上面：GPUI 的 border 先于子节点绘制，留在根节点上会被
@@ -3532,21 +3712,26 @@ impl PlayerView {
         })
     }
 
-    /// 光尘这一帧的贴图与它在窗口里的矩形。没在散时为 `None`。
+    /// 光尘这一帧的贴图与它在窗口里的矩形。手上没有光尘贴图时为 `None`。
     ///
     /// 它比胶囊大一圈（[`DUST_PAD`]），所以不能塞进胶囊那个 div：那里
     /// `overflow_hidden` 会把飞出去的尘切掉，套着的 `opacity` 又会让它跟着胶囊
     /// 一起消失——而粒子恰恰要在胶囊淡完之后继续。胶囊本体的淡出已经烘进这张
     /// 贴图的 alpha 里了（`DustPhase::fade`）。
+    ///
+    /// 只看「手上是不是光尘那张」，不看相位：贴图是后台烤的，回场刚收尾那一帧
+    /// 普通贴图可能还没回来，这时把最后一张光尘图摆着，胶囊才不会空一帧。
     fn dust_plate(&self, window: &Window) -> Option<((f32, f32, f32, f32), ImageSource)> {
-        self.dust_phase()?;
+        if !self.video_active {
+            return None;
+        }
+        let image = self.video.surface.glass_padded(0)?;
         let size = window.bounds().size;
         let (x, y, w, h) = capsule_box(
             f32::from(size.width),
             f32::from(size.height),
             self.playlist_open && !self.cinema,
         )?;
-        let image = self.video.surface.glass(0)?;
         Some((
             (
                 x - DUST_PAD,
@@ -3737,6 +3922,7 @@ impl PlayerView {
                     .top(px(0.))
                     .left(px(0.))
                     .size_full()
+                    .rounded(px(INFO_RADIUS))
                     .into_any_element()
             }))
             // 描边画在贴图上面（GPUI 的 border 先于子节点绘制，留在根节点上会被
@@ -3755,26 +3941,7 @@ impl PlayerView {
                         overlay::border()
                     }),
             )
-            .when(!liquid, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top(px(0.))
-                        .left(px(0.))
-                        .right(px(0.))
-                        .h(px(1.))
-                        .bg(overlay::highlight()),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .bottom(px(0.))
-                        .left(px(0.))
-                        .right(px(0.))
-                        .h(px(1.))
-                        .bg(overlay::shade()),
-                )
-            })
+            .when(!liquid, |el| el.children(rim_lines(INFO_RADIUS)))
             .child(
                 canvas(
                     move |bounds, _window, _cx| {
@@ -3849,8 +4016,41 @@ impl PlayerView {
         });
     }
 
-    /// 按当前窗口和面板开关重烤液态玻璃。位置/帧没变时烘焙器自己会跳过。
-    fn sync_liquid_glass(&mut self, window: &mut Window) {
+    /// GPU 通路：玻璃要源图时才从 GPU 读回一张缩小图。
+    ///
+    /// 软件渲染的舞台图本身就是源，什么都不用做。GPU 通路的画面不经过 CPU，控制层
+    /// 藏着（大部分播放时间）就一个字节都不读；亮着时按玻璃的重烤间隔读。暂停时
+    /// 舞台不换帧，读过一次就不再读。
+    fn refresh_glass_source(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let VideoRuntime {
+                engine,
+                surface,
+                glass_read_at,
+                ..
+            } = &mut self.video;
+            let Some(engine) = engine.as_mut().filter(|engine| engine.renders_on_gpu()) else {
+                return;
+            };
+            if !surface.glass_source_stale()
+                || glass_read_at
+                    .is_some_and(|at| at.elapsed() < crate::liquid_glass::BAKE_MIN_INTERVAL)
+            {
+                return;
+            }
+            if let Some(frame) = engine.snapshot(GLASS_SOURCE_LONG) {
+                surface.accept_glass_source(frame);
+                *glass_read_at = Some(Instant::now());
+            }
+        }
+    }
+
+    /// 按当前窗口和面板开关重烤液态玻璃。位置/帧没变时什么也不做。
+    ///
+    /// 烤在后台线程上（见 `video_surface` 的模块说明）：这一帧先摆上一版贴图，
+    /// 烤好了再叫一次重绘。
+    fn sync_liquid_glass(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let size = window.bounds().size;
         let win_w = size.width.as_f32();
         let win_h = size.height.as_f32();
@@ -3878,10 +4078,39 @@ impl PlayerView {
                 jobs.push(GlassJob::playlist(x, y, w, h));
             }
         }
+        if !jobs.is_empty() {
+            self.refresh_glass_source();
+        }
         let hue = self.tint_applied.or_else(|| self.video.surface.tint());
-        self.video
+        let dpi = window.scale_factor();
+        match self
+            .video
             .surface
-            .sync_glass(win_w, win_h, &jobs, hue, window);
+            .plan_glass(win_w, win_h, &jobs, hue, dpi, window)
+        {
+            GlassPlan::Idle => {}
+            GlassPlan::Later(wait) => {
+                cx.spawn_in(window, async move |this, cx| {
+                    cx.background_executor().timer(wait).await;
+                    let _ = this.update_in(cx, |view, _window, cx| {
+                        view.video.surface.glass_woke();
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            GlassPlan::Bake(ticket) => {
+                cx.spawn_in(window, async move |this, cx| {
+                    let done = cx.background_spawn(async move { ticket.run() }).await;
+                    let _ = this.update_in(cx, |view, window, cx| {
+                        if view.video.surface.finish_glass(done, window) {
+                            cx.notify();
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     /// 悬浮胶囊：两行进度区 + 控制行，深色玻璃，**固定 760 宽**。
@@ -3897,14 +4126,17 @@ impl PlayerView {
         // 就是胶囊的真实外框（含 padding），算几何时不会差一圈。
         let slot = self.capsule_rect.clone();
         // 光尘在跑时贴图比胶囊大一圈（粒子要飞出去），而且胶囊本体的淡出已经烘进
-        // 贴图 alpha 了，所以那几帧不在这里画，改由根节点单独摆一层（见 `dust_plate`）。
+        // 贴图 alpha 了，所以那张不在这里画，改由根节点单独摆一层（见 `dust_plate`）。
+        // 贴图是后台烤的，起散/收尾那一两帧手上可能还是另一种，按手上那张摆。
         let dusting = self.dust_phase().is_some();
-        let glass = if self.video_active && !dusting {
+        let glass = if self.video_active {
             self.video.surface.glass(0)
         } else {
             None
         };
-        let liquid = glass.is_some() || dusting;
+        let liquid = glass.is_some()
+            || dusting
+            || (self.video_active && self.video.surface.glass_padded(0).is_some());
         div()
             .w(px(CAPSULE_WIDTH))
             .max_w_full()
@@ -3932,8 +4164,9 @@ impl PlayerView {
                     inset: false,
                 },
             ])
-            // 液态玻璃贴图是不透明的（圆角外 alpha 0），压暗和染色已经烤在里面。
-            // 没有贴图时才退回 L1 渐变 + L2 染色，否则渐变会盖住折射。
+            // 液态玻璃贴图整块不透明，压暗和染色已经烤在里面；圆角由 `img` 自己
+            // 在 GPU 上裁（`overflow_hidden` 只裁矩形）。没有贴图时才退回 L1 渐变 +
+            // L2 染色，否则渐变会盖住折射。
             .children(glass.map(|source| {
                 gpui_kit::img(source)
                     .object_fit(gpui_kit::ObjectFit::Fill)
@@ -3941,8 +4174,11 @@ impl PlayerView {
                     .top(px(0.))
                     .left(px(0.))
                     .size_full()
+                    .rounded(px(CAPSULE_RADIUS))
                     .into_any_element()
             }))
+            // 退回的 L1 渐变 / L2 染色层自己带圆角：外层 `overflow_hidden` 只按矩形
+            // 裁，铺满的直角子节点会把胶囊的圆角整个盖掉（没有视频的空页面就是这样）。
             .when(!liquid, |el| {
                 el.child(
                     div()
@@ -3950,6 +4186,7 @@ impl PlayerView {
                         .top(px(0.))
                         .left(px(0.))
                         .size_full()
+                        .rounded(px(CAPSULE_RADIUS))
                         .bg(crate::theme::v_gradient(
                             overlay::capsule_top(),
                             overlay::capsule_bottom(),
@@ -3958,9 +4195,18 @@ impl PlayerView {
             })
             .when(!liquid, |el| {
                 el.when_some(self.tint_applied, |el, hue| {
-                    el.child(div().absolute().top(px(0.)).left(px(0.)).size_full().bg(
-                        crate::theme::v_gradient(overlay::tint(hue, 0.26), overlay::tint(hue, 0.08)),
-                    ))
+                    el.child(
+                        div()
+                            .absolute()
+                            .top(px(0.))
+                            .left(px(0.))
+                            .size_full()
+                            .rounded(px(CAPSULE_RADIUS))
+                            .bg(crate::theme::v_gradient(
+                                overlay::tint(hue, 0.26),
+                                overlay::tint(hue, 0.08),
+                            )),
+                    )
                 })
             })
             // 1px 描边必须**画在贴图上面**。
@@ -3987,30 +4233,9 @@ impl PlayerView {
             )
             // 1px 顶亮 / 底暗只在没有贴图时画。
             //
-            // 液态玻璃的边必须**沿圆角连续**：这两条是绝对定位的矩形，圆角那一段
-            // 会被外层裁掉，于是顶边的亮线在进圆角处突然断掉、弧上只剩贴图的边圈，
-            // 看着像描边缺了一截。贴图在场时改由上面那层 `border_1()` 沿圆角整圈
-            // 描边（GPUI 的圆角边框自带抗锯齿），厚度感交给折射本身。
-            .when(!liquid, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .top(px(0.))
-                        .left(px(0.))
-                        .right(px(0.))
-                        .h(px(1.))
-                        .bg(overlay::highlight()),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .bottom(px(0.))
-                        .left(px(0.))
-                        .right(px(0.))
-                        .h(px(1.))
-                        .bg(overlay::shade()),
-                )
-            })
+            // 液态玻璃的边必须**沿圆角连续**，贴图在场时改由上面那层 `border_1()`
+            // 沿圆角整圈描边（GPUI 的圆角边框自带抗锯齿），厚度感交给折射本身。
+            .when(!liquid, |el| el.children(rim_lines(CAPSULE_RADIUS)))
 
             .child(
                 canvas(
@@ -4577,6 +4802,7 @@ impl PlayerView {
     /// 真实切换要 `ShowWindowAsync`（无头窗口没有原生句柄），这里只验
     /// 「状态 → 按钮文案/图标」这一层——用户报的 bug 里，图标卡在「最大化」
     /// 也是症状之一，所以按钮 label 必须跟着状态走。
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub(crate) fn test_set_maximized(&mut self, on: bool) {
         self.maximized = on;
     }
@@ -4697,7 +4923,7 @@ impl Render for PlayerView {
         // 列表字色跟着视频态走，深色主题下奶白面板才读得清。
         self.sync_playlist_ink(cx);
         if self.video_active {
-            self.sync_liquid_glass(window);
+            self.sync_liquid_glass(window, cx);
         }
 
         // 拖放：GPUI 把系统的文件拖放转成内部拖拽（载荷类型是 ExternalPaths），
@@ -4841,6 +5067,56 @@ impl Render for PlayerView {
             .when(self.drop_hint_shown, |el| el.child(self.render_drop_hint()))
             .into_any_element()
     }
+}
+
+/// mac 拖窗口：按下只「上膛」，真挪出几像素才交给系统
+/// （`start_window_move` → `performWindowDragWithEvent`）。
+///
+/// 按下当场就开拖的话，系统的拖动循环会吞掉抬起，单击 / 双击都收不到；
+/// 手抖一两像素也算点击，不该被当成拖动吞掉。
+pub(crate) fn native_window_move<E: InteractiveElement>(
+    armed: &Rc<Cell<Option<Point<Pixels>>>>,
+    element: E,
+) -> E {
+    const SLOP: f32 = 3.0;
+    let (down, moved, up) = (armed.clone(), armed.clone(), armed.clone());
+    element
+        .on_mouse_down(MouseButton::Left, move |e, _window, _cx| {
+            down.set(Some(e.position));
+        })
+        .on_mouse_move(move |e, window, _cx| {
+            let Some(origin) = moved.get() else {
+                return;
+            };
+            if e.pressed_button != Some(MouseButton::Left) {
+                moved.set(None);
+                return;
+            }
+            let d = e.position - origin;
+            if d.x.as_f32().abs() > SLOP || d.y.as_f32().abs() > SLOP {
+                moved.set(None);
+                window.start_window_move();
+            }
+        })
+        .on_mouse_up(MouseButton::Left, move |_e, _window, _cx| {
+            up.set(None);
+        })
+}
+
+/// 交给 mpv 放的：视频文件和一切串流地址（串流是音是视只有 mpv 知道）。
+fn wants_mpv(path: &str) -> bool {
+    is_stream_url(path) || is_video_file(Path::new(path))
+}
+
+/// 「最近打开」里显示的名字：文件名带扩展名（设计稿口径），串流就是地址本身。
+pub(crate) fn recent_title(path: &str) -> String {
+    if is_stream_url(path) {
+        return path.to_string();
+    }
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string())
 }
 
 /// 路径比较用的归一化键：`\` 和 `/` 视为同一个字符。

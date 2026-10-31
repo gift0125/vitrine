@@ -1,4 +1,4 @@
-//! Chroma 主题：把设计稿的 Catppuccin Latte 色板灌进 gpui-component。
+//! Vitrine 主题：把设计稿的 Catppuccin Latte 色板灌进 gpui-component。
 //!
 //! 之前整个应用用的是 gpui-component 的默认中性灰主题（`Theme::default()`），
 //! 和设计稿（Ardot file 737444551354649，Catppuccin Latte + Mauve 强调色）
@@ -248,7 +248,7 @@ fn config(name: &str, mode: ThemeMode, p: &Palette) -> ThemeConfig {
     cfg
 }
 
-/// 安装 Chroma 主题（浅色 Latte 为默认，深色 Mocha 备切换）。
+/// 安装 Vitrine 主题（浅色 Latte 为默认，深色 Mocha 备切换）。
 ///
 /// 必须在 `gpui_kit::init(cx)` 之后调用：那一步会先装一份默认主题并
 /// `Theme::change(Light)`，这里再把它替换成设计稿的色板。
@@ -465,8 +465,8 @@ pub fn v_gradient(
 }
 
 pub fn install(cx: &mut App, dark: bool) {
-    let light = Rc::new(config("Chroma Latte", ThemeMode::Light, &LATTE));
-    let dark_cfg = Rc::new(config("Chroma Mocha", ThemeMode::Dark, &MOCHA));
+    let light = Rc::new(config("Vitrine Latte", ThemeMode::Light, &LATTE));
+    let dark_cfg = Rc::new(config("Vitrine Mocha", ThemeMode::Dark, &MOCHA));
 
     Theme::update(cx, |theme| {
         // 先登记两套配置，再让 apply_config 把浅色应用上去
@@ -537,7 +537,7 @@ mod tests {
 
             let theme = cx.theme();
             assert!(!theme.mode.is_dark(), "默认应为浅色 Latte");
-            assert_eq!(theme.theme_name().as_ref(), "Chroma Latte");
+            assert_eq!(theme.theme_name().as_ref(), "Vitrine Latte");
             assert_eq!(
                 theme.background,
                 hex(0xEFF1F5),
@@ -556,7 +556,7 @@ mod tests {
 
             let theme = cx.theme();
             assert!(theme.mode.is_dark());
-            assert_eq!(theme.theme_name().as_ref(), "Chroma Mocha");
+            assert_eq!(theme.theme_name().as_ref(), "Vitrine Mocha");
             assert_eq!(theme.background, hex(0x1E1E2E), "深色应为 Mocha Base");
             assert_eq!(theme.primary, hex(0xCBA6F7), "深色强调色为 Mocha Mauve");
         });

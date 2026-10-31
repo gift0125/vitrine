@@ -75,10 +75,24 @@ pub fn is_video_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 串流协议：这些「路径」不在本地磁盘上，一律交给 mpv（它自己会分辨是音是视）。
+const STREAM_SCHEMES: &[&str] = &[
+    "http", "https", "rtmp", "rtmps", "rtsp", "rtp", "srt", "udp", "mms", "ftp", "ytdl",
+];
+
+/// 是不是串流地址（`https://…`、`rtmp://…` 这类）。
+///
+/// 只认 `协议://`：Windows 盘符 `C:\…` 也带冒号，不能把它当成协议。
+pub fn is_stream_url(path: &str) -> bool {
+    path.split_once("://").is_some_and(|(scheme, rest)| {
+        !rest.is_empty() && STREAM_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str())
+    })
+}
+
 /// 视频内核错误。
 #[derive(Debug, thiserror::Error)]
 pub enum VideoError {
-    #[error("未找到 libmpv-2.dll（可用环境变量 SMP_LIBMPV_PATH 指定路径）")]
+    #[error("未找到 {}（可用环境变量 SMP_LIBMPV_PATH 指定路径）", crate::LIBMPV_NAME)]
     LibmpvNotFound,
     #[error("无法加载 libmpv：{0}")]
     Load(String),
@@ -201,6 +215,8 @@ pub struct VideoEngine {
     buffer: FrameBuffer,
     /// 上一次渲染失败的原因（只用来去重日志，别每帧刷）
     last_render_error: Option<String>,
+    /// 这个文件实际用上的硬解方式记过没有（每次加载记一次）
+    hwdec_logged: AtomicBool,
 }
 
 impl VideoEngine {
@@ -357,12 +373,44 @@ impl VideoEngine {
             render: None,
             buffer: FrameBuffer::new(),
             last_render_error: None,
+            hwdec_logged: AtomicBool::new(false),
         })
     }
 
     /// 加载并播放文件（替换当前文件）。
     pub fn load(&self, path: &str) {
+        self.load_at(path, 0.0);
+    }
+
+    /// 加载文件并从 `start` 秒开始放（续播）。
+    ///
+    /// 走 mpv 的 `start` 属性而不是加载后再 seek：seek 要等文件打开才生效，
+    /// 中间会先从头闪出一帧、响一下声。属性是全局的，每次加载都要重写一遍，
+    /// 否则下一个文件也会从这个位置开始。
+    pub fn load_at(&self, path: &str, start: f64) {
+        let value = if start > 0.0 {
+            format!("{start}")
+        } else {
+            "none".to_string()
+        };
+        trace_command(&["set_property", "start", &value]);
+        self.mpv
+            .set_property_string(self.ctx.raw(), "start", &value);
+        self.hwdec_logged.store(false, Ordering::Relaxed);
         self.command(&["loadfile", path, "replace"]);
+    }
+
+    /// 出第一帧时记一下 mpv 实际选的解码方式（`videotoolbox` / `no` …）。
+    /// `hwdec=auto-safe` 只是「允许」，真用没用上只有这个属性知道。
+    fn log_hwdec_once(&self) {
+        if self.hwdec_logged.load(Ordering::Relaxed) {
+            return;
+        }
+        // 解码器起来之前这个属性不存在（头几帧可能还是清屏），拿到为止
+        if let Some(current) = self.mpv.get_property_string(self.ctx.raw(), "hwdec-current") {
+            self.hwdec_logged.store(true, Ordering::Relaxed);
+            trace(&format!("render: hwdec-current={current}"));
+        }
     }
 
     pub fn pause(&self) {
@@ -459,6 +507,19 @@ impl VideoEngine {
         if !self.mpv.has_render_api() {
             return Err("这个 libmpv 不带渲染 API（缺少 mpv_render_context_* 符号）".into());
         }
+        // mac 先走 GPU（OpenGL → IOSurface）；建不起来再退回软件渲染。
+        // `VITRINE_RENDER=sw` 强制软件渲染，方便两条路对比。
+        #[cfg(target_os = "macos")]
+        if std::env::var("VITRINE_RENDER").as_deref() != Ok("sw") {
+            match RenderContext::create_gl(Arc::clone(&self.mpv), self.ctx.raw()) {
+                Ok(render) => {
+                    trace("render: OpenGL 渲染上下文已建立（IOSurface / NV12）");
+                    self.render = Some(render);
+                    return Ok(());
+                }
+                Err(detail) => trace(&format!("!! render: OpenGL 不可用，退回软件渲染（{detail}）")),
+            }
+        }
         match RenderContext::create(Arc::clone(&self.mpv), self.ctx.raw()) {
             Ok(render) => {
                 trace("render: 软件渲染上下文已建立（sw / bgr0）");
@@ -479,6 +540,41 @@ impl VideoEngine {
 
     pub fn has_render(&self) -> bool {
         self.render.is_some()
+    }
+
+    /// 画面走 GPU 通路（[`Self::render_surface`]）还是软件渲染（[`Self::render_frame`]）。
+    pub fn renders_on_gpu(&self) -> bool {
+        self.render.as_ref().is_some_and(RenderContext::is_gpu)
+    }
+
+    /// GPU 通路：把当前帧画成一块 NV12 的 `CVPixelBuffer`，直接交给界面合成。
+    #[cfg(target_os = "macos")]
+    pub fn render_surface(&mut self, width: usize, height: usize) -> Option<crate::PixelBuffer> {
+        let render = self.render.as_mut()?;
+        match render.render_surface(width, height) {
+            Ok(buffer) => {
+                self.last_render_error = None;
+                render.report_swap();
+                self.log_hwdec_once();
+                Some(buffer)
+            }
+            Err(detail) => {
+                if self.last_render_error.as_deref() != Some(detail.as_str()) {
+                    trace(&format!("!! render: {detail}"));
+                    self.last_render_error = Some(detail);
+                }
+                None
+            }
+        }
+    }
+
+    /// GPU 通路：最近一帧的缩小图（BGRA，长边 ≤ `max_long`），给液态玻璃用。
+    #[cfg(target_os = "macos")]
+    pub fn snapshot(&mut self, max_long: usize) -> Option<FrameRef<'_>> {
+        let render = self.render.as_mut()?;
+        render
+            .snapshot(max_long, &mut self.buffer)
+            .then(|| self.buffer.frame())
     }
 
     /// 每来一帧就调一次（mpv 的任意内部线程）。里面只能丢信号，不能碰 mpv API。
@@ -505,6 +601,7 @@ impl VideoEngine {
         }
         self.last_render_error = None;
         render.report_swap();
+        self.log_hwdec_once();
         Some(self.buffer.frame())
     }
     /// 取走并清除「最近一次加载/解码失败」标记（UI 每轮轮询调用一次）。
@@ -900,6 +997,17 @@ mod tests {
     }
 
     #[test]
+    fn stream_url_detection() {
+        assert!(is_stream_url("https://example.com/live.m3u8"));
+        assert!(is_stream_url("RTMP://host/app/key"));
+        assert!(!is_stream_url("C:\\movies\\a.mkv"), "盘符不是协议");
+        assert!(!is_stream_url("C:/movies/a.mkv"));
+        assert!(!is_stream_url("/Users/me/a.mkv"));
+        assert!(!is_stream_url("https://"), "只有协议没有地址");
+        assert!(!is_stream_url("file:///tmp/a.mkv"), "本地文件走正常路径");
+    }
+
+    #[test]
     fn video_extension_detection() {
         assert!(is_video_file(Path::new("movie.MP4")));
         assert!(is_video_file(Path::new("clip.mkv")));
@@ -1076,9 +1184,9 @@ mod tests {
             .join("..")
             .join("target")
             .join("mpv-dev")
-            .join("libmpv-2.dll");
+            .join(crate::LIBMPV_NAME);
         let Some(lib) = find_libmpv(None).or_else(|| dev_copy.is_file().then_some(dev_copy)) else {
-            eprintln!("跳过：未找到 libmpv-2.dll");
+            eprintln!("跳过：未找到 {}", crate::LIBMPV_NAME);
             return;
         };
         let media = std::env::temp_dir().join("smp-libmpv-test.wav");
@@ -1147,6 +1255,134 @@ mod tests {
         cond()
     }
 
+    /// GPU 通路端到端（mac）：上红下蓝的图 → mpv(OpenGL) → NV12 的 CVPixelBuffer。
+    ///
+    /// 一次验三件最容易错、错了界面上又只是「颜色怪 / 画面倒了」的事：
+    /// - **方向**：IOSurface 第一行（Metal 眼里的顶）必须是画面的顶；
+    /// - **换算**：Y / CbCr 是 BT.601 全范围（GPUI 的着色器按它逆回 RGB）；
+    /// - **玻璃回读**：缩小图也是从上到下、BGRA。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gpu_surface_is_upright_nv12() {
+        use objc2_core_video::{
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, CVPixelBufferGetBaseAddressOfPlane,
+            CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferGetHeight,
+            CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth, CVPixelBufferLockBaseAddress,
+            CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+        };
+
+        let Some(lib) = find_libmpv(None) else {
+            eprintln!("跳过：未找到 {}", crate::LIBMPV_NAME);
+            return;
+        };
+        let image = std::env::temp_dir().join(format!("smp-gl-{}.bmp", std::process::id()));
+        write_split_bmp(&image, 64, 64).expect("写测试图");
+
+        let mut engine = VideoEngine::spawn(SpawnOptions {
+            libmpv: lib,
+            wid: None,
+            volume: 0.0,
+            extra_args: vec![
+                "--ao=null".into(),
+                "--image-display-duration=inf".into(),
+                // 缩放器不能把红蓝交界抹到采样点上：采样点离交界远，默认的也够
+                "--scale=bilinear".into(),
+            ],
+        })
+        .expect("libmpv 应该能初始化");
+        engine.enable_render().expect("应能建立渲染上下文");
+        assert!(engine.renders_on_gpu(), "mac 上默认应走 OpenGL 通路");
+
+        let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&frames);
+        engine.set_frame_callback(Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        engine.load(&image.to_string_lossy());
+        assert!(
+            wait_for(|| frames.load(Ordering::SeqCst) > 0, 8000),
+            "update 回调应被触发"
+        );
+
+        // 第一帧可渲染之前 render 只是清屏（全黑），给一段重试窗口
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut planes = None;
+        while std::time::Instant::now() < deadline {
+            if let Some(buffer) = engine.render_surface(64, 64) {
+                assert_eq!(
+                    CVPixelBufferGetPixelFormatType(&buffer),
+                    kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+                    "GPUI 只认 420f"
+                );
+                assert_eq!((CVPixelBufferGetWidth(&buffer), CVPixelBufferGetHeight(&buffer)), (64, 64));
+                unsafe { CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags::ReadOnly) };
+                let read = |plane: usize, x: usize, y: usize, bpp: usize| -> Vec<u8> {
+                    let base = CVPixelBufferGetBaseAddressOfPlane(&buffer, plane) as *const u8;
+                    let stride = CVPixelBufferGetBytesPerRowOfPlane(&buffer, plane);
+                    (0..bpp)
+                        .map(|i| unsafe { *base.add(y * stride + x * bpp + i) })
+                        .collect()
+                };
+                // 采样点离红蓝交界（y=32）远：上 8 行、下 56 行；色度是半尺寸
+                let sample = (
+                    read(0, 32, 8, 1)[0],
+                    read(0, 32, 56, 1)[0],
+                    read(1, 16, 4, 2),
+                    read(1, 16, 28, 2),
+                );
+                unsafe { CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags::ReadOnly) };
+                if sample.0 > 40 {
+                    planes = Some(sample);
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        let (y_top, y_bottom, c_top, c_bottom) = planes.expect("应在 8 秒内渲染出画面");
+        // 纯红 Y=76 Cb=85 Cr=255；纯蓝 Y=29 Cb=255 Cr=107（BT.601 全范围）
+        let near = |v: u8, want: i32| (v as i32 - want).abs() <= 6;
+        assert!(near(y_top, 76) && near(y_bottom, 29), "Y 上 {y_top} 下 {y_bottom}（倒了的话会反过来）");
+        assert!(near(c_top[0], 85) && near(c_top[1], 255), "上半 CbCr {c_top:?} 应是红");
+        assert!(near(c_bottom[0], 255) && near(c_bottom[1], 107), "下半 CbCr {c_bottom:?} 应是蓝");
+
+        let snap = engine.snapshot(16).expect("应能读回缩小图");
+        assert_eq!((snap.width, snap.height), (16, 16), "64 → 长边 16 是第 2 级 mipmap");
+        let px = |x: usize, y: usize| &snap.data[(y * snap.width + x) * 4..][..4];
+        assert!(px(8, 1)[2] > 200 && px(8, 1)[0] < 60, "缩小图顶部应是红（BGRA）：{:?}", px(8, 1));
+        assert!(px(8, 14)[0] > 200 && px(8, 14)[2] < 60, "缩小图底部应是蓝：{:?}", px(8, 14));
+        assert_eq!(px(8, 1)[3], 255);
+
+        engine.shutdown();
+        let _ = std::fs::remove_file(&image);
+    }
+
+    /// 24 位 BMP，上半纯红、下半纯蓝（BMP 默认自下而上存行，这里用负高度存成自上而下）。
+    #[cfg(target_os = "macos")]
+    fn write_split_bmp(path: &Path, w: u32, h: u32) -> std::io::Result<()> {
+        let row = (w * 3).div_ceil(4) * 4;
+        let data_len = row * h;
+        let mut out = Vec::with_capacity(54 + data_len as usize);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&(54 + data_len).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&(w as i32).to_le_bytes());
+        out.extend_from_slice(&(-(h as i32)).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&24u16.to_le_bytes());
+        out.extend_from_slice(&[0u8; 24]);
+        for y in 0..h {
+            let bgr: [u8; 3] = if y < h / 2 { [0, 0, 255] } else { [255, 0, 0] };
+            let start = out.len();
+            for _ in 0..w {
+                out.extend_from_slice(&bgr);
+            }
+            out.resize(start + row as usize, 0);
+        }
+        std::fs::write(path, out)
+    }
+
     /// 写一段静音 WAV（16bit 单声道 8kHz），只为让 mpv 有个能解码的文件。
     fn write_silent_wav(path: &Path, secs: f64) -> std::io::Result<()> {
         let rate = 8000u32;
@@ -1181,9 +1417,9 @@ mod tests {
             .join("..")
             .join("target")
             .join("mpv-dev")
-            .join("libmpv-2.dll");
+            .join(crate::LIBMPV_NAME);
         let Some(lib) = find_libmpv(None).or_else(|| dev_copy.is_file().then_some(dev_copy)) else {
-            eprintln!("跳过：未找到 libmpv-2.dll");
+            eprintln!("跳过：未找到 {}", crate::LIBMPV_NAME);
             return;
         };
         let media = Path::new(env!("CARGO_MANIFEST_DIR"))

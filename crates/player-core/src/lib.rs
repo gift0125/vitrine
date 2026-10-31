@@ -7,16 +7,20 @@
 //! - 目录扫描 / 扩展名过滤等纯数据工具
 
 mod audio;
+#[cfg(target_os = "macos")]
+mod gl_render;
 mod libmpv;
 mod metadata;
 mod render;
 mod video;
 
 pub use audio::{AudioEngine, EngineError};
+#[cfg(target_os = "macos")]
+pub use gl_render::{pixel_buffer_size, PixelBuffer};
 pub use metadata::{is_supported_audio, load_track_meta, scan_dir_for_tracks};
-pub use libmpv::{find_libmpv, LibMpv};
-pub use render::{fit_render_size, FrameBuffer, FrameRef, RenderContext};
-pub use video::{is_video_file, SpawnOptions, VideoEngine, VideoError, VideoStatus};
+pub use libmpv::{find_libmpv, LibMpv, LIBMPV_NAME};
+pub use render::{fit_gpu_render_size, fit_render_size, FrameBuffer, FrameRef, RenderContext};
+pub use video::{is_stream_url, is_video_file, SpawnOptions, VideoEngine, VideoError, VideoStatus};
 
 /// 曲目元数据
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

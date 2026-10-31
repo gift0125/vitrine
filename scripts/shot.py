@@ -52,7 +52,7 @@ if not exe.is_absolute():
     exe = root / exe
 
 args = sys.argv[1:]
-out = Path(args[0]) if args and not args[0].startswith("--") else root / "docs/screenshots/chroma-light.png"
+out = Path(args[0]) if args and not args[0].startswith("--") else root / "docs/screenshots/vitrine-light.png"
 dark = "--dark" in args
 keep = "--keep" in args
 width = int(args[args.index("--w") + 1]) if "--w" in args else 1040
@@ -95,10 +95,10 @@ env = dict(os.environ, SMP_DATA_DIR=str(shot_data))
 proc = subprocess.Popen(cmd, stdout=err, stderr=subprocess.STDOUT, env=env)
 time.sleep(3.2)
 
-hwnd = user32.FindWindowW(None, "Chroma")
+hwnd = user32.FindWindowW(None, "Vitrine")
 if not hwnd:
     proc.kill()
-    raise SystemExit("未找到标题为 Chroma 的窗口")
+    raise SystemExit("未找到标题为 Vitrine 的窗口")
 
 scale = user32.GetDpiForWindow(hwnd) / 96.0
 phys_w, phys_h = round(width * scale), round(height * scale)

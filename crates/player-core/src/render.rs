@@ -304,6 +304,46 @@ pub fn fit_render_size(
     (width.round().max(16.0) as usize, height.round().max(16.0) as usize)
 }
 
+/// GPU 通路单帧像素数上限（≈3840×2400）。超了才让 GPUI 再拉一下。
+pub const MAX_GPU_FRAME_PIXELS: usize = 3840 * 2400;
+
+/// GPU 通路每帧该渲染多大（设备像素）。
+///
+/// 和 [`fit_render_size`] 只差一条：**放大也交给 mpv**。缩放在 GPU 上几乎免费，
+/// 而 mpv 的缩放器（spline36 等）比 GPUI 贴图的双线性好得多——720p 在 4K 窗里
+/// 按舞台尺寸渲染，正是 IINA 那份清晰度的来源。保持宽高比和像素预算照旧。
+pub fn fit_gpu_render_size(
+    stage_width: f32,
+    stage_height: f32,
+    native: Option<(u32, u32)>,
+    scale: f32,
+) -> (usize, usize) {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let mut width = (stage_width * scale).round().max(16.0);
+    let mut height = (stage_height * scale).round().max(16.0);
+    if let Some((nw, nh)) = native {
+        let (nw, nh) = (nw as f32, nh as f32);
+        if nw >= 16.0 && nh >= 16.0 {
+            let fit = (width / nw).min(height / nh);
+            width = nw * fit;
+            height = nh * fit;
+        }
+    }
+    let pixels = width * height;
+    if pixels > MAX_GPU_FRAME_PIXELS as f32 {
+        let k = (MAX_GPU_FRAME_PIXELS as f32 / pixels).sqrt();
+        width *= k;
+        height *= k;
+    }
+    // NV12 的色度是半尺寸：宽高取偶
+    let even = |v: f32| ((v.round().max(16.0) as usize) & !1).max(16);
+    (even(width), even(height))
+}
+
 /// 一个 `mpv_render_context`（软件后端）。
 ///
 /// 生命周期：`create` → 反复 `set_update_callback` / `render` → `Drop`（自动 free）。
@@ -316,6 +356,10 @@ pub struct RenderContext {
     callback: Option<*mut CallbackSlot>,
     /// 创建线程：`render` 只能在这个线程上调（`render.h` 的约定）。
     owner: std::thread::ThreadId,
+    /// OpenGL 后端（mac）：有它就走 [`Self::render_surface`]，没有就是软件渲染。
+    /// 字段顺序要紧：`Drop` 先 free mpv 的上下文，这个 GL 上下文之后才释放。
+    #[cfg(target_os = "macos")]
+    gl: Option<crate::gl_render::GlTarget>,
 }
 
 /// 回调的用户数据壳子：`*mut c_void` 传不了胖指针，所以双装箱。
@@ -347,7 +391,68 @@ impl RenderContext {
             ptr,
             callback: None,
             owner: std::thread::current().id(),
+            #[cfg(target_os = "macos")]
+            gl: None,
         })
+    }
+
+    /// 创建 OpenGL 渲染上下文（mac）：画面经 IOSurface 交给界面，见 [`crate::gl_render`]。
+    #[cfg(target_os = "macos")]
+    pub fn create_gl(lib: Arc<LibMpv>, mpv: *mut c_void) -> Result<Self, String> {
+        if !lib.has_render_api() {
+            return Err("这个 libmpv 不带渲染 API".into());
+        }
+        let gl = crate::gl_render::GlTarget::new()?;
+        gl.make_current();
+        let (ptr, rc) = lib.render_create_gl(mpv, crate::gl_render::get_proc_address);
+        if ptr.is_null() {
+            return Err(format!("mpv_render_context_create(opengl) 失败（{}）", lib.error_string(rc)));
+        }
+        Ok(Self {
+            lib,
+            ptr,
+            callback: None,
+            owner: std::thread::current().id(),
+            gl: Some(gl),
+        })
+    }
+
+    /// 走的是不是 GPU 通路（mac 的 OpenGL → IOSurface）。
+    pub fn is_gpu(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        return self.gl.is_some();
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+
+    /// GPU 通路：把当前帧画成一块 NV12 的 `CVPixelBuffer`（尺寸会被取成偶数）。
+    #[cfg(target_os = "macos")]
+    pub fn render_surface(
+        &mut self,
+        width: usize,
+        height: usize,
+    ) -> Result<crate::gl_render::PixelBuffer, String> {
+        debug_assert!(
+            self.is_owner_thread(),
+            "mpv_render_context 只能在创建它的线程上渲染"
+        );
+        let Some(gl) = self.gl.as_mut() else {
+            return Err("不是 OpenGL 渲染上下文".into());
+        };
+        let (fbo, width, height) = gl.begin(width, height)?;
+        let rc = self.lib.render_frame_gl(self.ptr, fbo, width, height);
+        if rc < 0 {
+            return Err(self.lib.error_string(rc));
+        }
+        gl.finish()
+    }
+
+    /// GPU 通路：最近一帧的缩小图（长边 ≤ `max_long`），给液态玻璃取色和模糊。
+    #[cfg(target_os = "macos")]
+    pub fn snapshot(&mut self, max_long: usize, out: &mut FrameBuffer) -> bool {
+        self.gl
+            .as_mut()
+            .is_some_and(|gl| gl.snapshot(max_long, out))
     }
 
     pub fn is_owner_thread(&self) -> bool {
@@ -413,6 +518,11 @@ impl RenderContext {
 impl Drop for RenderContext {
     fn drop(&mut self) {
         // 顺序：摘回调 → 释放壳子 → free 上下文。反了就可能在 free 之后被回调。
+        // OpenGL 后端的 free 会删 GL 对象，得先让它的上下文当前。
+        #[cfg(target_os = "macos")]
+        if let Some(gl) = &self.gl {
+            gl.make_current();
+        }
         self.lib
             .render_set_update_callback(self.ptr, None, std::ptr::null_mut());
         if let Some(raw) = self.callback.take() {
@@ -551,6 +661,28 @@ mod tests {
         let (w, h) = fit_render_size(3840.0, 2160.0, Some((3840, 2160)), 1.0);
         assert!(w * h <= MAX_FRAME_PIXELS + 4096, "{w}x{h} 超预算");
         assert!((w as f32 / h as f32 - 16.0 / 9.0).abs() < 0.01, "比例要保住");
+    }
+
+    /// GPU 通路：放大也渲染到舞台尺寸，比例和预算照旧，宽高一律偶数。
+    #[test]
+    fn fit_gpu_render_size_upscales_and_stays_even() {
+        // 720p 进 4K 舞台：按舞台渲染（交给 mpv 的缩放器），不是停在原生尺寸
+        assert_eq!(
+            fit_gpu_render_size(1920.0, 1080.0, Some((1280, 720)), 2.0),
+            (3840, 2160)
+        );
+        // 4:3 进 16:9：contain，左右留边
+        assert_eq!(
+            fit_gpu_render_size(1280.0, 720.0, Some((640, 480)), 1.0),
+            (960, 720)
+        );
+        // 奇数舞台取偶
+        let (w, h) = fit_gpu_render_size(1001.0, 667.0, None, 1.0);
+        assert_eq!((w % 2, h % 2), (0, 0), "{w}x{h}");
+        // 5K 全屏撞预算，比例不变
+        let (w, h) = fit_gpu_render_size(2560.0, 1440.0, Some((3840, 2160)), 2.0);
+        assert!(w * h <= MAX_GPU_FRAME_PIXELS, "{w}x{h} 超预算");
+        assert!((w as f32 / h as f32 - 16.0 / 9.0).abs() < 0.01);
     }
 
     /// 缓冲区换尺寸要重分配，同尺寸不重分配（每帧都分配会拖慢）。

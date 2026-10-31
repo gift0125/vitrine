@@ -1,4 +1,4 @@
-"""生成 Chroma 的应用图标（assets/chroma.ico + assets/chroma.png）。
+"""生成 Vitrine 的应用图标（assets/vitrine.ico + assets/vitrine.png）。
 
 图形语言取自设计稿的 **Logo C（双层盘）**，尺寸表见 `2:564`–`2:576`：
 - 外盘：竖直渐变 `#7321D9 → #5E12B8`；
@@ -6,7 +6,7 @@
 - 外沿 1px 白 18% 描边（只在 ≥64px 有意义）+ Mauve 30% 投影（0/12/28 @160，按比例）；
 - 白色播放三角：宽 37.6%、高 47% 直径，圆角 4%。
 
-比例来自设计稿矢量（三角 39%×48%）。用 `design/icons/chroma-{16,32,64,128,256}.png`
+比例来自设计稿矢量（三角 39%×48%）。用 `design/icons/vitrine-{16,32,64,128,256}.png`
 栅格反推会得到 0.375×0.47——那是抗锯齿边缘被阈值切掉的差，不是真值；
 16px 也是照同一比例缩的，没有单独的 16px 重绘。
 画布上另有一个 `2:528`（16px 圆角方块 + 小三角），实测 16px 下反而认不出来，
@@ -125,13 +125,13 @@ def build(px):
 def main():
     ASSETS.mkdir(exist_ok=True)
 
-    png = ASSETS / "chroma.png"
+    png = ASSETS / "vitrine.png"
     build(256).save(png)
     print(f"saved {png.relative_to(ROOT)} 256x256")
 
     # ico 每档单独画，不是缩放出来的
     frames = [build(s) for s in ICO_SIZES]
-    ico = ASSETS / "chroma.ico"
+    ico = ASSETS / "vitrine.ico"
     frames[-1].save(ico, format="ICO", append_images=frames[:-1],
                     sizes=[(s, s) for s in ICO_SIZES])
     print(f"saved {ico.relative_to(ROOT)} sizes={ICO_SIZES}")

@@ -11,3 +11,22 @@ lofty = "0.22"
 thiserror = "2"
 # 运行时加载 libmpv-2.dll（构建机不需要 DLL，找不到也能给出可见提示）
 libloading = "0.8"
+
+# mac 的画面走 OpenGL → IOSurface → GPUI 的 `surface()`。版本必须和 gpui-pre 用的
+# 同一个（0.3.2），`CVPixelBuffer` 才是同一个类型，能直接交给界面。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CFBase",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+] }
+objc2-core-video = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "CVBase",
+    "CVBuffer",
+    "CVImageBuffer",
+    "CVPixelBuffer",
+    "CVReturn",
+] }

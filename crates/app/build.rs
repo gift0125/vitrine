@@ -22,7 +22,7 @@ fn main() {
     }
 
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let icon = manifest.join("../../assets/chroma.ico");
+    let icon = manifest.join("../../assets/vitrine.ico");
     println!("cargo:rerun-if-changed={}", icon.display());
 
     let icon = match std::fs::canonicalize(&icon) {
@@ -48,7 +48,7 @@ fn main() {
         .replace('\\', "/");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
-    let rc_path = out_dir.join("chroma.rc");
+    let rc_path = out_dir.join("vitrine.rc");
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".into());
     let dotted = version.replace('.', ",");
     let version_tuple = format!("{dotted},0");
@@ -68,11 +68,11 @@ BEGIN
   BEGIN
     BLOCK "040904b0"
     BEGIN
-      VALUE "FileDescription", "Chroma Media Player"
+      VALUE "FileDescription", "Vitrine Media Player"
       VALUE "FileVersion", "{version}"
       VALUE "InternalName", "simple-media-player"
       VALUE "OriginalFilename", "simple-media-player.exe"
-      VALUE "ProductName", "Chroma"
+      VALUE "ProductName", "Vitrine"
       VALUE "ProductVersion", "{version}"
     END
   END
@@ -90,8 +90,19 @@ END
         return;
     }
 
-    match embed_resource::compile(&rc_path, embed_resource::NONE) {
+    embed(&rc_path);
+}
+
+// `embed-resource` 只在 Windows 宿主上是构建依赖，别的宿主上连符号都没有。
+#[cfg(windows)]
+fn embed(rc_path: &std::path::Path) {
+    match embed_resource::compile(rc_path, embed_resource::NONE) {
         embed_resource::CompilationResult::Ok => {}
         _ => println!("cargo:warning=图标资源未嵌入（rc.exe 不可用？），任务栏将显示系统占位图"),
     }
+}
+
+#[cfg(not(windows))]
+fn embed(_rc_path: &std::path::Path) {
+    println!("cargo:warning=非 Windows 宿主交叉编译，跳过图标资源");
 }

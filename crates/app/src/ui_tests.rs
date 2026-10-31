@@ -20,8 +20,11 @@ use gpui_kit::{
 use player_core::TrackMeta;
 use smallvec::SmallVec;
 
-use crate::persistence::{self, Settings};
-use crate::player_view::{chrome_visible_target, seek_target, short_codec, PlayerView};
+use crate::first_run::{self, FirstRunState, FirstRunView, Launch};
+use crate::persistence::{self, Recent, RecentEntry, Settings};
+use crate::player_view::{
+    chrome_visible_target, recent_title, seek_target, short_codec, PlayerView,
+};
 
 /// 每个用例一个独立临时目录，避免并行执行时互相踩。
 fn fresh_dir(tag: &str) -> PathBuf {
@@ -566,6 +569,7 @@ fn dropping_files_adds_them_and_starts_playback(cx: &mut TestAppContext) {
 /// 回归的是用户报的那个 bug 的一半：切换只发生在 GPUI 之外的 Win32 调用里
 /// （`ShowWindowAsync`），如果图标文案还读 `window.is_maximized()` 或干脆写死，
 /// 用户看到的就是「最大化之后按钮还是最大化」。
+#[cfg(not(target_os = "macos"))]
 #[gpui_kit::test]
 fn maximize_button_reflects_window_state(cx: &mut TestAppContext) {
     fresh_dir("zoom-label");
@@ -677,17 +681,19 @@ fn chrome_region_covers_capsule_and_panel(cx: &mut TestAppContext) {
                 .any(|r| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
         }
 
-        // 标题带左端（拖动区）和窗口按钮都在里面
+        // 标题带左端（拖动区）和窗口按钮都在里面（mac 没有自绘窗口按钮）
         assert!(covered(&rects, 8., 17.), "标题带必须在区域里：{rects:?}");
-        let max_button = window.find("win-max").bounds();
-        assert!(
-            covered(
-                &rects,
-                max_button.center().x.as_f32(),
-                max_button.center().y.as_f32()
-            ),
-            "最大化按钮必须在区域里，否则点不到：{rects:?} vs {max_button:?}"
-        );
+        if !cfg!(target_os = "macos") {
+            let max_button = window.find("win-max").bounds();
+            assert!(
+                covered(
+                    &rects,
+                    max_button.center().x.as_f32(),
+                    max_button.center().y.as_f32()
+                ),
+                "最大化按钮必须在区域里，否则点不到：{rects:?} vs {max_button:?}"
+            );
+        }
 
         // 胶囊里的控件同理
         let seek = window.find("seek-bar").bounds();
@@ -799,6 +805,35 @@ fn maximize_button_leaves_cinema(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// mac 用系统红绿灯：标题带里不能再有自绘的窗口按钮，标题文字要让开左上角。
+#[cfg(target_os = "macos")]
+#[gpui_kit::test]
+fn mac_title_band_leaves_window_buttons_to_the_system(cx: &mut TestAppContext) {
+    fresh_dir("band-mac");
+    let (window, view) = open_view(cx, Vec::new());
+
+    cx.update_window(window, |_, window, cx| {
+        for video in [false, true] {
+            view.update(cx, |view, _| view.test_set_video_mode(video));
+            window.render_frame(cx);
+
+            for id in ["win-min", "win-max", "win-close"] {
+                assert!(
+                    window.try_find(id).is_none(),
+                    "mac 不该自绘 {id}（video={video}），红绿灯由系统画"
+                );
+            }
+            let drag = window.find("title-drag").bounds();
+            let (light_x, _) = crate::player_view::TRAFFIC_LIGHT_ORIGIN;
+            assert!(
+                drag.left().as_f32() >= light_x + 14.0 * 3.0 + 6.0 * 2.0,
+                "标题文字会压到红绿灯上（video={video}）：{drag:?}"
+            );
+        }
+    })
+    .unwrap();
+}
+
 /// 标题带必须铺满整窗宽度（含右上角那三颗窗口按钮）。
 ///
 /// 用户报「顶栏没有铺满宽度」。布局这一层守的是：三个窗口按钮贴着窗口右沿、
@@ -815,15 +850,17 @@ fn title_band_spans_full_width(cx: &mut TestAppContext) {
             window.render_frame(cx);
 
             let bounds = window.bounds();
-            let close = window.find("win-close").bounds();
-            assert!(
-                (close.right() - bounds.right()).as_f32().abs() <= 1.0,
-                "关闭按钮应贴着窗口右沿（video={video}）：按钮 {close:?} vs 窗口 {bounds:?}"
-            );
-            assert!(
-                (close.top() - bounds.top()).as_f32().abs() <= 1.0,
-                "窗口按钮应贴着窗口上沿（video={video}）：按钮 {close:?} vs 窗口 {bounds:?}"
-            );
+            if !cfg!(target_os = "macos") {
+                let close = window.find("win-close").bounds();
+                assert!(
+                    (close.right() - bounds.right()).as_f32().abs() <= 1.0,
+                    "关闭按钮应贴着窗口右沿（video={video}）：按钮 {close:?} vs 窗口 {bounds:?}"
+                );
+                assert!(
+                    (close.top() - bounds.top()).as_f32().abs() <= 1.0,
+                    "窗口按钮应贴着窗口上沿（video={video}）：按钮 {close:?} vs 窗口 {bounds:?}"
+                );
+            }
 
             let rects = view.read(cx).test_chrome_rects(window);
             assert!(
@@ -1155,7 +1192,7 @@ fn codec_string_keeps_only_its_first_alias() {
 // 播放列表面板 v2：几何、tab、循环/随机/排序
 // ----------------------------------------------------------------------
 
-/// 设计稿口径：面板 320 宽、贴右 24、顶边 = 标题带 40 + 8。
+/// 设计稿口径：面板 320 宽、贴右 24、顶边 = 标题带 + 8。
 ///
 /// 之前是 `top: TITLE_BAND+6 / right: 12 / bottom: BOTTOM_BAND`，宽高都靠窗口
 /// 撑，和设计稿的固定 320 差两圈；这类"整体缩进一格"的偏差光看截图很难发现。
@@ -1172,7 +1209,11 @@ fn playlist_panel_matches_design_geometry(cx: &mut TestAppContext) {
         let panel = window.find("playlist-panel").bounds();
         let window_bounds = window.bounds();
         assert_eq!(panel.size.width.as_f32(), 320.0, "面板宽 320");
-        assert_eq!(panel.top().as_f32(), 48.0, "面板顶边 = 标题带 40 + 8");
+        assert_eq!(
+            panel.top().as_f32(),
+            crate::player_view::TITLE_BAND + 8.0,
+            "面板顶边 = 标题带 + 8"
+        );
         assert_eq!(
             window_bounds.right().as_f32() - panel.right().as_f32(),
             24.0,
@@ -1394,6 +1435,232 @@ fn hidden_chrome_leaves_no_rects(cx: &mut TestAppContext) {
         view.update(cx, |view, _| view.test_set_chrome_alpha(1.0));
         window.render_frame(cx);
         assert!(!view.read(cx).test_chrome_rects(window).is_empty());
+    })
+    .unwrap();
+}
+
+// ----------------------------------------------------------------------
+// 首屏：最近打开 / 空 / 拖入中 三态，选好之后交给 on_launch
+// ----------------------------------------------------------------------
+
+type Launched = std::rc::Rc<std::cell::RefCell<Vec<Launch>>>;
+
+fn recent_entry(path: &Path, duration: f64, position: f64) -> RecentEntry {
+    RecentEntry {
+        path: path.to_string_lossy().replace('\\', "/"),
+        title: recent_title(&path.to_string_lossy()),
+        duration_secs: Some(duration),
+        position_secs: position,
+    }
+}
+
+/// 560×440 的首屏窗口；`on_launch` 收到的东西记进返回的列表里。
+fn open_first_run(
+    cx: &mut TestAppContext,
+    recent: Recent,
+) -> (AnyWindowHandle, Entity<FirstRunView>, Launched) {
+    let launched = Launched::default();
+    let sink = launched.clone();
+    let (window, view) = cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::install(cx, false);
+        let (w, h) = first_run::WINDOW_SIZE;
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(0.), px(0.)),
+                    size: size(px(w), px(h)),
+                })),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                let on_launch: first_run::OnLaunch =
+                    std::rc::Rc::new(move |launch, _, _| sink.borrow_mut().push(launch));
+                cx.new(|cx| FirstRunView::new(recent, on_launch, window, cx))
+            },
+        )
+        .expect("打开首屏窗口")
+    });
+    (window, view, launched)
+}
+
+#[gpui_kit::test]
+fn first_run_without_history_shows_the_empty_guide(cx: &mut TestAppContext) {
+    fresh_dir("fr-empty");
+    let (window, view, _) = open_first_run(cx, Recent::default());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).state(), FirstRunState::Empty);
+        let guide = window.find("fr-empty");
+        assert_eq!(guide.bounds().origin, point(px(24.), px(186.)), "空态引导块的位置");
+        assert_eq!(guide.bounds().size, size(px(512.), px(220.)));
+        assert!(window.try_find("fr-open").is_some(), "空态也要有「打开文件」");
+        assert!(window.try_find("fr-stream").is_some(), "空态也要有「打开串流」");
+        assert!(window.try_find("fr-continue").is_none(), "没有历史就没有「继续上次」");
+        assert!(window.try_find(("fr-row", 0usize)).is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn first_run_lists_recent_and_resumes_the_last_one(cx: &mut TestAppContext) {
+    let dir = fresh_dir("fr-recent");
+    let last = write_silent_wav_named(&dir, "last.wav", 1.0);
+    let older = write_silent_wav_named(&dir, "older.wav", 1.0);
+    let oldest = write_silent_wav_named(&dir, "oldest.wav", 1.0);
+    let recent = Recent {
+        entries: vec![
+            recent_entry(&last, 3600.0, 1234.0),
+            recent_entry(&older, 200.0, 0.0),
+            // 文件已经被挪走：不该露出来
+            recent_entry(&dir.join("gone.mkv"), 100.0, 0.0),
+            recent_entry(&oldest, 200.0, 50.0),
+        ],
+    };
+    let (window, view, launched) = open_first_run(cx, recent);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(view.read(cx).state(), FirstRunState::Recent);
+        assert!(window.try_find("fr-empty").is_none());
+        assert_eq!(
+            window.find("fr-continue").bounds().origin,
+            point(px(24.), px(196.)),
+            "「继续上次」紧跟在按钮行下面"
+        );
+        // 「继续上次」那一条不再出现在列表里；找不到的文件也被滤掉
+        assert!(window.try_find(("fr-row", 0usize)).is_some());
+        assert!(window.try_find(("fr-row", 1usize)).is_some());
+        assert!(window.try_find(("fr-row", 2usize)).is_none());
+
+        window.click("fr-continue", cx);
+        // 列表里的行：看到一半的也接着放
+        window.click(("fr-row", 1usize), cx);
+        // 没看过（进度 0）的从头放
+        window.click(("fr-row", 0usize), cx);
+    })
+    .unwrap();
+
+    let path = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    assert_eq!(
+        *launched.borrow(),
+        vec![
+            Launch::Open {
+                path: path(&last),
+                resume_at: Some(1234.0)
+            },
+            Launch::Open {
+                path: path(&oldest),
+                resume_at: Some(50.0)
+            },
+            Launch::Open {
+                path: path(&older),
+                resume_at: None
+            },
+        ]
+    );
+}
+
+#[gpui_kit::test]
+fn first_run_keyboard_picks_the_highlighted_row(cx: &mut TestAppContext) {
+    let dir = fresh_dir("fr-keys");
+    let a = write_silent_wav_named(&dir, "a.wav", 1.0);
+    let b = write_silent_wav_named(&dir, "b.wav", 1.0);
+    // 都没看过：没有「继续上次」，两条都在列表里
+    let recent = Recent {
+        entries: vec![recent_entry(&a, 60.0, 0.0), recent_entry(&b, 60.0, 0.0)],
+    };
+    let (window, _view, launched) = open_first_run(cx, recent);
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("fr-continue").is_none());
+        assert_eq!(
+            window.find(("fr-row", 0usize)).bounds().origin.y,
+            px(196.) + px(22.),
+            "没有「继续上次」时列表上移到按钮行下面"
+        );
+        window.press("down", cx);
+        window.press("enter", cx);
+    })
+    .unwrap();
+
+    assert_eq!(
+        *launched.borrow(),
+        vec![Launch::Open {
+            path: b.to_string_lossy().replace('\\', "/"),
+            resume_at: None
+        }]
+    );
+}
+
+#[gpui_kit::test]
+fn first_run_drop_zone_shows_and_imports(cx: &mut TestAppContext) {
+    let dir = fresh_dir("fr-drop");
+    let wav = write_silent_wav_named(&dir, "clip.wav", 1.0);
+    let (window, view, launched) = open_first_run(cx, Recent::default());
+
+    cx.update_window(window, |_, window, cx| {
+        window.render_frame(cx);
+        view.update(cx, |view, _| view.test_set_drag(Some("clip.wav")));
+        window.render_frame(cx);
+        assert_eq!(
+            view.read(cx).state(),
+            FirstRunState::Drop("clip.wav".into())
+        );
+        let zone = window.find("fr-drop");
+        assert_eq!(zone.bounds().origin, point(px(24.), px(204.)));
+        assert_eq!(zone.bounds().size, size(px(512.), px(212.)));
+        assert!(window.try_find("fr-empty").is_none(), "投放区替换掉空态引导");
+
+        let position = point(px(280.), px(300.));
+        let paths = ExternalPaths(SmallVec::from_vec(vec![wav.clone()]));
+        window.dispatch_event(
+            FileDropEvent::Entered { position, paths }.to_platform_input(),
+            cx,
+        );
+        window.render_frame(cx);
+        window.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+
+    assert_eq!(*launched.borrow(), vec![Launch::Import(vec![wav])]);
+}
+
+/// 真实的交接：首屏选中之后，主窗口要先开出来、首屏再关掉——
+/// 反过来的话中间有一刻一个窗口都没有，`on_window_closed` 会把整个应用退掉。
+#[gpui_kit::test]
+fn first_run_hands_over_to_the_player_window(cx: &mut TestAppContext) {
+    let dir = fresh_dir("fr-handoff");
+    let wav = write_silent_wav_named(&dir, "pick.wav", 1.0);
+    persistence::save_recent(&Recent {
+        entries: vec![recent_entry(&wav, 1.0, 0.0)],
+    });
+
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        crate::theme::install(cx, false);
+        crate::open_first_run(cx);
+    });
+    let first = cx.update(|cx| cx.windows());
+    assert_eq!(first.len(), 1);
+    cx.update_window(first[0], |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(("fr-row", 0usize)).is_some(), "先出来的应当是首屏");
+        window.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let windows = cx.update(|cx| cx.windows());
+    assert_eq!(windows.len(), 1, "首屏应当关掉，只剩主窗口");
+    cx.update_window(windows[0], |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("play-pause").is_some(), "剩下的应当是主播放窗口");
+        assert!(window.try_find("fr-open").is_none());
     })
     .unwrap();
 }

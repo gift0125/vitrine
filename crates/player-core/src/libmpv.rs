@@ -87,8 +87,16 @@ pub struct MpvEventLogMessage {
 
 // ---- mpv_render_param_type（`render.h`）----
 //
-// 只订到软件渲染要用的那几项；枚举值是 ABI 的一部分，不能自己编。
+// 只订到要用的那几项；枚举值是 ABI 的一部分，不能自己编。
 pub const MPV_RENDER_PARAM_API_TYPE: c_int = 1;
+#[cfg(target_os = "macos")]
+pub const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
+#[cfg(target_os = "macos")]
+pub const MPV_RENDER_PARAM_OPENGL_FBO: c_int = 3;
+#[cfg(target_os = "macos")]
+pub const MPV_RENDER_PARAM_FLIP_Y: c_int = 4;
+#[cfg(target_os = "macos")]
+pub const MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME: c_int = 12;
 pub const MPV_RENDER_PARAM_SW_SIZE: c_int = 17;
 pub const MPV_RENDER_PARAM_SW_FORMAT: c_int = 18;
 pub const MPV_RENDER_PARAM_SW_STRIDE: c_int = 19;
@@ -98,6 +106,32 @@ pub const MPV_RENDER_PARAM_SW_POINTER: c_int = 20;
 pub const MPV_RENDER_API_TYPE_SW: &[u8] = b"sw\0";
 /// 输出像素格式：4 字节/像素、地址递增顺序 B,G,R,X（X 是垃圾值，见下）。
 pub const MPV_RENDER_SW_FORMAT: &[u8] = b"bgr0\0";
+/// OpenGL 后端的 `API_TYPE` 取值（`MPV_RENDER_API_TYPE_OPENGL`）。
+#[cfg(target_os = "macos")]
+pub const MPV_RENDER_API_TYPE_OPENGL: &[u8] = b"opengl\0";
+
+/// mpv 向我们要 GL 函数指针的回调（`mpv_opengl_init_params::get_proc_address`）。
+#[cfg(target_os = "macos")]
+pub type FnGetProcAddress = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
+
+/// `mpv_opengl_init_params`（`render_gl.h`）。
+#[cfg(target_os = "macos")]
+#[repr(C)]
+pub struct MpvOpenglInitParams {
+    pub get_proc_address: Option<FnGetProcAddress>,
+    pub get_proc_address_ctx: *mut c_void,
+}
+
+/// `mpv_opengl_fbo`（`render_gl.h`）。
+#[cfg(target_os = "macos")]
+#[repr(C)]
+pub struct MpvOpenglFbo {
+    pub fbo: c_int,
+    pub w: c_int,
+    pub h: c_int,
+    /// 纹理的内部格式（如 `GL_RGBA8`），不知道就填 0
+    pub internal_format: c_int,
+}
 /// `mpv_render_context_update()` 的返回位：有新帧，该渲染了。
 pub const MPV_RENDER_UPDATE_FRAME: u64 = 1;
 
@@ -462,6 +496,73 @@ impl LibMpv {
         }
     }
 
+    /// 创建 OpenGL 渲染上下文（`MPV_RENDER_API_TYPE_OPENGL`）。
+    ///
+    /// 调用时那个 GL 上下文必须是当前上下文，之后每次 `render_frame_gl` 也一样。
+    #[cfg(target_os = "macos")]
+    pub fn render_create_gl(
+        &self,
+        ctx: *mut c_void,
+        get_proc_address: FnGetProcAddress,
+    ) -> (*mut c_void, c_int) {
+        let Some(create) = self.render_create else {
+            return (std::ptr::null_mut(), -1);
+        };
+        let mut init = MpvOpenglInitParams {
+            get_proc_address: Some(get_proc_address),
+            get_proc_address_ctx: std::ptr::null_mut(),
+        };
+        let mut params = [
+            MpvRenderParam::new(
+                MPV_RENDER_PARAM_API_TYPE,
+                MPV_RENDER_API_TYPE_OPENGL.as_ptr() as *mut c_void,
+            ),
+            MpvRenderParam::new(
+                MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
+                &mut init as *mut MpvOpenglInitParams as *mut c_void,
+            ),
+            MpvRenderParam::sentinel(),
+        ];
+        let mut out: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe { create(&mut out, ctx, params.as_mut_ptr()) };
+        if rc < 0 {
+            (std::ptr::null_mut(), rc)
+        } else {
+            (out, 0)
+        }
+    }
+
+    /// 把当前帧画进 `fbo`（`w × h`）。不翻转：画面第一行落在 GL 的 y=0。
+    #[cfg(target_os = "macos")]
+    pub fn render_frame_gl(&self, render: *mut c_void, fbo: u32, w: usize, h: usize) -> c_int {
+        let Some(draw) = self.render_render else {
+            return -1;
+        };
+        const GL_RGBA8: c_int = 0x8058;
+        let mut target = MpvOpenglFbo {
+            fbo: fbo as c_int,
+            w: w as c_int,
+            h: h as c_int,
+            internal_format: GL_RGBA8,
+        };
+        let mut flip: c_int = 0;
+        // 跑在 UI 线程上，不能等到「该显示的时刻」（同 `video-timing-offset=0` 的理由）
+        let mut block: c_int = 0;
+        let mut params = [
+            MpvRenderParam::new(
+                MPV_RENDER_PARAM_OPENGL_FBO,
+                &mut target as *mut MpvOpenglFbo as *mut c_void,
+            ),
+            MpvRenderParam::new(MPV_RENDER_PARAM_FLIP_Y, &mut flip as *mut c_int as *mut c_void),
+            MpvRenderParam::new(
+                MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+                &mut block as *mut c_int as *mut c_void,
+            ),
+            MpvRenderParam::sentinel(),
+        ];
+        unsafe { draw(render, params.as_mut_ptr()) }
+    }
+
     pub fn render_set_update_callback(
         &self,
         render: *mut c_void,
@@ -574,10 +675,48 @@ impl MpvCtx {
     }
 }
 
-/// 按「环境变量 → exe 同目录 → PATH → 常见安装路径」找 `libmpv-2.dll`。
+/// 本平台上 libmpv 的文件名（报错提示也用它）。
+#[cfg(windows)]
+pub const LIBMPV_NAME: &str = "libmpv-2.dll";
+#[cfg(target_os = "macos")]
+pub const LIBMPV_NAME: &str = "libmpv.2.dylib";
+#[cfg(not(any(windows, target_os = "macos")))]
+pub const LIBMPV_NAME: &str = "libmpv.so.2";
+
+/// 按优先级试的文件名。macOS / Linux 上包管理器有时只留不带版本号的那个链接。
+#[cfg(windows)]
+const LIB_NAMES: &[&str] = &["libmpv-2.dll"];
+#[cfg(target_os = "macos")]
+const LIB_NAMES: &[&str] = &["libmpv.2.dylib", "libmpv.dylib"];
+#[cfg(not(any(windows, target_os = "macos")))]
+const LIB_NAMES: &[&str] = &["libmpv.so.2", "libmpv.so"];
+
+/// PATH 都找不到时再看的常见安装目录。
+#[cfg(windows)]
+const INSTALL_DIRS: &[&str] = &[
+    r"C:\ProgramData\chocolatey\lib\mpvio.install\tools",
+    r"C:\Program Files\mpv",
+    r"C:\Program Files (x86)\mpv",
+];
+/// Homebrew（Apple Silicon / Intel）和 MacPorts。`brew install mpv` 会带上 libmpv。
+#[cfg(target_os = "macos")]
+const INSTALL_DIRS: &[&str] = &["/opt/homebrew/lib", "/usr/local/lib", "/opt/local/lib"];
+#[cfg(not(any(windows, target_os = "macos")))]
+const INSTALL_DIRS: &[&str] = &[
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib/aarch64-linux-gnu",
+    "/usr/lib64",
+    "/usr/lib",
+    "/usr/local/lib",
+];
+
+/// 按「环境变量 → exe 同目录 → PATH → 常见安装路径」找 libmpv（文件名见 [`LIBMPV_NAME`]）。
 ///
 /// 与旧的 `find_mpv` 一一对应：`SMP_MPV_PATH` 仍然有效（老的批处理/脚本不用改），
 /// 另外加了 `SMP_LIBMPV_PATH`（语义更准，优先用它）。
+///
+/// macOS 的 `.app` 包里 exe 在 `Contents/MacOS`，库按惯例放 `Contents/Frameworks`，
+/// 所以 exe 同目录之外还会看一眼 `../Frameworks`。
 pub fn find_libmpv(exe_dir: Option<&Path>) -> Option<PathBuf> {
     find_libmpv_in(
         exe_dir,
@@ -601,8 +740,6 @@ fn find_libmpv_in(
     current_exe: Option<PathBuf>,
     path_var: Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    const DLL: &str = "libmpv-2.dll";
-
     for path in overrides.into_iter().flatten() {
         let path = PathBuf::from(path);
         if path.is_file() {
@@ -610,39 +747,36 @@ fn find_libmpv_in(
         }
     }
 
-    // exe 同目录优先：发布包里 DLL 就放在这儿
-    if let Some(dir) = exe_dir {
-        let candidate = dir.join(DLL);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
+    let in_dir = |dir: &Path| {
+        LIB_NAMES
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    };
+
+    // exe 同目录优先：发布包里库就放在这儿
+    if let Some(found) = exe_dir.and_then(in_dir) {
+        return Some(found);
     }
 
     if let Some(dir) = current_exe.as_deref().and_then(Path::parent) {
-        let candidate = dir.join(DLL);
-        if candidate.is_file() {
-            return Some(candidate);
+        if let Some(found) = in_dir(dir) {
+            return Some(found);
+        }
+        if let Some(found) = in_dir(&dir.join("../Frameworks")) {
+            return Some(found);
         }
     }
 
     if let Some(paths) = path_var {
-        for dir in std::env::split_paths(&paths) {
-            let candidate = dir.join(DLL);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
+        if let Some(found) = std::env::split_paths(&paths).find_map(|dir| in_dir(&dir)) {
+            return Some(found);
         }
     }
 
-    const CANDIDATES: &[&str] = &[
-        r"C:\ProgramData\chocolatey\lib\mpvio.install\tools\libmpv-2.dll",
-        r"C:\Program Files\mpv\libmpv-2.dll",
-        r"C:\Program Files (x86)\mpv\libmpv-2.dll",
-    ];
-    CANDIDATES
+    INSTALL_DIRS
         .iter()
-        .map(PathBuf::from)
-        .find(|path| path.is_file())
+        .find_map(|dir| in_dir(Path::new(dir)))
 }
 
 #[cfg(test)]
@@ -670,7 +804,7 @@ mod tests {
         let fake = dir.join("fake-libmpv-2.dll");
         std::fs::write(&fake, b"not a dll").unwrap();
         // 同目录也放一个"真名"的候选，用来证明 override 确实压过了它
-        let decoy = dir.join("libmpv-2.dll");
+        let decoy = dir.join(LIBMPV_NAME);
         std::fs::write(&decoy, b"not a dll either").unwrap();
 
         let found = find_libmpv_in(Some(&dir), [Some(fake.clone().into()), None], None, None);
@@ -679,6 +813,23 @@ mod tests {
         // 没有 override 时才轮到 exe 同目录
         let found = find_libmpv_in(Some(&dir), [None, None], None, None);
         assert_eq!(found.as_deref(), Some(decoy.as_path()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 只有不带版本号的那个名字（包管理器只留了 `libmpv.dylib` / `libmpv.so`）也要认，
+    /// PATH 里的目录也要找。
+    #[test]
+    fn falls_back_to_the_unversioned_name_on_path() {
+        let dir = std::env::temp_dir().join("smp-libmpv-test-unversioned");
+        std::fs::create_dir_all(&dir).unwrap();
+        let last = LIB_NAMES.last().expect("至少一个文件名");
+        let lib = dir.join(last);
+        std::fs::write(&lib, b"not a library").unwrap();
+
+        let path = std::env::join_paths([dir.as_path()]).unwrap();
+        let found = find_libmpv_in(None, [None, None], None, Some(path));
+        assert_eq!(found.as_deref(), Some(lib.as_path()));
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -26,7 +26,9 @@
 /// 也全是空实现，没必要为它引入一个平台类型。
 pub type Hwnd = isize;
 
+#[cfg_attr(not(windows), allow(dead_code))]
 const SW_MAXIMIZE: i32 = 3;
+#[cfg_attr(not(windows), allow(dead_code))]
 const SW_RESTORE: i32 = 9;
 
 /// 窗口当前是否最大化（`IsZoomed`）。
@@ -143,17 +145,20 @@ pub fn move_window(hwnd: Hwnd, x: i32, y: i32) {
 /// 系统会把窗口压不到这个尺寸以下（GPUI 把它交给 `WM_GETMINMAXINFO`）。而按画面
 /// 比例算出来的尺寸可能比它还小（低分辨率视频），那时只能反过来把窗口放大——
 /// 窗口缩不下去、画面又没跟着放大，就会留一圈黑边。
+#[cfg_attr(not(windows), allow(dead_code))]
 pub const MIN_CLIENT: (f32, f32) = (720.0, 480.0);
 
 /// 窗口与屏幕边缘之间留的余量（逻辑像素）。
 ///
 /// 不留余量的话窗口会正好贴满工作区，看起来像"被最大化"了，边框也不见了。
+#[cfg_attr(not(windows), allow(dead_code))]
 const SCREEN_MARGIN: f32 = 12.0;
 
 /// 一次「按画面尺寸定窗口」用到的现场事实（全是物理像素）。
 ///
 /// 单独抽出来是为了让策略能被单测覆盖：真机上的工作区尺寸、DPI、边框厚度
 /// 都不可控，纯函数才测得出「4K 片子在 1080p 屏上怎么放」这种分支。
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FitScene {
     /// 画面显示尺寸（像素，已含像素宽高比校正）
@@ -171,6 +176,7 @@ pub struct FitScene {
 }
 
 /// 「按画面尺寸定窗口」的结果（物理像素）。
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FitPlan {
     /// 目标外框左上角
@@ -181,6 +187,7 @@ pub struct FitPlan {
     pub client: (i32, i32),
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 impl FitPlan {
     /// 和当前窗口完全一致（不必再调 `SetWindowPos`）。
     pub fn same_as(&self, scene: &FitScene) -> bool {
@@ -196,6 +203,7 @@ impl FitPlan {
 /// 2. 屏幕放不下时**等比缩小**到工作区里（留 `margin`）；
 /// 3. 缩放后的客户区小于窗口最小尺寸时**反过来放大**窗口（否则画面周围会留黑边）；
 /// 4. 位置以当前窗口中心为锚点，并夹回工作区内（不改居中的观感，又不会跑出屏幕）。
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn plan_fit(scene: FitScene) -> Option<FitPlan> {
     let (vw, vh) = (scene.video.0 as f32, scene.video.1 as f32);
     if vw < 2.0 || vh < 2.0 {

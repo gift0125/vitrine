@@ -1,4 +1,4 @@
-# Chroma 设计稿要点（Ardot file 737444551354649）
+# Vitrine 设计稿要点（Ardot file 737444551354649）
 
 > 从 MEMORY.md 拆出，避免主备忘超注入上限。
 
@@ -55,7 +55,7 @@
 - 标题栏 = `NSVisualEffectView(material: .titlebar, blendingMode: .withinWindow)`，**糊的是同窗口内的视频**（这正是 Win 叠加窗拿不到的那种 blur）。栏高 32/28pt（macOS 26+/旧），标题容器 +8。
 - 唯一一条线：标题栏底 `NSBox.boxType = .separator`、高 1pt、色 `NSColor.titleBarBorder`。另有标题文字黑 shadow（blur 8）保可读。
 - 流量灯进 `fadeableViews`，闲置时 `alphaValue = 1e-100`（**不是 isHidden**，保留命中区）；窗口模式 `titleVisibility = .hidden`。
-- ~~对照我们：Chroma 窗口有一圈 1px 内描边~~ → **2026-10-18 晚上已删掉**（16 个帧 `strokes: []`，代码根节点本来就没有 border）。这圈线正是「贴图感」的来源，去掉后画面直通边缘、只靠投影托起窗口，和 iina 的口径一致。仍保留的差异：标题带独立 40/48 高、按钮常驻、无分隔线。
+- ~~对照我们：Vitrine 窗口有一圈 1px 内描边~~ → **2026-10-18 晚上已删掉**（16 个帧 `strokes: []`，代码根节点本来就没有 border）。这圈线正是「贴图感」的来源，去掉后画面直通边缘、只靠投影托起窗口，和 iina 的口径一致。仍保留的差异：标题带独立 40/48 高、按钮常驻、无分隔线。
 - iina 的「闲置淡出」是 `fadeableViews` + `alphaValue = 1e-100`（保留命中区）；我们的口径不同：**淡出后连区域一起让出去**（`chrome_rects()` 返回空），否则看不见的按钮照样吃点击。代价是底部遮罩要自己补 `on_double_click`。
 
 ## UI / 样式坑（从 MEMORY.md 拆出）

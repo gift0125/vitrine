@@ -245,10 +245,10 @@ proc = subprocess.Popen(
 )
 time.sleep(4.0)
 
-hwnd = user32.FindWindowW(None, "Chroma")
+hwnd = user32.FindWindowW(None, "Vitrine")
 if not hwnd:
     proc.kill()
-    raise SystemExit("未找到标题为 Chroma 的窗口")
+    raise SystemExit("未找到标题为 Vitrine 的窗口")
 # 残留实例会让 `FindWindowW` 拿到**另一个进程**的窗口，后面每一条判定都会失真
 owner = wintypes.DWORD()
 user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))

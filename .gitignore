@@ -14,3 +14,4 @@ __pycache__/
 
 # 临时截图/探针产物
 /.tmp-shot
+.DS_Store

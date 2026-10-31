@@ -1,15 +1,15 @@
-# <img src="assets/chroma.png" width="28" align="top" /> Simple Media Player
+# <img src="assets/vitrine.png" width="28" align="top" /> Simple Media Player
 
 一个用 Rust + [GPUI Kit](https://gpui-kit.com) 写的轻量桌面媒体播放器：单窗口、原生渲染、启动快，
 音频走 [rodio](https://github.com/RustAudio/rodio)，视频交给 mpv。
 
-窗口标题用设计稿的产品名 **Chroma**（仓库/二进制名沿用 `simple-media-player`）。
+窗口标题用设计稿的产品名 **Vitrine**（仓库/二进制名沿用 `simple-media-player`）。
 界面按设计稿的 **IINA 式沉浸布局**：内容占满窗口，控制条是一块悬浮的深色玻璃胶囊，
 播放列表默认收起。应用表面严格对齐 **Catppuccin Latte** 色板（深色模式 **Mocha**），
 强调色只用 **Mauve `#8839EF`** 一个；悬浮叠加层单独一套深色玻璃色值。两套映射都集中在
 `crates/app/src/theme.rs`，改一处即整体换肤。
 
-![音频模式（Latte 浅色）](docs/screenshots/chroma-light.png)
+![音频模式（Latte 浅色）](docs/screenshots/vitrine-light.png)
 
 ## 功能
 
@@ -35,15 +35,15 @@
 | 错误提示 | 文件损坏、格式不支持、libmpv 缺失等都有提示：音频模式走右上角 toast，视频模式走标题带胶囊 |
 | 无障碍 | 所有图标按钮都有可读名称（`aria_label`） |
 
-![视频播放：窗口按画面尺寸开好（1280×720 1:1），标题带 / 胶囊压在画面上](docs/screenshots/chroma-video.png)
+![视频播放：窗口按画面尺寸开好（1280×720 1:1），标题带 / 胶囊压在画面上](docs/screenshots/vitrine-video.png)
 
 展开歌单时面板浮在画面右侧，画面宽度不变（右侧那条青色色条一直铺到窗口边缘）：
 
-![歌单悬浮在画面上，不挤占画面宽度](docs/screenshots/chroma-video-playlist.png)
+![歌单悬浮在画面上，不挤占画面宽度](docs/screenshots/vitrine-video-playlist.png)
 
 点胶囊左侧的 `ⓘ` 展开视频信息卡（再点收起）：
 
-![视频信息卡：分辨率/编码/码率/帧率/色彩/音频，浮在画面左下](docs/screenshots/chroma-video-info.png)
+![视频信息卡：分辨率/编码/码率/帧率/色彩/音频，浮在画面左下](docs/screenshots/vitrine-video-info.png)
 
 ## 环境要求
 
@@ -465,7 +465,7 @@ Mocha Mauve `#CBA6F7`，播放键仍是品牌色 `#8839EF`。
 
 ### 应用图标
 
-`assets/chroma.ico` 由 `scripts/make-icon.py` 生成（品牌 Mauve 圆角方块 + 白色播放三角，
+`assets/vitrine.ico` 由 `scripts/make-icon.py` 生成（品牌 Mauve 圆角方块 + 白色播放三角，
 和界面里那颗播放按钮同一个符号），多尺寸 16…256，改品牌色只改脚本。
 
 `crates/app/build.rs` 用 `embed-resource` 把它以 **ID = 1** 写进 exe 的 PE 资源，

@@ -1,9 +1,9 @@
 {
-  "_readme": "Chroma 设计规格（机读）。来源：Ardot 设计稿 737444551354649。不要手改本文件——要改就走画布会话，改完由画布重新导出 frames/icons 并更新本文件。单位：逻辑像素（DP），颜色：hex。",
+  "_readme": "Vitrine 设计规格（机读）。来源：Ardot 设计稿 737444551354649。不要手改本文件——要改就走画布会话，改完由画布重新导出 frames/icons 并更新本文件。单位：逻辑像素（DP），颜色：hex。",
   "meta": {
     "design_file": "https://ardot.tencent.com/file/737444551354649",
     "file_id": 737444551354649,
-    "exported_at": "2026-10-18T22:42+08:00",
+    "exported_at": "2026-10-22T15:30+08:00",
     "frame_scale": 2,
     "note": "帧已裁到窗口实际内容：**图像 = 设计尺寸 ×2**（音乐模式 800×1560、设置 1920×1360/1440、首屏 1120×880），无投影留白。窗口四角为透明圆角（radius 10），窗口本身不画描边（见 window_edge）。量坐标直接除以 2。视频播放态（1280×800）不在 frames 里——见 known_gaps 第一条。"
   },
@@ -506,27 +506,27 @@
   ],
   "icons": [
     {
-      "file": "icons/chroma-256.png",
+      "file": "icons/vitrine-256.png",
       "node": "2:564",
       "size": 256
     },
     {
-      "file": "icons/chroma-128.png",
+      "file": "icons/vitrine-128.png",
       "node": "2:567",
       "size": 128
     },
     {
-      "file": "icons/chroma-64.png",
+      "file": "icons/vitrine-64.png",
       "node": "2:570",
       "size": 64
     },
     {
-      "file": "icons/chroma-32.png",
+      "file": "icons/vitrine-32.png",
       "node": "2:573",
       "size": 32
     },
     {
-      "file": "icons/chroma-16.png",
+      "file": "icons/vitrine-16.png",
       "node": "2:576",
       "size": 16
     }

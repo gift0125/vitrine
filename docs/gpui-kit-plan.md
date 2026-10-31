@@ -205,7 +205,7 @@ GPUI 的 Windows 后端使用 `DirectComposition + WS_EX_NOREDIRECTIONBITMAP`，
   - `scripts/package.ps1`：release 构建 → `dist/simple-media-player-1.0.0/`（exe + README + MANIFEST 校验和）
     → 同名 zip（8.7 MB）；`-WithMpv` 可把 mpv.exe 一并打入（GPL 合规需自行确认）。
   - 实测：解压到临时目录 + 全新 `APPDATA` 启动，视频/音频/影院/错误提示全部正常，mpv 进程随窗口关闭回收。
-- [x] README + 截图（`docs/screenshots/chroma-{light,dark,video}.png`）
+- [x] README + 截图（`docs/screenshots/vitrine-{light,dark,video}.png`）
 
 **验收**：release 包在干净目录 + 全新配置下可运行 ✅；测试套件 15（player-core）+ 11（app）全绿 ✅；
 release 1080p H.264 播放 mpv 峰值 10.85% 单核（整机 ~0.68%），满足 < 15% ✅。
@@ -245,7 +245,7 @@ release 1080p H.264 播放 mpv 峰值 10.85% 单核（整机 ~0.68%），满足 
 
 **验证**：`theme::tests` 两个用例断言 token 真的落到全局（Base/Mauve/Mocha）；
 UI 测试改为先装真实皮肤再断言；`scripts/shot.py` 按 DPI 缩放截图，产出
-`docs/screenshots/chroma-{light,dark,video}.png` 三张对照图。
+`docs/screenshots/vitrine-{light,dark,video}.png` 三张对照图。
 
 ---
 
@@ -409,7 +409,7 @@ GPUI 的 Windows 后端注册窗口类时调的是
 （`gpui-pre-windows` 的 `load_icon`）——**只认 ID = 1**。exe 里没有这条资源时它拿到空句柄，
 窗口类就没图标，任务栏/Alt+Tab 显示系统占位图。`WindowOptions.icon` 帮不上忙（x11 only）。
 
-做法：`assets/chroma.ico` 由 `scripts/make-icon.py` 生成（1024 超采样 → 16…256 多尺寸），
+做法：`assets/vitrine.ico` 由 `scripts/make-icon.py` 生成（1024 超采样 → 16…256 多尺寸），
 `crates/app/build.rs` 用 `embed-resource` 把 `1 ICON …` + VERSIONINFO 编进 PE。
 找不到 `rc.exe`（没装 Windows SDK）时只 `cargo:warning` 不失败。
 
@@ -421,7 +421,7 @@ GPUI 的 Windows 后端注册窗口类时调的是
 - PE 资源：`LoadLibraryExW(DATAFILE)` + `FindResourceW(1, RT_GROUP_ICON/RT_ICON/RT_VERSION)`
   三个 ID 都存在（debug 与 release 都验过）。
 - 运行时：`GetClassLongPtrW(GCLP_HICON)` 非 0（`0x8DA0B95`），说明窗口类真的拿到了图标。
-- 观感：截任务栏，按 Mauve 色值定位到按钮，确认是「紫底 + 白三角」的 Chroma 图标。
+- 观感：截任务栏，按 Mauve 色值定位到按钮，确认是「紫底 + 白三角」的 Vitrine 图标。
 
 **3. 顺带：截图不再污染真实数据**
 
@@ -1261,14 +1261,14 @@ GPUI 不总生效，要展开面板/弹卡片这种有状态的点击得用真�
 
 - `cargo test --workspace`：22（core）+ **37**（app，新增 4 个几何/模式/时长用例）全绿；
 - `scripts/verify_floating_chrome.py`：**18 项 ALL OK**（连跑三次稳定）；
-- 文档截图重拍（`docs/screenshots/chroma-video*.png`，1280×720）：新胶囊 + 面板 + 信息卡。
+- 文档截图重拍（`docs/screenshots/vitrine-video*.png`，1280×720）：新胶囊 + 面板 + 信息卡。
 
 #### 还没做的设计项
 
 - **画中画**：需要第二个置顶视频窗（`ICON_PIP` 已经画好，按钮故意没接）；
 - **首屏三态 560×440**（最近 / 空 / 拖入中）、**设置窗 960×720**（40 标题带）、
   **音乐模式 400×780**：都是独立窗口/整页，属于下一批；
-- 应用图标换成 `design/icons/chroma-256.png`；标题带那三枚窗口按钮在深色画面上应取 `#E6E9EF`。
+- 应用图标换成 `design/icons/vitrine-256.png`；标题带那三枚窗口按钮在深色画面上应取 `#E6E9EF`。
 
 
 ---
@@ -1404,7 +1404,7 @@ tick 在算的（和 `drop_activity` 同一个套路）。
 - `scripts/verify_floating_chrome.py`：**18 项 ALL OK**（连跑三次）；
 - 实测淡出后视频继续解码（两次取样左下角时间码不同）；遮罩区双击进全屏
   （`逻辑(150,410) 处窗口类 = Zed::Window`，外框 `(0,0,3840,2160)`）；
-- 文档截图重拍（`docs/screenshots/chroma-video*.png`）：胶囊有渐变 + 薄荷色偏，
+- 文档截图重拍（`docs/screenshots/vitrine-video*.png`）：胶囊有渐变 + 薄荷色偏，
   底三分之一压暗，播放键是一颗球。
 
 #### 留给下一轮

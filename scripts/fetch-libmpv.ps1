@@ -47,7 +47,7 @@ if ((Test-Path $dll) -and (-not $Force)) {
         "https://api.github.com/repos/zhongfly/mpv-winbuild/releases/latest"
     }
     Write-Host "==> 查询 $api"
-    $release = Invoke-RestMethod -Uri $api -Headers @{ "User-Agent" = "chroma-fetch-libmpv" }
+    $release = Invoke-RestMethod -Uri $api -Headers @{ "User-Agent" = "vitrine-fetch-libmpv" }
     $asset = $release.assets | Where-Object {
         $_.name.StartsWith($prefix) -and
         $_.name.EndsWith(".7z") -and
